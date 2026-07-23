@@ -7,6 +7,7 @@ use openkakao_cli::bujamentor_service::{
     append_log_record, classify_status_path, classify_status_text, validate_health_runtime_paths,
     validate_log_record_value, validate_watch_runtime_paths, write_config_invalid_status,
     ClosedReason, HealthClass, LogEvent, LogRecord, NotificationOutcome, ServiceName,
+    STATUS_FRESH_SECS,
 };
 use serde_json::json;
 use tempfile::tempdir;
@@ -23,10 +24,10 @@ fn healthy_status_text(started_at: &str, heartbeat_at: &str) -> String {
 }
 
 #[test]
-fn healthy_boundary_is_fresh_at_35_seconds_and_stale_after() {
-    let now = Utc.with_ymd_and_hms(2026, 7, 23, 10, 0, 35).unwrap();
-    let started_at = (now - ChronoDuration::seconds(70)).to_rfc3339();
-    let heartbeat_at = (now - ChronoDuration::seconds(35)).to_rfc3339();
+fn healthy_boundary_is_fresh_at_status_fresh_threshold_and_stale_after() {
+    let now = Utc.with_ymd_and_hms(2026, 7, 23, 10, 0, 0).unwrap();
+    let started_at = (now - ChronoDuration::seconds(STATUS_FRESH_SECS * 2)).to_rfc3339();
+    let heartbeat_at = (now - ChronoDuration::seconds(STATUS_FRESH_SECS)).to_rfc3339();
 
     let fresh = classify_status_text(now, &healthy_status_text(&started_at, &heartbeat_at));
     assert_eq!(fresh.class, HealthClass::Healthy);
@@ -47,9 +48,9 @@ fn healthy_boundary_is_fresh_at_35_seconds_and_stale_after() {
 
 #[test]
 fn starting_records_expire_after_grace_window() {
-    let now = Utc.with_ymd_and_hms(2026, 7, 23, 10, 0, 35).unwrap();
-    let started_at = (now - ChronoDuration::seconds(35)).to_rfc3339();
-    let heartbeat_at = (now - ChronoDuration::seconds(35)).to_rfc3339();
+    let now = Utc.with_ymd_and_hms(2026, 7, 23, 10, 0, 0).unwrap();
+    let started_at = (now - ChronoDuration::seconds(STATUS_FRESH_SECS)).to_rfc3339();
+    let heartbeat_at = (now - ChronoDuration::seconds(STATUS_FRESH_SECS)).to_rfc3339();
     let status = json!({
         "schema_version": 1,
         "state": "starting",
