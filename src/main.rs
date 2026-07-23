@@ -598,6 +598,18 @@ enum Commands {
         loco: bool,
     },
 }
+fn is_local_only_command(command: &Commands) -> bool {
+    matches!(
+        command,
+        Commands::LocalChats { .. }
+            | Commands::LocalRead { .. }
+            | Commands::LocalSearch { .. }
+            | Commands::LocalSchema
+            | Commands::LocalSend { .. }
+            | Commands::AxRead { .. }
+            | Commands::AxWatch { .. }
+    )
+}
 
 fn require_loco_write(config: &config::OpenKakaoConfig) -> Result<()> {
     if !config.safety.allow_loco_write {
@@ -693,7 +705,9 @@ fn main() -> Result<()> {
     // stdout. Silenced with OPENKAKAO_CLI_NO_DEPRECATION=1 for scripted
     // local-only use. `local-send`/`ax-read` need neither login nor this
     // warning, since they never touch Kakao's servers.
-    if std::env::var_os("OPENKAKAO_CLI_NO_DEPRECATION").is_none() {
+    if std::env::var_os("OPENKAKAO_CLI_NO_DEPRECATION").is_none()
+        && !is_local_only_command(&cli.command)
+    {
         eprintln!("⚠️  Server login (login --save / login --manual) is broken on recent");
         eprintln!("   KakaoTalk macOS builds. Do NOT repeatedly retry login on an unregistered");
         eprintln!("   device — it can get your account's sub-device login blocked. Prefer");
@@ -2438,6 +2452,19 @@ mod tests {
             }
             other => panic!("expected local-send, got {other:?}"),
         }
+    }
+    #[test]
+    fn local_only_commands_suppress_deprecation_warning() {
+        let ax_read = Cli::try_parse_from(["openkakao-cli", "ax-read", "나와의 채팅"])
+            .expect("ax-read should parse");
+        assert!(is_local_only_command(&ax_read.command));
+
+        let local_send = Cli::try_parse_from(["openkakao-cli", "local-send", "나와의 채팅", "hi"])
+            .expect("local-send should parse");
+        assert!(is_local_only_command(&local_send.command));
+
+        let login = Cli::try_parse_from(["openkakao-cli", "login"]).expect("login should parse");
+        assert!(!is_local_only_command(&login.command));
     }
 
     #[test]
