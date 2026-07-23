@@ -277,13 +277,13 @@ async fn run_service_iteration<S: ServiceScraper>(
                                     } else {
                                         loop_state.status.hook_failure_count =
                                             loop_state.status.hook_failure_count.saturating_add(1);
+                                        failure = Some(reason);
+                                        loop_state.baseline.insert(
+                                            row.name.clone(),
+                                            (row.unread, row.preview.clone()),
+                                        );
+                                        break;
                                     }
-                                    failure = Some(reason);
-                                    loop_state.baseline.insert(
-                                        row.name.clone(),
-                                        (row.unread, row.preview.clone()),
-                                    );
-                                    break;
                                 }
                             }
                         }
@@ -619,6 +619,60 @@ mod tests {
         let log = fs::read_to_string(&log_path).unwrap();
         assert!(log.contains("\"service\":\"watch\""));
         assert!(log.contains("\"event\":\"watch_poll_completed\""));
+    }
+    #[test]
+    fn service_iteration_keeps_rate_limited_second_hook_healthy() {
+        let temp = tempdir().unwrap();
+        let mut options = canonical_service_options(temp.path());
+        let hook_path = temp.path().join("hook.sh");
+        write_hook(&hook_path, "#!/bin/sh\nexit 0\n");
+        options.hook_path = Some(hook_path.clone());
+
+        let status_path = service_status_path(&options).unwrap().to_path_buf();
+        let log_path = service_log_path(&options).unwrap().to_path_buf();
+        let filter_config = service_filter_config(&options);
+        let scraper = FakeScraper {
+            result: ServiceScrapeResult::Success(vec![
+                ax_send::ChatListRow {
+                    name: "Alice".to_string(),
+                    unread: 1,
+                    preview: "hello".to_string(),
+                    timestamp: String::new(),
+                },
+                ax_send::ChatListRow {
+                    name: "Bob".to_string(),
+                    unread: 1,
+                    preview: "hi".to_string(),
+                    timestamp: String::new(),
+                },
+            ]),
+        };
+        let mut loop_state = ServiceLoopState {
+            baseline: HashMap::new(),
+            first: false,
+            hook_limiter: DirectHookLimiter::new(Duration::from_secs(WATCH_INTERVAL_SECS)),
+            status: WatchStatusRecord::starting_now(Utc::now()),
+        };
+
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(run_service_iteration(
+                &scraper,
+                &filter_config,
+                options.hook_path.as_deref(),
+                &status_path,
+                &log_path,
+                &mut loop_state,
+            ))
+            .unwrap();
+
+        assert_eq!(
+            loop_state.status.state,
+            openkakao_cli::bujamentor_service::WatchState::Healthy
+        );
+        assert_eq!(loop_state.status.hook_success_count, 1);
+        assert_eq!(loop_state.status.hook_failure_count, 0);
+        assert_eq!(loop_state.status.hook_rate_limited_count, 1);
     }
 
     #[test]
