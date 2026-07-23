@@ -367,6 +367,12 @@ mod imp {
         post_key_to_pid(pid, RETURN_KEYCODE, false)?;
         Ok(())
     }
+    fn focus_composer(field: &AXUIElement) -> Result<()> {
+        let focused_attr: AXAttribute<CFType> = AXAttribute::new(&CFString::new("AXFocused"));
+        field
+            .set_attribute(&focused_attr, CFBoolean::true_value().as_CFType())
+            .map_err(|e| anyhow!("composer could not be focused: {e:?}"))
+    }
 
     /// Type `text` into the focused field by posting one keyboard CGEvent pair
     /// per character directly to KakaoTalk's pid, using the Unicode string
@@ -672,6 +678,7 @@ mod imp {
                 }
             }
         };
+        focus_composer(&field)?;
 
         if field.set_value(CFString::new(message).as_CFType()).is_err() {
             type_text_to_pid(pid, message)?;
