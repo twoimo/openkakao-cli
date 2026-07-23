@@ -20,7 +20,6 @@
 //! stub with the same public API stands in on other platforms so the crate
 //! still builds and lints in cross-platform CI.
 
-use std::collections::HashMap;
 // Only `imp::open_chat_row` (macOS-only) actually calls these outside of
 // tests, so on other platforms — where `mod imp` doesn't compile and
 // `mod stub` never needs to match a chat row at all — they're otherwise
@@ -122,6 +121,9 @@ mod imp {
     const KAKAOTALK_BUNDLE_ID: &str = "com.kakao.KakaoTalkMac";
     const RETURN_KEYCODE: u16 = 36;
     const OPEN_CHAT_TIMEOUT: Duration = Duration::from_secs(5);
+    const SERVICE_AX_MESSAGING_TIMEOUT_SECS: f32 = 0.25;
+    const SERVICE_AX_TRAVERSAL_TIMEOUT: Duration = Duration::from_secs(3);
+    const SERVICE_AX_NODE_LIMIT: usize = 512;
 
     /// Find the running KakaoTalk process id via `pgrep -x`.
     ///
@@ -221,6 +223,96 @@ mod imp {
         }
 
         Ok(window)
+    }
+    fn service_walk(
+        root: &AXUIElement,
+        deadline: Instant,
+        target_role: &str,
+        skip_matching_subtrees: bool,
+        stop_after_first_match: bool,
+    ) -> Option<Vec<AXUIElement>> {
+        let mut stack = vec![root.clone()];
+        let mut matches = Vec::new();
+        let mut visited = 0;
+
+        while let Some(element) = stack.pop() {
+            if Instant::now() >= deadline || visited >= SERVICE_AX_NODE_LIMIT {
+                return None;
+            }
+            visited += 1;
+            if element
+                .set_messaging_timeout(SERVICE_AX_MESSAGING_TIMEOUT_SECS)
+                .is_err()
+            {
+                return None;
+            }
+            if role(&element) == target_role {
+                matches.push(element.clone());
+                if stop_after_first_match {
+                    return Some(matches);
+                }
+                if skip_matching_subtrees {
+                    continue;
+                }
+            }
+            let children: Vec<_> = element
+                .children()
+                .ok()?
+                .iter()
+                .map(|child| (*child).clone())
+                .collect();
+            for child in children.into_iter().rev() {
+                stack.push(child);
+            }
+        }
+
+        Some(matches)
+    }
+
+    /// Service-only scraper: bounded and read-only. Unlike interactive commands,
+    /// it never changes tabs when the chat table is absent.
+    fn scrape_chat_list_for_service_rows(main_window: &AXUIElement) -> Option<Vec<ChatListRow>> {
+        let deadline = Instant::now() + SERVICE_AX_TRAVERSAL_TIMEOUT;
+        let table = service_walk(main_window, deadline, "AXTable", true, true)?
+            .into_iter()
+            .next()?;
+        let rows = service_walk(&table, deadline, "AXRow", true, false)?;
+        let mut out = Vec::with_capacity(rows.len());
+
+        for row in rows {
+            let static_texts = service_walk(&row, deadline, "AXStaticText", false, false)?;
+            let Some(name) = static_texts
+                .first()
+                .and_then(|text| attr_as_string(text, "AXValue"))
+            else {
+                continue;
+            };
+            let mut unread = 0;
+            let mut timestamp = String::new();
+            for text in static_texts.iter().skip(1) {
+                let Some(value) = attr_as_string(text, "AXValue") else {
+                    continue;
+                };
+                if let Ok(value) = value.trim().parse::<i32>() {
+                    if unread == 0 {
+                        unread = value;
+                    }
+                } else if timestamp.is_empty() {
+                    timestamp = value;
+                }
+            }
+            let preview = service_walk(&row, deadline, "AXTextArea", true, true)?
+                .first()
+                .and_then(|text| attr_as_string(text, "AXValue"))
+                .unwrap_or_default();
+            out.push(ChatListRow {
+                name,
+                unread,
+                preview,
+                timestamp,
+            });
+        }
+        Some(out)
     }
 
     /// A single recursive snapshot of an AX subtree, capturing each node's
@@ -792,52 +884,17 @@ mod imp {
             return super::ServiceScrapeResult::AxUnavailable;
         }
         let app = AXUIElement::application(pid);
+        if app
+            .set_messaging_timeout(SERVICE_AX_MESSAGING_TIMEOUT_SECS)
+            .is_err()
+        {
+            return super::ServiceScrapeResult::AxUnavailable;
+        }
         let main_window = match find_main_window(&app) {
             Ok(window) => window,
             Err(_) => return super::ServiceScrapeResult::AxUnavailable,
         };
-        let snap = ensure_chatrooms_tab(&main_window);
-        let Some(table) = snap.find_first("AXTable") else {
-            return super::ServiceScrapeResult::AxUnavailable;
-        };
-
-        let mut rows = Vec::new();
-        table.find_all("AXRow", &mut rows);
-
-        let mut out = Vec::with_capacity(rows.len());
-        for row in rows {
-            let mut static_texts = Vec::new();
-            row.find_all("AXStaticText", &mut static_texts);
-            let Some(name) = static_texts.first().and_then(|t| t.value.clone()) else {
-                continue;
-            };
-            let mut unread = 0;
-            let mut timestamp = String::new();
-            for t in static_texts.iter().skip(1) {
-                let Some(v) = t.value.as_deref() else {
-                    continue;
-                };
-                if let Ok(n) = v.trim().parse::<i32>() {
-                    if unread == 0 {
-                        unread = n;
-                    }
-                } else if timestamp.is_empty() {
-                    timestamp = v.to_string();
-                }
-            }
-            let preview = row
-                .find_first("AXTextArea")
-                .and_then(|t| t.value.clone())
-                .unwrap_or_default();
-            out.push(ChatListRow {
-                name,
-                unread,
-                preview,
-                timestamp,
-            });
-        }
-
-        super::normalize_service_rows(out)
+        super::classify_service_rows(scrape_chat_list_for_service_rows(&main_window))
     }
 
     #[cfg(test)]
@@ -847,6 +904,13 @@ mod imp {
         #[test]
         fn open_chat_timeout_is_bounded() {
             assert!(OPEN_CHAT_TIMEOUT.as_secs() > 0);
+        }
+        #[test]
+        fn service_traversal_budget_is_bounded() {
+            const {
+                assert!(SERVICE_AX_MESSAGING_TIMEOUT_SECS > 0.0);
+                assert!(SERVICE_AX_TRAVERSAL_TIMEOUT.as_nanos() > 0);
+            };
         }
 
         #[test]
@@ -936,13 +1000,19 @@ impl ServiceScraper for DefaultServiceScraper {
     }
 }
 
+fn classify_service_rows(rows: Option<Vec<ChatListRow>>) -> ServiceScrapeResult {
+    match rows {
+        Some(rows) => normalize_service_rows(rows),
+        None => ServiceScrapeResult::AxUnavailable,
+    }
+}
+
 fn normalize_service_rows(rows: Vec<ChatListRow>) -> ServiceScrapeResult {
     if rows.len() > 10_000 {
         return ServiceScrapeResult::Failed;
     }
 
     let mut normalized = Vec::new();
-    let mut by_name = HashMap::new();
     for row in rows {
         let name = row.name.trim();
         if name.is_empty() || row.unread < 0 {
@@ -951,30 +1021,18 @@ fn normalize_service_rows(rows: Vec<ChatListRow>) -> ServiceScrapeResult {
             }
             continue;
         }
-        let row = ChatListRow {
+        if normalized
+            .iter()
+            .any(|existing: &ChatListRow| existing.name == name)
+        {
+            return ServiceScrapeResult::Failed;
+        }
+        normalized.push(ChatListRow {
             name: name.to_string(),
             ..row
-        };
-        if let Some(index) = by_name.get(&row.name).copied() {
-            merge_service_row(&mut normalized[index], row);
-        } else {
-            by_name.insert(row.name.clone(), normalized.len());
-            normalized.push(row);
-        }
+        });
     }
     ServiceScrapeResult::Success(normalized)
-}
-
-fn merge_service_row(existing: &mut ChatListRow, candidate: ChatListRow) {
-    if candidate.unread > existing.unread {
-        existing.unread = candidate.unread;
-    }
-    if existing.preview.is_empty() && !candidate.preview.is_empty() {
-        existing.preview = candidate.preview;
-    }
-    if existing.timestamp.is_empty() && !candidate.timestamp.is_empty() {
-        existing.timestamp = candidate.timestamp;
-    }
 }
 
 #[cfg(test)]
@@ -982,7 +1040,7 @@ mod service_tests {
     use super::*;
 
     #[test]
-    fn normalizes_duplicate_service_rows() {
+    fn rejects_duplicate_service_rows() {
         let result = normalize_service_rows(vec![
             ChatListRow {
                 name: "Alice".to_string(),
@@ -997,14 +1055,13 @@ mod service_tests {
                 timestamp: "09:10".to_string(),
             },
         ]);
+        assert_eq!(result, ServiceScrapeResult::Failed);
+    }
+    #[test]
+    fn classifies_bounded_traversal_failure_as_ax_unavailable() {
         assert_eq!(
-            result,
-            ServiceScrapeResult::Success(vec![ChatListRow {
-                name: "Alice".to_string(),
-                unread: 3,
-                preview: "hello".to_string(),
-                timestamp: "09:10".to_string(),
-            }])
+            classify_service_rows(None),
+            ServiceScrapeResult::AxUnavailable
         );
     }
 

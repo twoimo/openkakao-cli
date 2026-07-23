@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{anyhow, Result};
 use chrono::Utc;
@@ -323,6 +323,14 @@ async fn run_service_iteration<S: ServiceScraper>(
     Ok(())
 }
 
+fn next_service_poll_start(previous_start: Instant, interval: Duration, now: Instant) -> Instant {
+    let mut next = previous_start + interval;
+    while next <= now {
+        next += interval;
+    }
+    next
+}
+
 fn cmd_ax_watch_service(options: AxWatchOptions) -> Result<()> {
     if let Err(error) = validate_service_mode_options(&options) {
         write_service_config_invalid_status(&options);
@@ -350,6 +358,8 @@ fn cmd_ax_watch_service(options: AxWatchOptions) -> Result<()> {
 
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
+        let interval = Duration::from_secs(options.interval_secs);
+        let mut poll_start = Instant::now();
         loop {
             run_service_iteration(
                 &scraper,
@@ -360,7 +370,8 @@ fn cmd_ax_watch_service(options: AxWatchOptions) -> Result<()> {
                 &mut loop_state,
             )
             .await?;
-            tokio::time::sleep(Duration::from_secs(options.interval_secs)).await;
+            poll_start = next_service_poll_start(poll_start, interval, Instant::now());
+            tokio::time::sleep_until(tokio::time::Instant::from_std(poll_start)).await;
         }
     })
 }
@@ -568,6 +579,19 @@ mod tests {
         })
         .unwrap_err();
         assert!(error.to_string().contains("--interval 5"));
+    }
+    #[test]
+    fn service_poll_cadence_is_anchored_to_poll_starts() {
+        let start = Instant::now();
+        let interval = Duration::from_secs(WATCH_INTERVAL_SECS);
+        assert_eq!(
+            next_service_poll_start(start, interval, start + Duration::from_secs(2)),
+            start + interval
+        );
+        assert_eq!(
+            next_service_poll_start(start, interval, start + Duration::from_secs(12)),
+            start + interval + interval + interval
+        );
     }
 
     #[test]
