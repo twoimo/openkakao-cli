@@ -373,6 +373,17 @@ mod imp {
             .set_attribute(&focused_attr, CFBoolean::true_value().as_CFType())
             .map_err(|e| anyhow!("composer could not be focused: {e:?}"))
     }
+    /// Read the selected composer field's current text, if Accessibility
+    /// exposes `AXValue` as a string. An unavailable or non-string value is
+    /// deliberately left unconfirmed rather than used to trigger a retry.
+    fn composer_text(field: &AXUIElement) -> Option<String> {
+        let value_attr: AXAttribute<CFType> = AXAttribute::new(&CFString::new("AXValue"));
+        field
+            .attribute(&value_attr)
+            .ok()
+            .and_then(|value| value.downcast::<CFString>())
+            .map(|value| value.to_string())
+    }
 
     /// Type `text` into the focused field by posting one keyboard CGEvent pair
     /// per character directly to KakaoTalk's pid, using the Unicode string
@@ -643,8 +654,8 @@ mod imp {
     }
 
     /// Send `message` to the chat identified by `chat_display_name` via AX
-    /// automation. Returns after KakaoTalk accepts the Return key event; callers
-    /// must treat delivery as unconfirmed and avoid automatic retries.
+    /// automation. Performs bounded composer-state acceptance verification after
+    /// Return, but does not confirm delivery and never automatically retries it.
     ///
     /// `chat_display_name` should be a substring of the chat's title as shown
     /// in the chat list (same matching convention as kakaocli's `send`).
@@ -684,6 +695,22 @@ mod imp {
             type_text_to_pid(pid, message)?;
         }
         press_return(pid)?;
+        sleep(Duration::from_millis(150));
+
+        // A readable, unchanged composer means KakaoTalk accepted the text but
+        // ignored the first Return. Retry once only in that exact state; an
+        // unreadable value remains accepted-but-unconfirmed to avoid duplicates.
+        if composer_text(&field).as_deref() == Some(message) {
+            focus_composer(&field)?;
+            press_return(pid)?;
+            sleep(Duration::from_millis(150));
+
+            if composer_text(&field).as_deref() == Some(message) {
+                return Err(anyhow!(
+                    "KakaoTalk left the message in the composer after two Return attempts; no further retry was made"
+                ));
+            }
+        }
 
         Ok(())
     }
