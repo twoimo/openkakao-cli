@@ -53,3 +53,6 @@ docs/plans/
 docs/superpowers/
 .superpowers/
 capture.jsonl
+.gjc/
+artifacts/
+KakaoTalk_Chat_*.csv
