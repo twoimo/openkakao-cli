@@ -192,25 +192,19 @@ def extract_urls(message: str) -> list[str]:
     return re.findall(r"https?://[^\s<>\"]+", message)[:2]
 
 
-def capture_image_input() -> Path | None:
-    if sys.platform != "darwin":
-        return None
-    try:
-        fd, name = tempfile.mkstemp(prefix="bujamentor-image-", suffix=".png")
-        os.close(fd)
-        path = Path(name)
-        result = subprocess.run(
-            ["/usr/sbin/screencapture", "-x", "-T", "1", str(path)],
-            timeout=3,
-            capture_output=True,
-            check=False,
-        )
-        if result.returncode == 0 and path.exists() and path.stat().st_size:
-            return path
-        path.unlink(missing_ok=True)
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    return None
+def links_fully_retrieved(message: str, previews: list[dict]) -> bool:
+    urls = extract_urls(message)
+    if not urls:
+        return True
+    if len(previews) != len(urls):
+        return False
+    return all(
+        str(preview.get("url") or "").strip()
+        and (str(preview.get("title") or "").strip() or str(preview.get("text") or "").strip())
+        for preview in previews
+    )
+
+
 
 
 def fetch_link_previews(message: str) -> list[dict]:
@@ -402,29 +396,30 @@ def main() -> int:
 
     provided_image = str(event.get("image_path") or "").strip()
     image_path = Path(provided_image) if provided_image and Path(provided_image).is_file() else None
-    if image_path is None and event.get("method") == "system_events_ax" and attachment == "image":
-        image_path = capture_image_input()
     try:
         if attachment == "image" and image_path is None:
             reply = ""
         else:
-            previews = fetch_link_previews(message)
             urls = extract_urls(message)
-            try:
-                context = run_context_search(message)
-                styles = run_style_search(message)
-            except (OSError, subprocess.TimeoutExpired):
-                context = []
-                styles = []
-            reply = generate_reply(
-                message,
-                context,
-                styles,
-                previews,
-                attachment,
-                image_path,
-                bool(urls),
-            )
+            previews = fetch_link_previews(message)
+            if urls and not links_fully_retrieved(message, previews):
+                reply = ""
+            else:
+                try:
+                    context = run_context_search(message)
+                    styles = run_style_search(message)
+                except (OSError, subprocess.TimeoutExpired):
+                    context = []
+                    styles = []
+                reply = generate_reply(
+                    message,
+                    context,
+                    styles,
+                    previews,
+                    attachment,
+                    image_path,
+                    bool(urls),
+                )
     finally:
         if image_path is not None:
             image_path.unlink(missing_ok=True)
