@@ -204,8 +204,13 @@ def invoke_hook(event: dict, dry_run: bool) -> tuple[int, str]:
     return result.returncode, result.stdout.strip()
 
 
-def poll_once(state: dict, dry_run: bool, allow_send: bool) -> list[dict]:
-    raw_rows = snapshot()
+def poll_once(
+    state: dict,
+    dry_run: bool,
+    allow_send: bool,
+    snapshot_timeout: float = 10.0,
+) -> list[dict]:
+    raw_rows = snapshot(limit_seconds=max(snapshot_timeout, 0.5))
     rows, sender = normalize_rows(raw_rows, str(state.get("last_sender") or ""))
     state["last_sender"] = sender
     if not raw_rows:
@@ -260,11 +265,12 @@ def main() -> int:
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--allow-send", action="store_true")
+    parser.add_argument("--snapshot-timeout", type=float, default=10.0)
     args = parser.parse_args()
 
     state = load_state()
     while True:
-        results = poll_once(state, args.dry_run, args.allow_send)
+        results = poll_once(state, args.dry_run, args.allow_send, args.snapshot_timeout)
         if results:
             print(json.dumps(results, ensure_ascii=False), flush=True)
         if args.once:
