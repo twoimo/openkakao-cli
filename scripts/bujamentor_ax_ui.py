@@ -116,10 +116,14 @@ def snapshot(limit_seconds: float = 3.0) -> list[dict[str, Any]]:
 
 
 def visible_outgoing(message: str, limit_seconds: float = 3.0, min_row_index: int = 0) -> bool:
-    """Confirm an exact outgoing bubble rendered after a known baseline."""
+    """Confirm an exact rendered bubble after a known baseline.
+
+    KakaoTalk's AX tree can report a right-side outgoing bubble as incoming
+    when the chat window is narrow; exact text plus a post-send row boundary
+    is the reliable delivery signal.
+    """
     return any(
-        row.get("direction") == "outgoing"
-        and row.get("text") == message
+        row.get("text") == message
         and int(row.get("row_index", 0)) >= min_row_index
         for row in snapshot(limit_seconds)
     )
