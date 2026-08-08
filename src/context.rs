@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use chrono::NaiveDateTime;
 use csv::ReaderBuilder;
 use rusqlite::{params, Connection};
 use serde::Serialize;
@@ -8,6 +9,21 @@ use std::path::{Path, PathBuf};
 
 const VECTOR_DIM: usize = 128;
 const STYLE_USER: &str = "최연우";
+const MAX_RESPONSE_DELAY_SECONDS: i64 = 24 * 60 * 60;
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ResponseTimeStats {
+    pub chat: String,
+    pub source: String,
+    pub user: String,
+    pub sample_count: usize,
+    pub average_seconds: f64,
+    pub median_seconds: f64,
+    pub p90_seconds: f64,
+    pub min_seconds: f64,
+    pub max_seconds: f64,
+    pub max_window_seconds: i64,
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ContextResult {
@@ -25,6 +41,22 @@ pub fn default_db_path() -> PathBuf {
         .or_else(dirs::home_dir)
         .unwrap_or_else(|| PathBuf::from("/tmp"));
     base.join("openkakao").join("context.sqlite3")
+}
+fn parse_chat_date(value: &str) -> Option<NaiveDateTime> {
+    NaiveDateTime::parse_from_str(value.trim(), "%Y-%m-%d %H:%M:%S")
+        .or_else(|_| NaiveDateTime::parse_from_str(value.trim(), "%Y-%m-%d %H:%M"))
+        .ok()
+}
+
+fn is_response_participant(user: &str) -> bool {
+    let user = user.trim();
+    !user.is_empty()
+        && user != STYLE_USER
+        && !user.ends_with('봇')
+        && !matches!(
+            user,
+            "드리고" | "뉴스봇" | "채팅봇" | "주식봇" | "날씨날씨" | "인아웃" | "채팅도구"
+        )
 }
 
 pub fn index_csv(db_path: &Path, chat: &str, input: &Path) -> Result<usize> {
@@ -58,6 +90,8 @@ pub fn index_csv(db_path: &Path, chat: &str, input: &Path) -> Result<usize> {
         "DELETE FROM choi_yeonwoo_style WHERE source = ?1",
         [&source],
     )?;
+    let mut previous_human_at: Option<NaiveDateTime> = None;
+    let mut response_delays = Vec::new();
     let mut count = 0;
     for row in reader.records() {
         let row = row.context("invalid CSV record")?;
@@ -70,6 +104,18 @@ pub fn index_csv(db_path: &Path, chat: &str, input: &Path) -> Result<usize> {
         }
         let date = row.get(date_idx).unwrap_or_default().to_string();
         let user = row.get(user_idx).unwrap_or_default().to_string();
+        if let Some(current_at) = parse_chat_date(&date) {
+            if user == STYLE_USER {
+                if let Some(previous_at) = previous_human_at.take() {
+                    let delay = (current_at - previous_at).num_seconds();
+                    if (0..=MAX_RESPONSE_DELAY_SECONDS).contains(&delay) {
+                        response_delays.push(delay as f64);
+                    }
+                }
+            } else if is_response_participant(&user) {
+                previous_human_at = Some(current_at);
+            }
+        }
         let vector = encode_vector(&format!("{} {}", user, message));
         tx.execute("INSERT INTO context_messages(source, chat, date, user_name, message, vector) VALUES (?1, ?2, ?3, ?4, ?5, ?6)", params![source, chat, date, user, message, vector_to_bytes(&vector)])?;
         if user == STYLE_USER {
@@ -77,8 +123,97 @@ pub fn index_csv(db_path: &Path, chat: &str, input: &Path) -> Result<usize> {
         }
         count += 1;
     }
+    tx.execute(
+        "DELETE FROM response_time_stats WHERE chat = ?1 AND source = ?2 AND user_name = ?3",
+        params![chat, source, STYLE_USER],
+    )?;
+    if let Some(stats) = summarize_response_delays(chat, &source, STYLE_USER, response_delays) {
+        tx.execute(
+            "INSERT INTO response_time_stats(chat, source, user_name, sample_count, average_seconds, median_seconds, p90_seconds, min_seconds, max_seconds, max_window_seconds) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                stats.chat,
+                stats.source,
+                stats.user,
+                stats.sample_count as i64,
+                stats.average_seconds,
+                stats.median_seconds,
+                stats.p90_seconds,
+                stats.min_seconds,
+                stats.max_seconds,
+                stats.max_window_seconds,
+            ],
+        )?;
+    }
     tx.commit()?;
     Ok(count)
+}
+fn summarize_response_delays(
+    chat: &str,
+    source: &str,
+    user: &str,
+    mut delays: Vec<f64>,
+) -> Option<ResponseTimeStats> {
+    if delays.is_empty() {
+        return None;
+    }
+    delays.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
+    let average_seconds = delays.iter().sum::<f64>() / delays.len() as f64;
+    let percentile = |ratio: f64| {
+        let position = (delays.len() - 1) as f64 * ratio;
+        let lower = position.floor() as usize;
+        let upper = position.ceil() as usize;
+        if lower == upper {
+            delays[lower]
+        } else {
+            delays[lower] + (delays[upper] - delays[lower]) * (position - lower as f64)
+        }
+    };
+    Some(ResponseTimeStats {
+        chat: chat.to_string(),
+        source: source.to_string(),
+        user: user.to_string(),
+        sample_count: delays.len(),
+        average_seconds,
+        median_seconds: percentile(0.5),
+        p90_seconds: percentile(0.9),
+        min_seconds: delays[0],
+        max_seconds: *delays.last().unwrap_or(&delays[0]),
+        max_window_seconds: MAX_RESPONSE_DELAY_SECONDS,
+    })
+}
+
+pub fn response_time_stats(
+    db_path: &Path,
+    chat: &str,
+    user: &str,
+    source: Option<&str>,
+) -> Result<Option<ResponseTimeStats>> {
+    let conn = open_db(db_path)?;
+    let mut stmt = conn.prepare(
+        "SELECT chat, source, user_name, sample_count, average_seconds, median_seconds, p90_seconds, min_seconds, max_seconds, max_window_seconds
+         FROM response_time_stats
+         WHERE chat = ?1 AND user_name = ?2 AND (?3 IS NULL OR source = ?3)
+         ORDER BY sample_count DESC
+         LIMIT 1",
+    )?;
+    match stmt.query_row(params![chat, user, source], |row| {
+        Ok(ResponseTimeStats {
+            chat: row.get(0)?,
+            source: row.get(1)?,
+            user: row.get(2)?,
+            sample_count: row.get::<_, i64>(3)? as usize,
+            average_seconds: row.get(4)?,
+            median_seconds: row.get(5)?,
+            p90_seconds: row.get(6)?,
+            min_seconds: row.get(7)?,
+            max_seconds: row.get(8)?,
+            max_window_seconds: row.get(9)?,
+        })
+    }) {
+        Ok(stats) => Ok(Some(stats)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
 }
 
 pub fn search(
@@ -168,7 +303,9 @@ fn open_db(path: &Path) -> Result<Connection> {
         CREATE TRIGGER IF NOT EXISTS context_messages_ad AFTER DELETE ON context_messages BEGIN INSERT INTO context_messages_fts(context_messages_fts,rowid,message,user_name,chat) VALUES('delete',old.id,old.message,old.user_name,old.chat); END;
         CREATE TRIGGER IF NOT EXISTS context_messages_au AFTER UPDATE ON context_messages BEGIN INSERT INTO context_messages_fts(context_messages_fts,rowid,message,user_name,chat) VALUES('delete',old.id,old.message,old.user_name,old.chat); INSERT INTO context_messages_fts(rowid,message,user_name,chat) VALUES(new.id,new.message,new.user_name,new.chat); END;
         CREATE TABLE IF NOT EXISTS choi_yeonwoo_style(id INTEGER PRIMARY KEY, source TEXT NOT NULL, chat TEXT NOT NULL, date TEXT NOT NULL, user_name TEXT NOT NULL CHECK(user_name = '최연우'), message TEXT NOT NULL, vector BLOB NOT NULL);
-        CREATE INDEX IF NOT EXISTS idx_choi_yeonwoo_style_chat_source ON choi_yeonwoo_style(chat, source);")?;
+        CREATE INDEX IF NOT EXISTS idx_choi_yeonwoo_style_chat_source ON choi_yeonwoo_style(chat, source);
+        CREATE TABLE IF NOT EXISTS response_time_stats(chat TEXT NOT NULL, source TEXT NOT NULL, user_name TEXT NOT NULL CHECK(user_name = '최연우'), sample_count INTEGER NOT NULL, average_seconds REAL NOT NULL, median_seconds REAL NOT NULL, p90_seconds REAL NOT NULL, min_seconds REAL NOT NULL, max_seconds REAL NOT NULL, max_window_seconds INTEGER NOT NULL, PRIMARY KEY(chat, source, user_name));
+        CREATE INDEX IF NOT EXISTS idx_response_time_stats_chat_user ON response_time_stats(chat, user_name);")?;
     Ok(conn)
 }
 
@@ -404,6 +541,32 @@ mod tests {
         assert_eq!(count, 1);
     }
 
+    #[test]
+    fn indexes_and_reads_response_time_from_vector_db() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("index.sqlite3");
+        let path = dir.path().join("chat.csv");
+        fs::write(
+            &path,
+            "Date,User,Message\n\
+             2026-01-01 00:00:00,문승현,질문 하나\n\
+             2026-01-01 00:00:10,최연우,답변 하나\n\
+             2026-01-01 00:01:00,민수,질문 둘\n\
+             2026-01-01 00:03:00,최연우,답변 둘\n",
+        )
+        .unwrap();
+
+        index_csv(&db, "부자멘토멘티", &path).unwrap();
+        let stats = response_time_stats(&db, "부자멘토멘티", STYLE_USER, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stats.sample_count, 2);
+        assert!((stats.average_seconds - 65.0).abs() < f64::EPSILON);
+        assert!((stats.median_seconds - 65.0).abs() < f64::EPSILON);
+        assert_eq!(stats.p90_seconds, 109.0);
+        assert_eq!(stats.min_seconds, 10.0);
+        assert_eq!(stats.max_seconds, 120.0);
+    }
     #[test]
     fn reindex_removes_old_rows_and_vector_is_deterministic() {
         let dir = tempdir().unwrap();

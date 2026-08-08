@@ -576,6 +576,17 @@ enum Commands {
         #[arg(long)]
         db: Option<String>,
     },
+    /// Show Choi Yeonwoo's response-time statistics from the local vector database
+    ContextResponseTime {
+        #[arg(long)]
+        chat: String,
+        #[arg(long, default_value = "최연우")]
+        user: String,
+        #[arg(long)]
+        source: Option<String>,
+        #[arg(long)]
+        db: Option<String>,
+    },
     #[command(name = "ax-service-scrape-once", hide = true)]
     AxServiceScrapeOnce,
     /// Send a message via AX automation (no server contact, drives KakaoTalk's UI directly)
@@ -1426,6 +1437,36 @@ fn main() -> Result<()> {
                     "{} results (offline 최연우 style vector search)",
                     results.len()
                 );
+            }
+        }
+        Commands::ContextResponseTime {
+            chat,
+            user,
+            source,
+            db,
+        } => {
+            let db_path = db
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(openkakao_cli::context::default_db_path);
+            let stats = openkakao_cli::context::response_time_stats(
+                &db_path,
+                &chat,
+                &user,
+                source.as_deref(),
+            )?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&stats)?);
+            } else if let Some(stats) = stats {
+                println!(
+                    "{} average response: {:.1}s (median {:.1}s, p90 {:.1}s, {} samples)",
+                    stats.user,
+                    stats.average_seconds,
+                    stats.median_seconds,
+                    stats.p90_seconds,
+                    stats.sample_count
+                );
+            } else {
+                println!("No response-time samples for '{}' in '{}'.", user, chat);
             }
         }
         Commands::AxServiceScrapeOnce => {

@@ -31,6 +31,7 @@ tell application "System Events"
     repeat with i from firstIndex to n
       set r to row i of t
       set fields to {(i as text)}
+      set imageRect to ""
       try
         set {rx, ry} to position of r
         set rowDirection to "outgoing"
@@ -56,12 +57,20 @@ tell application "System Events"
               set end of fields to "text=" & (value of e as text)
             else if erole is "AXImage" then
               set hasImage to true
+              try
+                set {ix, iy} to position of e
+                set {iw, ih} to size of e
+                set imageRect to (ix as text) & "," & (iy as text) & "," & (iw as text) & "," & (ih as text)
+              end try
               if rowDirection is not "unknown" then set end of fields to "direction=" & rowDirection
             end if
           end try
         end repeat
       end repeat
-      if hasImage and not hasTextArea then set end of fields to "attachment=image"
+      if hasImage and not hasTextArea then
+        set end of fields to "attachment=image"
+        if imageRect is not "" then set end of fields to "image_rect=" & imageRect
+      end if
       set AppleScript's text item delimiters to sep
       set end of out to (fields as text)
     end repeat
@@ -105,7 +114,7 @@ def snapshot(limit_seconds: float = 3.0) -> list[dict[str, Any]]:
                 continue
             if key == "static":
                 statics.append(value)
-            elif key in {"direction", "text", "attachment"}:
+            elif key in {"direction", "text", "attachment", "image_rect"}:
                 row[key] = value
         row["static"] = statics
         if isinstance(row.get("text"), str) or row.get("attachment"):

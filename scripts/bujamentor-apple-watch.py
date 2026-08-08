@@ -181,6 +181,7 @@ def event_for(row: dict) -> dict:
         "message": row["message"],
         "timestamp": row.get("timestamp", ""),
         "attachment": row.get("attachment", ""),
+        "image_rect": row.get("image_rect", ""),
         "unread": 0,
         "event_id": event_id,
         "source_row_index": row["row_index"],
