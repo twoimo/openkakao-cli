@@ -212,3 +212,44 @@ pub fn download_media_file(creds: &KakaoCredentials, url: &str, path: &Path) -> 
     let bytes = std::io::copy(&mut response, &mut file)?;
     Ok(bytes)
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_kakao_attachment_key() {
+        let result = parse_attachment_url(r#"{"k":"abc/photo.jpg"}"#, 2);
+        assert_eq!(
+            result,
+            Some((
+                "https://dn-m.talk.kakao.com/talkm/abc/photo.jpg".into(),
+                "photo.jpg".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_attachment_json() {
+        assert!(parse_attachment_url("not-json", 2).is_none());
+    }
+
+    #[test]
+    fn rejects_non_kakao_download_domains() {
+        let creds = KakaoCredentials {
+            oauth_token: String::new(),
+            device_uuid: String::new(),
+            device_name: String::new(),
+            a_header: String::new(),
+            user_agent: String::new(),
+            app_version: String::new(),
+            user_id: 0,
+            refresh_token: None,
+            email: None,
+            rest_token: None,
+        };
+        let path = std::env::temp_dir().join("openkakao-media-test.bin");
+        let result = download_media_file(&creds, "https://example.com/image.jpg", &path);
+        assert!(result.is_err());
+        let _ = std::fs::remove_file(path);
+    }
+}

@@ -30,6 +30,7 @@ pub struct LocalMessage {
     pub author_id: i64,
     pub sender_name: String,
     pub message: String,
+    pub attachment: String,
     pub message_type: i32,
     pub sent_at: i64,
 }
@@ -188,7 +189,7 @@ fn extract_active_account_hash(dict: &plist::Dictionary) -> Option<String> {
 /// resort and runs on the main thread, so it must not hang the CLI when the
 /// hash has no small pre-image (logged-out account, foreign hash, or a userId
 /// outside the scanned range).
-const SHA512_BRUTE_FORCE_BUDGET: std::time::Duration = std::time::Duration::from_secs(15);
+const SHA512_BRUTE_FORCE_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Recover a userId by brute-forcing the SHA-512 pre-image.
 /// KakaoTalk stores SHA-512(userId) in plist revision keys. userIds are small
@@ -545,7 +546,7 @@ impl LocalDbReader {
                 (
                     "SELECT m.logId, m.chatId, m.authorId,
                         COALESCE(u.displayName, u.friendNickName, u.nickName, '') as senderName,
-                        COALESCE(m.message, '') as message, m.type, m.sentAt
+                        COALESCE(m.message, '') as message, m.attachment, m.type, m.sentAt
                  FROM NTChatMessage m
                  LEFT JOIN NTUser u ON m.authorId = u.userId AND u.linkId = 0
                  WHERE m.chatId = ? AND m.sentAt >= ?
@@ -558,7 +559,7 @@ impl LocalDbReader {
                 (
                     "SELECT m.logId, m.chatId, m.authorId,
                         COALESCE(u.displayName, u.friendNickName, u.nickName, '') as senderName,
-                        COALESCE(m.message, '') as message, m.type, m.sentAt
+                        COALESCE(m.message, '') as message, m.attachment, m.type, m.sentAt
                  FROM NTChatMessage m
                  LEFT JOIN NTUser u ON m.authorId = u.userId AND u.linkId = 0
                  WHERE m.chatId = ?
@@ -580,8 +581,9 @@ impl LocalDbReader {
                     author_id: row.get(2).unwrap_or(0),
                     sender_name: row.get(3).unwrap_or_default(),
                     message: row.get(4).unwrap_or_default(),
-                    message_type: row.get(5).unwrap_or(0),
-                    sent_at: row.get(6).unwrap_or(0),
+                    attachment: row.get(5).unwrap_or_default(),
+                    message_type: row.get(6).unwrap_or(0),
+                    sent_at: row.get(7).unwrap_or(0),
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -610,6 +612,7 @@ impl LocalDbReader {
                     author_id: row.get(2).unwrap_or(0),
                     sender_name: row.get(3).unwrap_or_default(),
                     message: row.get(4).unwrap_or_default(),
+                    attachment: String::new(),
                     message_type: row.get(5).unwrap_or(0),
                     sent_at: row.get(6).unwrap_or(0),
                 })

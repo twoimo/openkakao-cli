@@ -1,7 +1,7 @@
 use anyhow::Result;
 
 use crate::ax_send;
-use crate::util::{confirm, truncate, validate_outbound_message};
+use crate::util::{confirm, normalize_outgoing_message, truncate, validate_outbound_message};
 
 pub struct LocalSendOptions {
     pub chat_name: String,
@@ -23,13 +23,14 @@ pub fn cmd_local_send(opts: LocalSendOptions) -> Result<()> {
         dry_run,
         json,
     } = opts;
-    validate_outbound_message(message)?;
+    let message = normalize_outgoing_message(message);
+    validate_outbound_message(&message)?;
 
     if dry_run {
         eprintln!(
             "[dry-run] Would AX-send to chat \"{}\": \"{}\"",
             chat_name,
-            truncate(message, 80)
+            truncate(&message, 80)
         );
         if json {
             crate::util::output_json(&serde_json::json!({
@@ -46,7 +47,7 @@ pub fn cmd_local_send(opts: LocalSendOptions) -> Result<()> {
         eprint!(
             "AX-send to chat \"{}\"? Message: \"{}\"\n[y/N] ",
             chat_name,
-            truncate(message, 50)
+            truncate(&message, 50)
         );
         if !confirm()? {
             println!("Cancelled.");
@@ -54,7 +55,7 @@ pub fn cmd_local_send(opts: LocalSendOptions) -> Result<()> {
         }
     }
 
-    ax_send::send_via_ax(chat_name, message)?;
+    ax_send::send_via_ax(chat_name, &message)?;
     eprintln!(
         "Warning: KakaoTalk accepted the send action, but delivery is not confirmed. \
          Check the chat before retrying to avoid duplicates."

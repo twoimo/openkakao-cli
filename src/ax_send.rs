@@ -102,14 +102,20 @@ mod match_tests {
 #[cfg(target_os = "macos")]
 mod imp {
 
-    use std::process::Command;
+    use std::collections::VecDeque;
+    use std::process::{Command, Stdio};
     use std::thread::sleep;
     use std::time::{Duration, Instant};
 
-    use accessibility::{AXAttribute, AXUIElement, AXUIElementAttributes};
+    use accessibility::{
+        AXAttribute, AXUIElement, AXUIElementAttributes, Error as AccessibilityError,
+    };
     use accessibility_sys::kAXPressAction;
     use accessibility_sys::AXIsProcessTrusted;
-    use accessibility_sys::{AXUIElementCopyMultipleAttributeValues, AXUIElementRef};
+    use accessibility_sys::{
+        kAXErrorAttributeUnsupported, kAXErrorNoValue, AXUIElementCopyMultipleAttributeValues,
+        AXUIElementRef,
+    };
     use anyhow::{anyhow, Context, Result};
     use core_foundation::array::{CFArray, CFArrayRef};
     use core_foundation::base::{CFType, TCFType};
@@ -121,9 +127,8 @@ mod imp {
     const KAKAOTALK_BUNDLE_ID: &str = "com.kakao.KakaoTalkMac";
     const RETURN_KEYCODE: u16 = 36;
     const OPEN_CHAT_TIMEOUT: Duration = Duration::from_secs(5);
-    const SERVICE_AX_MESSAGING_TIMEOUT_SECS: f32 = 0.25;
-    const SERVICE_AX_TRAVERSAL_TIMEOUT: Duration = Duration::from_secs(3);
-    const SERVICE_AX_NODE_LIMIT: usize = 512;
+    const SERVICE_AX_TRAVERSAL_TIMEOUT: Duration = Duration::from_secs(10);
+    const SERVICE_AX_MESSAGING_TIMEOUT_SECS: f32 = 0.5;
 
     /// Find the running KakaoTalk process id via `pgrep -x`.
     ///
@@ -177,6 +182,25 @@ mod imp {
             .and_then(|v| v.downcast::<CFString>())
             .map(|s| s.to_string())
     }
+    fn debug_ax_failure(stage: &str, error: impl std::fmt::Debug) {
+        if std::env::var_os("OPENKAKAO_CLI_DEBUG_AX").is_some() {
+            eprintln!("[ax_send] {stage} failed: {error:?}");
+        }
+    }
+    fn child_elements(element: &AXUIElement) -> Result<Vec<AXUIElement>, ()> {
+        match element.children() {
+            Ok(children) => Ok(children.iter().map(|child| (*child).clone()).collect()),
+            Err(AccessibilityError::Ax(code))
+                if code == kAXErrorNoValue || code == kAXErrorAttributeUnsupported =>
+            {
+                Ok(Vec::new())
+            }
+            Err(error) => {
+                debug_ax_failure("children", error);
+                Err(())
+            }
+        }
+    }
 
     /// Find KakaoTalk's main chat-list window, as opposed to any individual
     /// open-chat windows (which are separate `AXWindow`s titled with the
@@ -224,95 +248,19 @@ mod imp {
 
         Ok(window)
     }
-    fn service_walk(
-        root: &AXUIElement,
-        deadline: Instant,
-        target_role: &str,
-        skip_matching_subtrees: bool,
-        stop_after_first_match: bool,
-    ) -> Option<Vec<AXUIElement>> {
-        let mut stack = vec![root.clone()];
-        let mut matches = Vec::new();
-        let mut visited = 0;
-
-        while let Some(element) = stack.pop() {
-            if Instant::now() >= deadline || visited >= SERVICE_AX_NODE_LIMIT {
-                return None;
-            }
-            visited += 1;
-            if element
-                .set_messaging_timeout(SERVICE_AX_MESSAGING_TIMEOUT_SECS)
-                .is_err()
-            {
-                return None;
-            }
-            if role(&element) == target_role {
-                matches.push(element.clone());
-                if stop_after_first_match {
-                    return Some(matches);
-                }
-                if skip_matching_subtrees {
-                    continue;
-                }
-            }
-            let children: Vec<_> = element
-                .children()
-                .ok()?
-                .iter()
-                .map(|child| (*child).clone())
-                .collect();
-            for child in children.into_iter().rev() {
-                stack.push(child);
-            }
-        }
-
-        Some(matches)
-    }
 
     /// Service-only scraper: bounded and read-only. Unlike interactive commands,
     /// it never changes tabs when the chat table is absent.
     fn scrape_chat_list_for_service_rows(main_window: &AXUIElement) -> Option<Vec<ChatListRow>> {
-        let deadline = Instant::now() + SERVICE_AX_TRAVERSAL_TIMEOUT;
-        let table = service_walk(main_window, deadline, "AXTable", true, true)?
+        let table_deadline = Instant::now() + SERVICE_AX_TRAVERSAL_TIMEOUT;
+        let table = live_walk(main_window, table_deadline, "AXTable", true, true)?
             .into_iter()
             .next()?;
-        let rows = service_walk(&table, deadline, "AXRow", true, false)?;
-        let mut out = Vec::with_capacity(rows.len());
-
-        for row in rows {
-            let static_texts = service_walk(&row, deadline, "AXStaticText", false, false)?;
-            let Some(name) = static_texts
-                .first()
-                .and_then(|text| attr_as_string(text, "AXValue"))
-            else {
-                continue;
-            };
-            let mut unread = 0;
-            let mut timestamp = String::new();
-            for text in static_texts.iter().skip(1) {
-                let Some(value) = attr_as_string(text, "AXValue") else {
-                    continue;
-                };
-                if let Ok(value) = value.trim().parse::<i32>() {
-                    if unread == 0 {
-                        unread = value;
-                    }
-                } else if timestamp.is_empty() {
-                    timestamp = value;
-                }
-            }
-            let preview = service_walk(&row, deadline, "AXTextArea", true, true)?
-                .first()
-                .and_then(|text| attr_as_string(text, "AXValue"))
-                .unwrap_or_default();
-            out.push(ChatListRow {
-                name,
-                unread,
-                preview,
-                timestamp,
-            });
-        }
-        Some(out)
+        let rows_deadline = Instant::now() + SERVICE_AX_TRAVERSAL_TIMEOUT;
+        let rows = live_walk(&table, rows_deadline, "AXRow", true, false)?;
+        rows.into_iter()
+            .map(|row| read_snapshot_chat_row(&snapshot(&row)))
+            .collect()
     }
 
     /// A single recursive snapshot of an AX subtree, capturing each node's
@@ -441,6 +389,34 @@ mod imp {
             }
         }
     }
+    fn read_snapshot_chat_row(row: &AxNode) -> Option<ChatListRow> {
+        let mut static_texts = Vec::new();
+        row.find_all("AXStaticText", &mut static_texts);
+        let name = static_texts.first()?.value.clone()?;
+        let mut unread = 0;
+        let mut timestamp = String::new();
+        for text in static_texts.iter().skip(1) {
+            let Some(value) = text.value.as_deref() else {
+                continue;
+            };
+            if let Ok(value) = value.trim().parse::<i32>() {
+                if unread == 0 {
+                    unread = value;
+                }
+            } else if timestamp.is_empty() {
+                timestamp = value.to_string();
+            }
+        }
+        let preview = row
+            .find_first("AXTextArea")
+            .and_then(|text| text.value.clone());
+        Some(ChatListRow {
+            name,
+            unread,
+            preview: preview.unwrap_or_default(),
+            timestamp,
+        })
+    }
 
     /// Post a CGEvent to KakaoTalk's pid directly (no `activate()` foreground
     /// switch — this is the Peekaboo-style fix for the focus race that hangs
@@ -523,52 +499,136 @@ mod imp {
         }
         snap
     }
+    const CHAT_ROW_LOOKUP_TIMEOUT: Duration = Duration::from_secs(8);
+    const CHAT_ROW_LOOKUP_NODE_LIMIT: usize = 4096;
+    const CHAT_ROW_LOOKUP_MESSAGING_TIMEOUT_SECS: f32 = 0.5;
 
-    fn open_chat_row(app: &AXUIElement, chat_display_name: &str) -> Result<()> {
-        let debug = std::env::var("OPENKAKAO_CLI_DEBUG").is_ok();
-        let start = Instant::now();
+    fn live_walk(
+        root: &AXUIElement,
+        deadline: Instant,
+        target_role: &str,
+        skip_matching_subtrees: bool,
+        stop_after_first_match: bool,
+    ) -> Option<Vec<AXUIElement>> {
+        let mut queue = VecDeque::from([root.clone()]);
+        let mut matches = Vec::new();
+        let mut visited = 0;
 
-        let main_window = find_main_window(app)?;
-        let snap = ensure_chatrooms_tab(&main_window);
-        if debug {
-            eprintln!(
-                "[ax_send] open_chat_row: snapshot took {:?}",
-                start.elapsed()
-            );
+        while let Some(element) = queue.pop_front() {
+            if Instant::now() >= deadline || visited >= CHAT_ROW_LOOKUP_NODE_LIMIT {
+                debug_ax_failure(
+                    "live_walk budget",
+                    format!("visited={visited}, node_limit={CHAT_ROW_LOOKUP_NODE_LIMIT}"),
+                );
+                return None;
+            }
+            visited += 1;
+            if let Err(error) =
+                element.set_messaging_timeout(CHAT_ROW_LOOKUP_MESSAGING_TIMEOUT_SECS)
+            {
+                debug_ax_failure("set_messaging_timeout", error);
+                return None;
+            }
+            if role(&element) == target_role {
+                matches.push(element.clone());
+                if stop_after_first_match {
+                    return Some(matches);
+                }
+                if skip_matching_subtrees {
+                    continue;
+                }
+            }
+            let children = match child_elements(&element) {
+                Ok(children) => children,
+                Err(()) => return None,
+            };
+            for child in children {
+                queue.push_back(child);
+            }
         }
-        let table = snap
-            .find_first("AXTable")
-            .ok_or_else(|| anyhow!("could not find chat list table in KakaoTalk's AX tree"))?;
+        Some(matches)
+    }
+    fn find_chat_table_live(main_window: &AXUIElement) -> Result<AXUIElement> {
+        let deadline = Instant::now() + CHAT_ROW_LOOKUP_TIMEOUT;
+        let table_matches = live_walk(main_window, deadline, "AXTable", true, true)
+            .ok_or_else(|| anyhow!("could not inspect KakaoTalk's AX tree"))?;
+        if let Some(table) = table_matches.into_iter().next() {
+            return Ok(table);
+        }
 
-        let mut rows = Vec::new();
-        table.find_all("AXRow", &mut rows);
+        let buttons = live_walk(
+            main_window,
+            Instant::now() + CHAT_ROW_LOOKUP_TIMEOUT,
+            "AXButton",
+            false,
+            false,
+        )
+        .ok_or_else(|| anyhow!("could not inspect KakaoTalk tab controls"))?;
+        let tab = buttons
+            .into_iter()
+            .find(|button| attr_as_string(button, "AXIdentifier").as_deref() == Some("chatrooms"))
+            .ok_or_else(|| anyhow!("KakaoTalk chatrooms tab is not visible"))?;
+        tab.perform_action(&CFString::new(kAXPressAction))
+            .map_err(|e| anyhow!("failed to select KakaoTalk chatrooms tab: {e:?}"))?;
+        sleep(Duration::from_millis(400));
+        live_walk(
+            main_window,
+            Instant::now() + CHAT_ROW_LOOKUP_TIMEOUT,
+            "AXTable",
+            true,
+            true,
+        )
+        .ok_or_else(|| anyhow!("could not inspect KakaoTalk's chat list after tab selection"))?
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow!("KakaoTalk chatrooms tab did not expose a chat list"))
+    }
 
-        // Match on the row's first AXStaticText (the chat name) exactly, not
-        // a substring — e.g. "Alice" must not accidentally match an
-        // "Alice & Bob" group chat. If more than one row has the exact same
-        // display name, refuse to guess rather than silently picking one
-        // (there is no chat-id to disambiguate with — see
-        // SafetyConfig::allowed_send_chats). The matching decision itself is
-        // `super::match_chat_row`, a pure function tested outside this
-        // macOS-only module.
+    fn find_chat_row_live(
+        main_window: &AXUIElement,
+        chat_display_name: &str,
+    ) -> Result<(AXUIElement, AXUIElement)> {
+        let table = find_chat_table_live(main_window)?;
+        let deadline = Instant::now() + CHAT_ROW_LOOKUP_TIMEOUT;
+        let rows = live_walk(&table, deadline, "AXRow", true, false)
+            .ok_or_else(|| anyhow!("could not read chat rows from KakaoTalk's AX tree"))?;
         let row_names: Vec<Option<String>> = rows
             .iter()
-            .map(|row| row.find_first("AXStaticText").and_then(|t| t.value.clone()))
+            .map(|row| {
+                snapshot(row)
+                    .find_first("AXStaticText")
+                    .and_then(|text| text.value.clone())
+            })
             .collect();
 
-        let row = match super::match_chat_row(&row_names, chat_display_name) {
+        let row_index = match super::match_chat_row(&row_names, chat_display_name) {
             super::ChatMatch::NotFound => {
                 return Err(anyhow!(
                     "chat '{chat_display_name}' not found in visible/loaded chat list"
                 ))
             }
-            super::ChatMatch::Found(idx) => rows[idx],
+            super::ChatMatch::Found(index) => index,
             super::ChatMatch::Ambiguous(count) => {
                 return Err(anyhow!(
                     "chat name '{chat_display_name}' matches {count} chats in the visible list — ambiguous, refusing to guess"
                 ))
             }
         };
+        Ok((table, rows[row_index].clone()))
+    }
+
+    fn open_chat_row(app: &AXUIElement, chat_display_name: &str) -> Result<()> {
+        let debug = std::env::var("OPENKAKAO_CLI_DEBUG").is_ok();
+        let start = Instant::now();
+
+        let main_window = find_main_window(app)?;
+        let (table, row) = find_chat_row_live(&main_window, chat_display_name)?;
+        if debug {
+            eprintln!(
+                "[ax_send] open_chat_row: live lookup took {:?}",
+                start.elapsed()
+            );
+        }
 
         // Select via AX attribute (works even for off-screen rows — this is the
         // fix kakaocli landed for its off-screen-row regression) rather than a
@@ -577,9 +637,8 @@ mod imp {
         // `accessibility` crate either way, so it's addressed by raw name).
         let selected_rows_attr: AXAttribute<CFType> =
             AXAttribute::new(&CFString::new("AXSelectedRows"));
-        let one_row = CFArray::from_CFTypes(std::slice::from_ref(&row.element));
+        let one_row = CFArray::from_CFTypes(std::slice::from_ref(&row));
         table
-            .element
             .set_attribute(&selected_rows_attr, one_row.as_CFType())
             .map_err(|e| anyhow!("failed to select chat row: {e:?}"))?;
 
@@ -608,24 +667,26 @@ mod imp {
         None
     }
 
-    /// Find the composer field, preferring the chat window whose title matches
-    /// `chat_display_name` (relevant when more than one chat window is already
-    /// open) and falling back to a whole-app search otherwise.
+    /// Find the composer field in the exact chat window named by
+    /// `chat_display_name`. Refuse a whole-app fallback because it could
+    /// select a different chat's composer.
     fn find_input_field(app: &AXUIElement, chat_display_name: &str) -> Result<AXUIElement> {
-        if let Ok(windows) = app.windows() {
-            if let Some(window) = windows.iter().find(|w| {
+        let windows = app
+            .windows()
+            .map_err(|e| anyhow!("could not inspect KakaoTalk windows: {e:?}"))?;
+        let window = windows
+            .iter()
+            .find(|w| {
                 w.title()
                     .map(|t| t.to_string())
                     .ok()
-                    .is_some_and(|t| t.contains(chat_display_name))
-            }) {
-                if let Some(field) = find_input_field_in(&window) {
-                    return Ok(field);
-                }
-            }
-        }
-        find_input_field_in(app).ok_or_else(|| {
-            anyhow!("could not find the message input field — is the chat window open and focused?")
+                    .is_some_and(|t| t == chat_display_name)
+            })
+            .ok_or_else(|| {
+                anyhow!("could not find the exact chat window for '{chat_display_name}'")
+            })?;
+        find_input_field_in(&window).ok_or_else(|| {
+            anyhow!("could not find the message input field in chat '{chat_display_name}'")
         })
     }
 
@@ -702,7 +763,7 @@ mod imp {
                 w.title()
                     .map(|t| t.to_string())
                     .ok()
-                    .is_some_and(|t| t.contains(chat_display_name))
+                    .is_some_and(|t| t == chat_display_name)
             })
             .map(|w| w.clone())
     }
@@ -809,7 +870,7 @@ mod imp {
 
     /// One chat-list row scraped from the main window, read-only (never opens
     /// the chat, so its unread state is untouched).
-    #[derive(Debug, Clone, PartialEq, Eq)]
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct ChatListRow {
         pub name: String,
         pub unread: i32,
@@ -896,6 +957,48 @@ mod imp {
         };
         super::classify_service_rows(scrape_chat_list_for_service_rows(&main_window))
     }
+    const SERVICE_SCRAPE_WORKER_TIMEOUT: Duration = Duration::from_secs(12);
+
+    pub fn scrape_chat_list_for_service_isolated() -> super::ServiceScrapeResult {
+        let executable = match std::env::current_exe() {
+            Ok(path) => path,
+            Err(_) => return super::ServiceScrapeResult::AxUnavailable,
+        };
+        let mut child = match Command::new(executable)
+            .arg("ax-service-scrape-once")
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(_) => return super::ServiceScrapeResult::AxUnavailable,
+        };
+        let deadline = Instant::now() + SERVICE_SCRAPE_WORKER_TIMEOUT;
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    if !status.success() {
+                        return super::ServiceScrapeResult::AxUnavailable;
+                    }
+                    let output = match child.wait_with_output() {
+                        Ok(output) => output,
+                        Err(_) => return super::ServiceScrapeResult::AxUnavailable,
+                    };
+                    return serde_json::from_slice(&output.stdout)
+                        .unwrap_or(super::ServiceScrapeResult::AxUnavailable);
+                }
+                Ok(None) if Instant::now() < deadline => sleep(Duration::from_millis(25)),
+                Ok(None) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return super::ServiceScrapeResult::AxUnavailable;
+                }
+                Err(_) => return super::ServiceScrapeResult::AxUnavailable,
+            }
+        }
+    }
 
     #[cfg(test)]
     mod tests {
@@ -908,7 +1011,6 @@ mod imp {
         #[test]
         fn service_traversal_budget_is_bounded() {
             const {
-                assert!(SERVICE_AX_MESSAGING_TIMEOUT_SECS > 0.0);
                 assert!(SERVICE_AX_TRAVERSAL_TIMEOUT.as_nanos() > 0);
             };
         }
@@ -923,10 +1025,11 @@ mod imp {
 } // mod imp
 
 #[cfg(target_os = "macos")]
-use imp::scrape_chat_list_for_service;
+pub use imp::{
+    read_via_ax, scrape_chat_list, scrape_chat_list_for_service,
+    scrape_chat_list_for_service_isolated, send_via_ax, ChatListRow,
+};
 #[cfg(target_os = "macos")]
-pub use imp::{read_via_ax, scrape_chat_list, send_via_ax, ChatListRow};
-
 #[cfg(not(target_os = "macos"))]
 mod stub {
     use anyhow::{anyhow, Result};
@@ -956,7 +1059,7 @@ mod stub {
     /// Mirrors `imp::ChatListRow`. Never constructed off macOS (the fn below
     /// always errors), so its fields would otherwise trip `dead_code`.
     #[allow(dead_code)]
-    #[derive(Debug, Clone, PartialEq, Eq)]
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct ChatListRow {
         pub name: String,
         pub unread: i32,
@@ -973,14 +1076,18 @@ mod stub {
     pub fn scrape_chat_list_for_service() -> super::ServiceScrapeResult {
         super::ServiceScrapeResult::AxUnavailable
     }
+    pub fn scrape_chat_list_for_service_isolated() -> super::ServiceScrapeResult {
+        super::ServiceScrapeResult::AxUnavailable
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
-use stub::scrape_chat_list_for_service;
-#[cfg(not(target_os = "macos"))]
-pub use stub::{read_via_ax, scrape_chat_list, send_via_ax, ChatListRow};
+pub use stub::{
+    read_via_ax, scrape_chat_list, scrape_chat_list_for_service,
+    scrape_chat_list_for_service_isolated, send_via_ax, ChatListRow,
+};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ServiceScrapeResult {
     Success(Vec<ChatListRow>),
     AxUnavailable,
@@ -996,7 +1103,7 @@ pub struct DefaultServiceScraper;
 
 impl ServiceScraper for DefaultServiceScraper {
     fn scrape(&self) -> ServiceScrapeResult {
-        scrape_chat_list_for_service()
+        scrape_chat_list_for_service_isolated()
     }
 }
 

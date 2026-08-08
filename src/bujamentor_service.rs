@@ -21,7 +21,7 @@ pub const STATUS_FRESH_SECS: i64 = 180;
 pub const HEALTH_INTERVAL_SECS: u64 = 15;
 pub const LOG_ROTATE_BYTES: u64 = 65_536;
 pub const LOG_ROTATE_AGE_SECS: u64 = 7 * 24 * 60 * 60;
-pub const WATCH_INTERVAL_SECS: u64 = 5;
+pub const WATCH_INTERVAL_SECS: u64 = 1;
 pub const HOOK_TOTAL_DEADLINE_SECS: u64 = 20;
 const HOOK_PAYLOAD_LIMIT_BYTES: usize = 4096;
 
@@ -111,6 +111,8 @@ pub struct WatchStatusRecord {
     pub hook_failure_count: u64,
     #[serde(default)]
     pub hook_rate_limited_count: u64,
+    #[serde(default)]
+    pub hook_skipped_count: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -226,6 +228,7 @@ impl WatchStatusRecord {
             poll_count: 0,
             hook_success_count: 0,
             hook_failure_count: 0,
+            hook_skipped_count: 0,
             hook_rate_limited_count: 0,
         }
     }
@@ -739,6 +742,7 @@ pub fn write_alerts(path: &Path, alerts: &HealthAlertsRecord) -> Result<()> {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServiceHookEvent {
+    pub direction: String,
     pub event_type: String,
     pub received_at: String,
     pub method: String,
@@ -820,6 +824,7 @@ pub async fn run_direct_service_hook(
         .env("OPENKAKAO_AUTHOR_ID", event.author_id.to_string())
         .env("OPENKAKAO_AUTHOR_NICKNAME", &event.author_nickname)
         .env("OPENKAKAO_MESSAGE_TYPE", event.message_type.to_string())
+        .env("OPENKAKAO_DIRECTION", &event.direction)
         .env(
             "OPENKAKAO_MESSAGE_TYPE_LABEL",
             message_type_label(event.message_type),

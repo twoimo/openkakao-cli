@@ -16,6 +16,8 @@ Automatic replies stay suspended after any binary change until both conditions a
 2. an operator explicitly promotes production mode
 
 Successful installation, quiet terminal output, and `launchctl print` are not enough to prove AX/TCC access.
+The watcher isolates each AX scrape in a bounded helper process. A KakaoTalk Accessibility call that hangs cannot leave the long-lived watcher stuck with an old heartbeat; the parent records a fresh `ax_unavailable` degradation instead.
+The alternate System Events source (`scripts/bujamentor-apple-watch.py`) is GUI-session-only: it reads the exact already-open `부자멘토멘티` window, derives direction from bubble geometry, requires a visible sender label, and records `apple-watch-status.json`. Run it from a user-owned terminal/tmux session; launchd cannot be treated as equivalent because TCC and protected project paths differ. `--allow-send` is the explicit side-effect switch, and delivery is accepted only after a new exact outgoing bubble is visible.
 
 ## Install
 

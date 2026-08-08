@@ -94,6 +94,7 @@ fn build_event(row: &ax_send::ChatListRow) -> WatchMessageEvent {
 
 fn build_service_event(event: &WatchMessageEvent) -> ServiceHookEvent {
     ServiceHookEvent {
+        direction: "unknown".to_string(),
         event_type: event.event_type.to_string(),
         received_at: event.received_at.clone(),
         method: event.method.clone(),
@@ -107,6 +108,15 @@ fn build_service_event(event: &WatchMessageEvent) -> ServiceHookEvent {
         attachment: event.attachment.clone(),
         unread: event.unread,
     }
+}
+
+fn service_event_is_actionable(event: &ServiceHookEvent) -> bool {
+    event.direction == "incoming"
+        && event.chat_id > 0
+        && event.log_id > 0
+        && event.author_id > 0
+        && !event.author_nickname.trim().is_empty()
+        && !event.message.trim().is_empty()
 }
 
 fn service_filter_config(options: &AxWatchOptions) -> WatchHookConfig {
@@ -257,32 +267,39 @@ async fn run_service_iteration<S: ServiceScraper>(
                     if watch_hook_matches(filter_config, &event) {
                         if let Some(hook_path) = hook_path {
                             let service_event = build_service_event(&event);
-                            match run_service_hook(
-                                hook_path,
-                                &mut loop_state.hook_limiter,
-                                &service_event,
-                            )
-                            .await
-                            {
-                                Ok(()) => {
-                                    loop_state.status.hook_success_count =
-                                        loop_state.status.hook_success_count.saturating_add(1);
-                                }
-                                Err(reason) => {
-                                    if reason == ClosedReason::HookRateLimited {
-                                        loop_state.status.hook_rate_limited_count = loop_state
-                                            .status
-                                            .hook_rate_limited_count
-                                            .saturating_add(1);
-                                    } else {
-                                        loop_state.status.hook_failure_count =
-                                            loop_state.status.hook_failure_count.saturating_add(1);
-                                        failure = Some(reason);
-                                        loop_state.baseline.insert(
-                                            row.name.clone(),
-                                            (row.unread, row.preview.clone()),
-                                        );
-                                        break;
+                            if !service_event_is_actionable(&service_event) {
+                                loop_state.status.hook_skipped_count =
+                                    loop_state.status.hook_skipped_count.saturating_add(1);
+                            } else {
+                                match run_service_hook(
+                                    hook_path,
+                                    &mut loop_state.hook_limiter,
+                                    &service_event,
+                                )
+                                .await
+                                {
+                                    Ok(()) => {
+                                        loop_state.status.hook_success_count =
+                                            loop_state.status.hook_success_count.saturating_add(1);
+                                    }
+                                    Err(reason) => {
+                                        if reason == ClosedReason::HookRateLimited {
+                                            loop_state.status.hook_rate_limited_count = loop_state
+                                                .status
+                                                .hook_rate_limited_count
+                                                .saturating_add(1);
+                                        } else {
+                                            loop_state.status.hook_failure_count = loop_state
+                                                .status
+                                                .hook_failure_count
+                                                .saturating_add(1);
+                                            failure = Some(reason);
+                                            loop_state.baseline.insert(
+                                                row.name.clone(),
+                                                (row.unread, row.preview.clone()),
+                                            );
+                                            break;
+                                        }
                                     }
                                 }
                             }
@@ -578,24 +595,28 @@ mod tests {
             ..canonical_service_options(Path::new("/tmp"))
         })
         .unwrap_err();
-        assert!(error.to_string().contains("--interval 5"));
+        assert!(error.to_string().contains("--interval 1"));
     }
     #[test]
     fn service_poll_cadence_is_anchored_to_poll_starts() {
         let start = Instant::now();
         let interval = Duration::from_secs(WATCH_INTERVAL_SECS);
         assert_eq!(
-            next_service_poll_start(start, interval, start + Duration::from_secs(2)),
+            next_service_poll_start(start, interval, start + interval / 2),
             start + interval
         );
         assert_eq!(
-            next_service_poll_start(start, interval, start + Duration::from_secs(12)),
-            start + interval + interval + interval
+            next_service_poll_start(
+                start,
+                interval,
+                start + interval * 2 + Duration::from_millis(1)
+            ),
+            start + interval * 3
         );
     }
 
     #[test]
-    fn service_iteration_counts_hook_success_and_logs_watch_poll() {
+    fn service_iteration_skips_untrusted_ax_events_and_logs_watch_poll() {
         let temp = tempdir().unwrap();
         let mut options = canonical_service_options(temp.path());
         let hook_path = temp.path().join("hook.sh");
@@ -637,15 +658,15 @@ mod tests {
             openkakao_cli::bujamentor_service::WatchState::Healthy
         );
         assert_eq!(loop_state.status.poll_count, 1);
-        assert_eq!(loop_state.status.hook_success_count, 1);
+        assert_eq!(loop_state.status.hook_success_count, 0);
         assert_eq!(loop_state.status.hook_failure_count, 0);
-        assert_eq!(loop_state.status.hook_rate_limited_count, 0);
+        assert_eq!(loop_state.status.hook_skipped_count, 1);
         let log = fs::read_to_string(&log_path).unwrap();
         assert!(log.contains("\"service\":\"watch\""));
         assert!(log.contains("\"event\":\"watch_poll_completed\""));
     }
     #[test]
-    fn service_iteration_keeps_rate_limited_second_hook_healthy() {
+    fn service_iteration_skips_untrusted_events_without_rate_limiting() {
         let temp = tempdir().unwrap();
         let mut options = canonical_service_options(temp.path());
         let hook_path = temp.path().join("hook.sh");
@@ -694,9 +715,9 @@ mod tests {
             loop_state.status.state,
             openkakao_cli::bujamentor_service::WatchState::Healthy
         );
-        assert_eq!(loop_state.status.hook_success_count, 1);
+        assert_eq!(loop_state.status.hook_success_count, 0);
         assert_eq!(loop_state.status.hook_failure_count, 0);
-        assert_eq!(loop_state.status.hook_rate_limited_count, 1);
+        assert_eq!(loop_state.status.hook_skipped_count, 2);
     }
 
     #[test]

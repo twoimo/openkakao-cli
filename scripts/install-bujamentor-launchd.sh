@@ -178,7 +178,7 @@ watch_program_arguments() {
     "ax-watch" \
     "--service-mode" \
     "--interval" \
-    "5" \
+    "1" \
     "--status-path" \
     "${STATE_ROOT}/watch-status.json" \
     "--log-path" \

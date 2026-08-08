@@ -89,6 +89,25 @@ openkakao-cli ax-read "채팅방 표시 이름" -n 20
 openkakao-cli ax-watch --hook-cmd 'my-script.sh'
 ```
 
+### 채팅방별 오프라인 맥락 인덱스
+
+CSV 내보내기 파일을 채팅방 이름과 원본 경로로 격리해 로컬 SQLite FTS5 키워드 인덱스와 결정적 로컬 벡터 인덱스를 함께 만듭니다. 대화 내용은 네트워크로 전송하지 않습니다. 벡터 모드는 외부 모델이 아닌 결정적 lexical hash vector이므로 의미 임베딩이 필요한 경우가 아니라 안전한 로컬 검색 보조로 사용합니다.
+
+```bash
+openkakao-cli context-index \
+  --input KakaoTalk_Chat_<방>.csv \
+  --chat "<방 표시 이름>" \
+  --json
+
+openkakao-cli context-search "지난번 세금 일정" \
+  --chat "<방 표시 이름>" \
+  --mode hybrid \
+  --limit 10 \
+  --json
+```
+
+`--mode keyword`, `--mode vector`, `--mode hybrid`를 선택할 수 있으며, `--db /path/to/index.sqlite3`로 인덱스 위치를 지정할 수 있습니다. 기본 인덱스는 macOS 로컬 데이터 디렉터리의 `openkakao/context.sqlite3`입니다.
+인덱스는 기본적으로 사용자 전용 권한으로 저장되며, `--db` 사용자 지정 경로는 해당 경로의 파일 권한과 백업 정책을 직접 관리해야 합니다. 같은 표시 이름의 여러 CSV를 함께 검색하지 않으려면 인덱싱한 CSV의 절대 경로를 `--source`로 지정합니다.
 ### 서버 로그인 기반 (현재 대부분 깨짐)
 
 ```bash

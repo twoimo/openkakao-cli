@@ -545,6 +545,39 @@ enum Commands {
     },
     /// Show local KakaoTalk database schema
     LocalSchema,
+    /// Build or refresh a local per-chat context index from a KakaoTalk CSV export
+    ContextIndex {
+        #[arg(long)]
+        input: String,
+        #[arg(long)]
+        chat: String,
+        #[arg(long)]
+        db: Option<String>,
+    },
+    /// Search the local per-chat context index without network access
+    ContextSearch {
+        query: String,
+        #[arg(long)]
+        chat: Option<String>,
+        #[arg(long, default_value = "hybrid", value_parser = ["keyword", "vector", "hybrid"])]
+        mode: String,
+        #[arg(short = 'n', long, default_value_t = 10)]
+        limit: usize,
+        #[arg(long)]
+        source: Option<String>,
+        #[arg(long)]
+        db: Option<String>,
+    },
+    /// Search only the dedicated 최연우 style vector table
+    ContextStyleSearch {
+        query: String,
+        #[arg(short = 'n', long, default_value_t = 10)]
+        limit: usize,
+        #[arg(long)]
+        db: Option<String>,
+    },
+    #[command(name = "ax-service-scrape-once", hide = true)]
+    AxServiceScrapeOnce,
     /// Send a message via AX automation (no server contact, drives KakaoTalk's UI directly)
     LocalSend {
         chat_name: String,
@@ -564,7 +597,7 @@ enum Commands {
     /// Watch for incoming KakaoTalk messages via AX (no server contact,
     /// background) and fire hooks/webhooks on unread-count increases
     AxWatch {
-        #[arg(long, default_value_t = 3)]
+        #[arg(long, default_value_t = 1)]
         interval: u64,
         #[arg(long)]
         hook_cmd: Option<String>,
@@ -605,6 +638,10 @@ fn is_local_only_command(command: &Commands) -> bool {
             | Commands::LocalRead { .. }
             | Commands::LocalSearch { .. }
             | Commands::LocalSchema
+            | Commands::ContextIndex { .. }
+            | Commands::ContextSearch { .. }
+            | Commands::ContextStyleSearch { .. }
+            | Commands::AxServiceScrapeOnce
             | Commands::LocalSend { .. }
             | Commands::AxRead { .. }
             | Commands::AxWatch { .. }
@@ -1304,6 +1341,98 @@ fn main() -> Result<()> {
                     println!("{}\n", sql);
                 }
             }
+        }
+        Commands::ContextIndex { input, chat, db } => {
+            let db_path = db
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(openkakao_cli::context::default_db_path);
+            let count =
+                openkakao_cli::context::index_csv(&db_path, &chat, std::path::Path::new(&input))?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "action": "index",
+                        "chat": chat,
+                        "input": input,
+                        "db": db_path,
+                        "messages": count,
+                        "network": false
+                    })
+                );
+            } else {
+                println!(
+                    "Indexed {} messages for '{}' into {} (offline).",
+                    count,
+                    chat,
+                    db_path.display()
+                );
+            }
+        }
+        Commands::ContextSearch {
+            query,
+            chat,
+            mode,
+            limit,
+            source,
+            db,
+        } => {
+            let db_path = db
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(openkakao_cli::context::default_db_path);
+            let results = openkakao_cli::context::search(
+                &db_path,
+                chat.as_deref(),
+                source.as_deref(),
+                &query,
+                &mode,
+                limit,
+            )?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&results)?);
+            } else {
+                for result in &results {
+                    println!(
+                        "[{:.3}] {} [{}] {}: {}",
+                        result.score,
+                        result.chat,
+                        result.date,
+                        result.user,
+                        util::truncate(&result.message, 160)
+                    );
+                }
+                println!("{} results (offline {} search)", results.len(), mode);
+            }
+        }
+        Commands::ContextStyleSearch { query, limit, db } => {
+            let db_path = db
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(openkakao_cli::context::default_db_path);
+            let results = openkakao_cli::context::style_search(&db_path, &query, limit)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&results)?);
+            } else {
+                for result in &results {
+                    println!(
+                        "[{:.3}] {} [{}] {}: {}",
+                        result.score,
+                        result.chat,
+                        result.date,
+                        result.user,
+                        util::truncate(&result.message, 160)
+                    );
+                }
+                println!(
+                    "{} results (offline 최연우 style vector search)",
+                    results.len()
+                );
+            }
+        }
+        Commands::AxServiceScrapeOnce => {
+            println!(
+                "{}",
+                serde_json::to_string(&ax_send::scrape_chat_list_for_service())?
+            );
         }
         Commands::LocalSend {
             chat_name,

@@ -21,11 +21,18 @@ pub fn debug_enabled() -> bool {
 }
 
 pub fn format_outgoing_message(message: &str, no_prefix: bool) -> String {
+    let message = normalize_outgoing_message(message);
     if no_prefix {
-        message.to_string()
+        message
     } else {
         format!("{} {}", SEND_PREFIX, message)
     }
+}
+pub fn normalize_outgoing_message(message: &str) -> String {
+    message
+        .replace("\\r\\n", "\n")
+        .replace("\\n", "\n")
+        .replace("\\r", "\n")
 }
 
 pub fn print_section_title(title: &str) {
@@ -507,5 +514,12 @@ mod tests {
     #[test]
     fn test_mask_token_empty() {
         assert_eq!(mask_token(""), "");
+    }
+    #[test]
+    fn normalize_outgoing_message_decodes_escaped_line_breaks() {
+        assert_eq!(
+            normalize_outgoing_message(r"첫 줄\n둘째 줄\r\n셋째 줄"),
+            "첫 줄\n둘째 줄\n셋째 줄"
+        );
     }
 }

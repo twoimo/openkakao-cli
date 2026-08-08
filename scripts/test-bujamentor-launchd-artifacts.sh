@@ -307,7 +307,7 @@ preflight_watch_args=$(json_args \
   "ax-watch" \
   "--service-mode" \
   "--interval" \
-  "5" \
+  "1" \
   "--status-path" \
   "$STATE_ROOT/watch-status.json" \
   "--log-path" \
@@ -340,7 +340,7 @@ production_watch_args=$(json_args \
   "ax-watch" \
   "--service-mode" \
   "--interval" \
-  "5" \
+  "1" \
   "--status-path" \
   "$STATE_ROOT/watch-status.json" \
   "--log-path" \
