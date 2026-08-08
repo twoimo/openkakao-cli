@@ -355,7 +355,7 @@ def generate_reply(
     ]
     if image_path is not None:
         command.extend(["--image", str(image_path)])
-    command.append(json.dumps(prompt, ensure_ascii=False))
+    command.extend(["--", json.dumps(prompt, ensure_ascii=False)])
     try:
         result = subprocess.run(
             command,
