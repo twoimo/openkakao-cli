@@ -112,8 +112,11 @@ def snapshot(limit_seconds: float = 3.0) -> list[dict[str, Any]]:
             key, separator, value = field.partition("=")
             if not separator:
                 continue
+            if value.strip().lower() == "missing value":
+                value = ""
             if key == "static":
-                statics.append(value)
+                if value:
+                    statics.append(value)
             elif key in {"direction", "text", "attachment", "image_rect"}:
                 row[key] = value
         row["static"] = statics

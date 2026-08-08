@@ -105,6 +105,8 @@ def timestamp_from_statics(statics: list[str]) -> str:
     return ""
 def is_sender_label(value: str) -> bool:
     normalized = " ".join(value.split())
+    if normalized.lower() == "missing value":
+        return False
     if not normalized or looks_like_time(normalized) or normalized.isdigit():
         return False
     if len(normalized) > 30 or re.search(r"[\[\]():]", normalized):
@@ -129,9 +131,15 @@ def normalize_rows(rows: list[dict], _previous_sender: str) -> tuple[list[dict],
     sender = ""
     normalized: list[dict] = []
     for row in rows:
-        statics = [str(value) for value in row.get("static", [])]
-        direction = row.get("direction")
+        statics = [
+            str(value)
+            for value in row.get("static", [])
+            if str(value).strip().lower() != "missing value"
+        ]
+        direction = str(row.get("direction") or "").strip().lower()
         text = str(row.get("text") or "").strip()
+        if text.lower() == "missing value":
+            text = ""
         if not text or direction not in {"incoming", "outgoing"}:
             sender = ""
             continue
