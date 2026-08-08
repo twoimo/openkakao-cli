@@ -341,9 +341,9 @@ def generate_reply(
 
 
 def _wait_for_visible_outgoing(reply: str, min_row_index: int) -> bool:
-    deadline = time.monotonic() + 3.0
+    deadline = time.monotonic() + 15.0
     while time.monotonic() < deadline:
-        if visible_outgoing(reply, limit_seconds=1.5, min_row_index=min_row_index):
+        if visible_outgoing(reply, limit_seconds=10.0, min_row_index=min_row_index):
             return True
         time.sleep(0.25)
     return False
@@ -353,7 +353,7 @@ def send_reply(reply: str) -> bool:
     if os.environ.get("OPENKAKAO_HOOK_DRY_RUN") == "1":
         print(json.dumps({"dry_run": True, "reply": reply}, ensure_ascii=False))
         return True
-    baseline_rows = snapshot(limit_seconds=2.0)
+    baseline_rows = snapshot(limit_seconds=10.0)
     if not baseline_rows:
         return False
     min_row_index = max(
