@@ -23,56 +23,59 @@ tell application "System Events"
     set centerX to wx + (ww / 2)
     set t to first table of first scroll area of w
     set n to count of rows of t
-    set firstIndex to n - 8
+    set firstIndex to n - 2
     if firstIndex < 1 then set firstIndex to 1
     set sep to character id 31
     set recsep to character id 30
     set out to {}
     repeat with i from firstIndex to n
       set r to row i of t
-      set fields to {(i as text)}
-      set imageRect to ""
+      set rowVisible to false
       try
         set {rx, ry} to position of r
+        set {rw, rh} to size of r
+        if (ry + rh > wy) and (ry < wy + wh) then set rowVisible to true
+      end try
+      if rowVisible then
+        set fields to {(i as text)}
+        set imageRect to ""
         set rowDirection to "outgoing"
         if rx < centerX then set rowDirection to "incoming"
-      on error
-        set rowDirection to "unknown"
-      end try
-      set direction to "unknown"
-      set hasTextArea to false
-      set hasImage to false
-      repeat with c in (UI elements of r)
-        repeat with e in (UI elements of c)
-          try
-            set erole to role of e as text
-            if erole is "AXStaticText" then
-              set end of fields to "static=" & (value of e as text)
-            else if erole is "AXTextArea" then
-              set hasTextArea to true
-              set {ex, ey} to position of e
-              set direction to "outgoing"
-              if ex < centerX then set direction to "incoming"
-              set end of fields to "direction=" & direction
-              set end of fields to "text=" & (value of e as text)
-            else if erole is "AXImage" then
-              set hasImage to true
-              try
-                set {ix, iy} to position of e
-                set {iw, ih} to size of e
-                set imageRect to (ix as text) & "," & (iy as text) & "," & (iw as text) & "," & (ih as text)
-              end try
-              if rowDirection is not "unknown" then set end of fields to "direction=" & rowDirection
-            end if
-          end try
+        set direction to "unknown"
+        set hasTextArea to false
+        set hasImage to false
+        repeat with c in (UI elements of r)
+          repeat with e in (UI elements of c)
+            try
+              set erole to role of e as text
+              if erole is "AXStaticText" then
+                set end of fields to "static=" & (value of e as text)
+              else if erole is "AXTextArea" then
+                set hasTextArea to true
+                set {ex, ey} to position of e
+                set direction to "outgoing"
+                if ex < centerX then set direction to "incoming"
+                set end of fields to "direction=" & direction
+                set end of fields to "text=" & (value of e as text)
+              else if erole is "AXImage" then
+                set hasImage to true
+                try
+                  set {ix, iy} to position of e
+                  set {iw, ih} to size of e
+                  set imageRect to (ix as text) & "," & (iy as text) & "," & (iw as text) & "," & (ih as text)
+                end try
+                set end of fields to "direction=" & rowDirection
+              end if
+            end try
+          end repeat
         end repeat
-      end repeat
-      if hasImage and not hasTextArea then
-        set end of fields to "attachment=image"
-        if imageRect is not "" then set end of fields to "image_rect=" & imageRect
+        if hasImage and not hasTextArea then
+          set end of fields to "attachment=image"
+          if imageRect is not "" then set end of fields to "image_rect=" & imageRect
+        end if
+        set AppleScript's text item delimiters to sep
+        set end of out to (fields as text)
       end if
-      set AppleScript's text item delimiters to sep
-      set end of out to (fields as text)
     end repeat
     set AppleScript's text item delimiters to recsep
     return out as text
