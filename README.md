@@ -104,6 +104,10 @@ openkakao-cli context-search "지난번 세금 일정" \
   --mode hybrid \
   --limit 10 \
   --json
+openkakao-cli context-response-time \
+  --chat "부자멘토멘티" \
+  --user "최연우" \
+  --json
 ```
 
 `--mode keyword`, `--mode vector`, `--mode hybrid`를 선택할 수 있으며, `--db /path/to/index.sqlite3`로 인덱스 위치를 지정할 수 있습니다. 기본 인덱스는 macOS 로컬 데이터 디렉터리의 `openkakao/context.sqlite3`입니다.
