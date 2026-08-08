@@ -32,14 +32,32 @@ STATE = Path(
 )
 CODEX = Path("/opt/homebrew/bin/codex")
 LOCK = Path(str(STATE) + ".lock")
+NON_HUMAN_AUTHORS = {
+    "드리고",
+    "드리고봇",
+    "뉴스봇",
+    "채팅봇",
+    "ChatGPT",
+    "주식봇",
+    "날씨날씨",
+    "인아웃",
+    "채팅도구",
+}
 def reply_authors() -> set[str]:
-    configured = os.environ.get("OPENKAKAO_REPLY_AUTHORS", "최연우")
+    configured = os.environ.get("OPENKAKAO_REPLY_AUTHORS", "").strip()
     return {name.strip() for name in configured.split(",") if name.strip()}
 
 
 def is_reply_author(value: object) -> bool:
     author = str(value or "").strip()
-    return bool(author) and author.lower() != "missing value" and author in reply_authors()
+    allowed = reply_authors()
+    return (
+        bool(author)
+        and author.lower() != "missing value"
+        and author not in NON_HUMAN_AUTHORS
+        and not author.endswith("봇")
+        and (not allowed or author in allowed)
+    )
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     def http_error_301(self, req, fp, code, msg, headers):
         raise urllib.error.HTTPError(req.full_url, code, "redirect disabled", headers, fp)
