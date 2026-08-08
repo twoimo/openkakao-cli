@@ -23,6 +23,9 @@ from pathlib import Path
 from bujamentor_ax_ui import CHAT, snapshot
 
 ROOT = Path(__file__).resolve().parents[1]
+def reply_authors() -> set[str]:
+    configured = os.environ.get("OPENKAKAO_REPLY_AUTHORS", "최연우")
+    return {name.strip() for name in configured.split(",") if name.strip()}
 HOOK = ROOT / "scripts" / "bujamentor-auto-reply.py"
 STATE = Path(
     os.environ.get(
@@ -246,6 +249,8 @@ def poll_once(
             continue
         self_nickname = os.environ.get("OPENKAKAO_SELF_NICKNAME", "").strip()
         if not self_nickname or row["author_nickname"] == self_nickname:
+            continue
+        if row["author_nickname"] not in reply_authors():
             continue
         event = event_for(row)
         if event["event_id"] in seen:
