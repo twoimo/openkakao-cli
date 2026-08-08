@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import subprocess
 import fcntl
@@ -60,7 +61,38 @@ def save_state(state: dict) -> None:
         if os.path.exists(name):
             os.unlink(name)
 
-def claim_event(fingerprint: str) -> tuple[dict, bool]:
+CLAIM_TTL_SECONDS = 5.0
+
+
+def _prune_semantic_claims(state: dict, now: float) -> dict[str, float]:
+    raw = state.get("semantic_claims", {})
+    if not isinstance(raw, dict):
+        return {}
+    claims: dict[str, float] = {}
+    for key, value in raw.items():
+        try:
+            claimed_at = float(value)
+        except (TypeError, ValueError):
+            continue
+        if now - claimed_at < CLAIM_TTL_SECONDS:
+            claims[str(key)] = claimed_at
+    return claims
+
+
+def semantic_event_key(event: dict, message: str, attachment: str) -> str:
+    payload = "\0".join(
+        [
+            str(event.get("chat_name") or CHAT),
+            str(event.get("author_nickname") or "").strip(),
+            str(event.get("direction") or ""),
+            message,
+            attachment,
+        ]
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def claim_event(fingerprint: str, semantic_key: str | None = None) -> tuple[dict, bool]:
     LOCK.parent.mkdir(parents=True, exist_ok=True)
     with LOCK.open("a+", encoding="utf-8") as stream:
         fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
@@ -68,12 +100,23 @@ def claim_event(fingerprint: str) -> tuple[dict, bool]:
         attempted = state.get("attempted_events", [])
         if not isinstance(attempted, list):
             attempted = []
-        if fingerprint in attempted or fingerprint in {state.get("last_event"), state.get("attempted_event")}:
+        now = time.time()
+        semantic_claims = _prune_semantic_claims(state, now)
+        if (
+            fingerprint in attempted
+            or fingerprint in {state.get("last_event"), state.get("attempted_event")}
+            or (semantic_key and semantic_key in semantic_claims)
+        ):
+            state["semantic_claims"] = semantic_claims
+            save_state(state)
             return state, False
         attempted.append(fingerprint)
         state["attempted_events"] = attempted[-512:]
         state["attempted_event"] = fingerprint
-        state["attempted_at"] = time.time()
+        state["attempted_at"] = now
+        if semantic_key:
+            semantic_claims[semantic_key] = now
+        state["semantic_claims"] = semantic_claims
         save_state(state)
         return state, True
 
@@ -352,7 +395,8 @@ def main() -> int:
         return 0
 
     fingerprint = str(event["event_id"]).strip()
-    state, claimed = claim_event(fingerprint)
+    semantic_key = semantic_event_key(event, message, attachment)
+    state, claimed = claim_event(fingerprint, semantic_key)
     if not claimed:
         return 0
 
@@ -366,8 +410,6 @@ def main() -> int:
         else:
             previews = fetch_link_previews(message)
             urls = extract_urls(message)
-            urls = extract_urls(message)
-            previews = fetch_link_previews(message)
             try:
                 context = run_context_search(message)
                 styles = run_style_search(message)
