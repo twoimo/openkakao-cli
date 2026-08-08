@@ -23,7 +23,7 @@ tell application "System Events"
     set centerX to wx + (ww / 2)
     set t to first table of first scroll area of w
     set n to count of rows of t
-    set firstIndex to n - 4
+    set firstIndex to n - 8
     if firstIndex < 1 then set firstIndex to 1
     set sep to character id 31
     set recsep to character id 30
