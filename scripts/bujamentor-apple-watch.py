@@ -209,7 +209,7 @@ def poll_once(
     state: dict,
     dry_run: bool,
     allow_send: bool,
-    snapshot_timeout: float = 10.0,
+    snapshot_timeout: float = 15.0,
 ) -> list[dict]:
     raw_rows = snapshot(limit_seconds=max(snapshot_timeout, 0.5))
     rows, sender = normalize_rows(raw_rows, str(state.get("last_sender") or ""))
@@ -266,7 +266,7 @@ def main() -> int:
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--allow-send", action="store_true")
-    parser.add_argument("--snapshot-timeout", type=float, default=10.0)
+    parser.add_argument("--snapshot-timeout", type=float, default=15.0)
     args = parser.parse_args()
 
     state = load_state()
