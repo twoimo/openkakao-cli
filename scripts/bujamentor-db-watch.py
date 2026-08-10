@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Poll KakaoTalk's local DB and pass identified media messages to the reply hook.
+"""DB-authoritative Bujamentor ingress.
 
-Unlike the AX watcher, this source carries chat/log/author IDs and the raw
-attachment record. It is intentionally read-only against the database; the
-only side effect is invoking the already-guarded reply hook.
+The local DB is the only automatic source.  This process emits durable,
+versioned envelopes and advances its replay cursor only on an authoritative
+outbox acknowledgement from the hook.
 """
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ import subprocess
 import tempfile
 import time
 from pathlib import Path
+from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 BINARY = Path(os.environ.get("OPENKAKAO_BINARY", str(ROOT / "target/release/openkakao-cli")))
@@ -25,20 +26,25 @@ STATE = Path(os.environ.get(
 HOOK = Path(os.environ.get("OPENKAKAO_REPLY_HOOK", str(ROOT / "scripts/bujamentor-auto-reply.py")))
 SELF = os.environ.get("OPENKAKAO_SELF_NICKNAME", "").strip()
 IMAGE_TYPES = {2, 14, 27}
+STATE_VERSION = 2
+ENVELOPE_VERSION = 1
+
+
+class DbFence(RuntimeError):
+    """A database capability failure which must stop automatic delivery."""
 
 
 def run_json(args: list[str], timeout: float = 5.0) -> object:
     result = subprocess.run(
-        [str(BINARY), *args, "--json"],
-        cwd=ROOT,
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-        check=False,
+        [str(BINARY), *args, "--json"], cwd=ROOT, capture_output=True, text=True,
+        timeout=timeout, check=False,
     )
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or f"command failed: {result.returncode}")
-    return json.loads(result.stdout)
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise DbFence("malformed database response") from exc
 
 
 def load_state() -> dict:
@@ -52,15 +58,35 @@ def load_state() -> dict:
 def save_state(state: dict) -> None:
     STATE.parent.mkdir(parents=True, exist_ok=True)
     tmp = STATE.with_suffix(".tmp")
-    tmp.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+    tmp.write_text(json.dumps(state, ensure_ascii=False, sort_keys=True), encoding="utf-8")
     tmp.replace(STATE)
 
 
-def find_chat() -> dict | None:
+def _state(state: dict) -> dict:
+    defaults = {
+        "schema_version": STATE_VERSION, "target_chat_id": None, "target_chat_name": CHAT,
+        "last_observed_log_id": 0, "acked_watermark": 0, "pending_log_ids": [],
+        "observed_log_ids": [], "acked_log_ids": [], "source_epoch": state.get("source_epoch", 0),
+        "capability_state": "starting", "delivery_enabled": False, "fence_reason": "",
+    }
+    defaults.update(state)
+    defaults["schema_version"] = STATE_VERSION
+    return defaults
+
+
+def find_chat() -> dict:
     chats = run_json(["local-chats", "--limit", "200"])
     if not isinstance(chats, list):
-        return None
-    return next((chat for chat in chats if chat.get("chat_name") == CHAT), None)
+        raise DbFence("malformed chat probe")
+    matches = [c for c in chats if isinstance(c, dict) and c.get("chat_name") == CHAT]
+    if len(matches) != 1:
+        raise DbFence("target chat missing or ambiguous")
+    chat = matches[0]
+    try:
+        chat_id = int(chat["chat_id"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise DbFence("target chat has malformed identity") from exc
+    return {**chat, "chat_id": chat_id}
 
 
 def download_image(chat_id: int, log_id: int) -> Path | None:
@@ -72,65 +98,117 @@ def download_image(chat_id: int, log_id: int) -> Path | None:
             return path
     except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired, json.JSONDecodeError):
         pass
-    for path in directory.rglob("*"):
-        if path.is_file() and path.stat().st_size:
-            return path
+    return next((p for p in directory.rglob("*") if p.is_file() and p.stat().st_size), None)
+
+
+def _ack(result: subprocess.CompletedProcess[str]) -> str | None:
+    if result.returncode != 0:
+        return None
+    for line in reversed(result.stdout.splitlines()):
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict) and value.get("ack") in {"accepted", "duplicate", "skipped"}:
+            return str(value["ack"])
     return None
 
 
-def emit(message: dict, image_path: Path | None) -> int:
-    event = {
-        "event_type": "local_db_message",
-        "method": "local_db",
-        "direction": "incoming",
-        "chat_id": message.get("chat_id", 0),
-        "chat_name": CHAT,
-        "log_id": message.get("log_id", 0),
-        "author_id": message.get("author_id", 0),
-        "author_nickname": message.get("sender_name", ""),
-        "message": message.get("message", ""),
-        "attachment": "image" if int(message.get("message_type", 0)) in IMAGE_TYPES and message.get("attachment") else "",
+def emit(message: dict, image_path: Path | None, *, skip_reason: str = "") -> str | None:
+    chat_id, log_id = int(message["chat_id"]), int(message["log_id"])
+    attachment = int(message.get("message_type", 0)) in IMAGE_TYPES and bool(message.get("attachment"))
+    event: dict[str, Any] = {
+        "envelope_version": ENVELOPE_VERSION, "event_type": "local_db_message",
+        "method": "local_db", "direction": "incoming", "source": "database",
+        "source_epoch": int(message.get("source_epoch", 0)),
+        "chat_id": chat_id, "chat_name": CHAT, "log_id": log_id,
+        "author_id": message.get("author_id", 0), "author_nickname": message.get("sender_name", ""),
+        "message": message.get("message", ""), "attachment": "image" if attachment else "",
         "image_path": str(image_path) if image_path else "",
-        "event_id": f"local-db:{message.get('chat_id', 0)}:{message.get('log_id', 0)}",
+        "event_id": f"db:{chat_id}:{log_id}", "canonical_event_id": f"db:{chat_id}:{log_id}",
     }
-    if not event["message"] and event["attachment"]:
+    if not event["message"] and attachment:
         event["message"] = "[사진]"
+    if skip_reason:
+        event["skip_reason"] = skip_reason
+        event["durable_skip"] = True
     result = subprocess.run(
-        [str(HOOK)],
-        cwd=ROOT,
-        input=json.dumps(event, ensure_ascii=False),
-        text=True,
-        env={**os.environ, "OPENKAKAO_SELF_NICKNAME": SELF},
-        timeout=15,
-        check=False,
+        [str(HOOK)], cwd=ROOT, input=json.dumps(event, ensure_ascii=False), capture_output=True,
+        text=True, env={**os.environ, "OPENKAKAO_SELF_NICKNAME": SELF}, timeout=15, check=False,
     )
-    return result.returncode
+    return _ack(result)
+
+
+def _validate_messages(messages: object, chat_id: int) -> list[dict]:
+    if not isinstance(messages, list):
+        raise DbFence("malformed local-read response")
+    valid = []
+    for item in messages:
+        if not isinstance(item, dict):
+            raise DbFence("malformed message row")
+        try:
+            if int(item["chat_id"]) != chat_id or int(item["log_id"]) <= 0:
+                raise ValueError
+        except (KeyError, TypeError, ValueError) as exc:
+            raise DbFence("malformed message identity") from exc
+        valid.append(item)
+    return valid
+
+
+def _advance_cursor(state: dict, log_id: int) -> None:
+    observed = {int(x) for x in state["observed_log_ids"]}
+    acked = {int(x) for x in state["acked_log_ids"]}
+    observed.add(log_id)
+    acked.add(log_id)
+    state["pending_log_ids"] = sorted(observed - acked)
+    watermark = int(state["acked_watermark"])
+    while watermark + 1 in observed and watermark + 1 in acked:
+        watermark += 1
+    state["acked_watermark"] = watermark
+    state["observed_log_ids"] = sorted(observed)[-500:]
+    state["acked_log_ids"] = sorted(acked)[-500:]
 
 
 def poll_once(state: dict) -> tuple[dict, int]:
-    chat = find_chat()
-    if not chat:
+    state = _state(state)
+    try:
+        chat = find_chat()
+        old_id = state.get("target_chat_id")
+        if old_id is not None and int(old_id) != chat["chat_id"]:
+            raise DbFence("target chat identity changed")
+        state.update(target_chat_id=chat["chat_id"], target_chat_name=CHAT,
+                     capability_state="ready", delivery_enabled=True, fence_reason="")
+        messages = _validate_messages(
+            run_json(["local-read", str(chat["chat_id"]), "--count", "50"]), chat["chat_id"])
+    except (DbFence, OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as exc:
+        state.update(capability_state="fenced", delivery_enabled=False, fence_reason=str(exc))
         return state, 0
-    messages = run_json(["local-read", str(chat["chat_id"]), "--count", "50"])
-    if not isinstance(messages, list):
-        return state, 0
-    seen = {str(item) for item in state.get("seen_log_ids", [])}
+
+    pending = {int(x) for x in state["pending_log_ids"]}
+    candidates = sorted(messages, key=lambda item: int(item["log_id"]))
     emitted = 0
-    for message in sorted(messages, key=lambda item: int(item.get("log_id", 0))):
-        log_id = str(message.get("log_id", ""))
-        if not log_id or log_id in seen:
+    for message in candidates:
+        log_id = int(message["log_id"])
+        if log_id <= int(state["acked_watermark"]) and log_id not in pending:
             continue
-        seen.add(log_id)
-        if not SELF or message.get("sender_name", "").strip() == SELF:
-            continue
-        if int(message.get("message_type", 0)) not in IMAGE_TYPES and not str(message.get("message", "")).strip():
-            continue
-        image_path = None
-        if int(message.get("message_type", 0)) in IMAGE_TYPES and message.get("attachment"):
-            image_path = download_image(int(message["chat_id"]), int(message["log_id"]))
-        if emit(message, image_path) == 0:
+        state["last_observed_log_id"] = max(int(state["last_observed_log_id"]), log_id)
+        state["observed_log_ids"] = sorted({*map(int, state["observed_log_ids"]), log_id})[-500:]
+        media = int(message.get("message_type", 0)) in IMAGE_TYPES and bool(message.get("attachment"))
+        if not SELF or str(message.get("sender_name", "")).strip() == SELF:
+            ack = emit(message, None, skip_reason="self_or_unconfigured_author")
+        elif media and (image := download_image(log_id=log_id, chat_id=int(message["chat_id"]))) is None:
+            ack = emit(message, None, skip_reason="media_unavailable")
+        elif media or str(message.get("message", "")).strip():
+            ack = emit(message, image if media else None)
+        else:
+            ack = emit(message, None, skip_reason="empty_message")
+        if ack in {"accepted", "duplicate", "skipped"}:
+            _advance_cursor(state, log_id)
             emitted += 1
-    state["seen_log_ids"] = sorted(seen, key=lambda value: int(value))[-500:]
+        else:
+            pending.add(log_id)
+            state["pending_log_ids"] = sorted(pending)
+            break
     return state, emitted
 
 
@@ -146,9 +224,11 @@ def main() -> int:
             state, _ = poll_once(state)
             save_state(state)
         except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired, json.JSONDecodeError) as exc:
+            state = _state(state)
+            state.update(capability_state="fenced", delivery_enabled=False, fence_reason=str(exc))
             print(f"[db-watch] {exc}", flush=True)
         time.sleep(max(args.interval, 0.2))
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
