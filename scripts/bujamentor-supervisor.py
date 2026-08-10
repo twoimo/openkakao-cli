@@ -92,15 +92,20 @@ def main() -> int:
         raise SystemExit("OPENKAKAO_SELF_NICKNAME must be configured")
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
-    start(["python3", "scripts/bujamentor-apple-watch.py", "--interval", str(args.interval), "--allow-send"], "apple-watch.log")
     database_started = False
     database_reason = "preflight_not_run"
     if db_ready():
-        start(["python3", "scripts/bujamentor-db-watch.py", "--interval", str(args.interval)], "db-watch.log")
         database_started = True
         database_reason = "ready"
     else:
         database_reason = "local_db_unavailable"
+    # AX is observation-only.  It is never a send-capable fallback for DB
+    # ingress, including while the DB is unavailable.
+    os.environ["OPENKAKAO_DB_AUTHORITATIVE"] = "1"
+    os.environ["OPENKAKAO_AUTO_REPLY_ENABLED"] = "1" if database_started else "0"
+    start(["python3", "scripts/bujamentor-apple-watch.py", "--interval", str(args.interval)], "apple-watch.log")
+    if database_started:
+        start(["python3", "scripts/bujamentor-db-watch.py", "--interval", str(args.interval)], "db-watch.log")
     write_status(database_started, database_reason)
     if args.once:
         stop()

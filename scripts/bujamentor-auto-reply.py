@@ -90,6 +90,9 @@ def save_state(state: dict) -> None:
             os.unlink(name)
 
 CLAIM_TTL_SECONDS = 5.0
+DELIVERY_UNKNOWN = "delivery_unknown"
+DB_AUTHORITATIVE_ENV = "OPENKAKAO_DB_AUTHORITATIVE"
+AUTO_REPLY_ENABLED_ENV = "OPENKAKAO_AUTO_REPLY_ENABLED"
 
 
 def _prune_semantic_claims(state: dict, now: float) -> dict[str, float]:
@@ -149,6 +152,37 @@ def claim_event(fingerprint: str, semantic_key: str | None = None) -> tuple[dict
         return state, True
 
 
+def release_event(fingerprint: str, semantic_key: str | None = None) -> None:
+    """Release a provisional claim when generation or enqueue fails."""
+    LOCK.parent.mkdir(parents=True, exist_ok=True)
+    with LOCK.open("a+", encoding="utf-8") as stream:
+        fcntl.flock(stream, fcntl.LOCK_EX)
+        state = load_state()
+        attempted = state.get("attempted_events", [])
+        if isinstance(attempted, list):
+            state["attempted_events"] = [
+                value for value in attempted if str(value) != fingerprint
+            ][-512:]
+        if state.get("attempted_event") == fingerprint:
+            state.pop("attempted_event", None)
+            state.pop("attempted_at", None)
+        claims = _prune_semantic_claims(state, time.time())
+        if semantic_key:
+            claims.pop(semantic_key, None)
+        state["semantic_claims"] = claims
+        save_state(state)
+
+
+def auto_reply_enabled() -> bool:
+    return os.environ.get(AUTO_REPLY_ENABLED_ENV) == "1"
+
+
+def db_authoritative_event_allowed(event: dict) -> bool:
+    if os.environ.get(DB_AUTHORITATIVE_ENV) != "1":
+        return True
+    return event.get("method") == "local_db" and event.get("event_type") == "local_db_message"
+
+
 def complete_event(fingerprint: str, reply: str) -> None:
     LOCK.parent.mkdir(parents=True, exist_ok=True)
     with LOCK.open("a+", encoding="utf-8") as stream:
@@ -158,6 +192,17 @@ def complete_event(fingerprint: str, reply: str) -> None:
         if reply:
             state["last_sent"] = reply
             state["last_delivery_confirmation"] = "visible_outgoing_bubble"
+        save_state(state)
+
+
+def record_delivery_unknown(fingerprint: str, reply: str) -> None:
+    LOCK.parent.mkdir(parents=True, exist_ok=True)
+    with LOCK.open("a+", encoding="utf-8") as stream:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        state = load_state()
+        state["last_event"] = fingerprint
+        state["delivery_state"] = DELIVERY_UNKNOWN
+        state["last_attempted_reply"] = reply
         save_state(state)
 
 
@@ -469,6 +514,10 @@ def main() -> int:
         return 0
     if event.get("event_type") not in {"apple_ax_message", "local_db_message"} or event.get("method") not in {"system_events_ax", "local_db"}:
         return 0
+    if not db_authoritative_event_allowed(event):
+        return 0
+    if not auto_reply_enabled() and os.environ.get("OPENKAKAO_HOOK_DRY_RUN") != "1":
+        return 0
     if event.get("direction") != "incoming" or not str(event.get("author_nickname") or "").strip():
         return 0
     self_nickname = os.environ.get("OPENKAKAO_SELF_NICKNAME", "").strip()
@@ -528,6 +577,7 @@ def main() -> int:
         complete_event(fingerprint, "")
         return 0
     if not send_reply(reply):
+        record_delivery_unknown(fingerprint, reply)
         return 1
     complete_event(fingerprint, reply)
     return 0
