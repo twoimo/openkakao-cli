@@ -219,6 +219,13 @@ allow_loco_write = true
 allow_ax_send = true
 allowed_send_chats = ["나와의 채팅에 표시되는 이름", "다른 허용 채팅방 이름"]
 ```
+### Bujamentor 자동 답변 운영 모드
+
+자동 미디어 답변은 `database_authoritative` 모드에서만 운영합니다. 정확히 하나의 대상 `chat_id`가 DB에서 확인되고 DB heartbeat·watermark·pending gap이 유효할 때만 DB watcher가 `db:<chat_id>:<log_id>` 이벤트를 outbox에 넣습니다. `acked_watermark`는 outbox의 `accepted`, `duplicate`, 또는 내구성 있는 정책 `skipped` ACK 뒤에만 전진합니다.
+
+DB probe/read/media/cursor 실패, 대상 chat-id 변경, stale heartbeat, owner 손실, 전송 결과 불확실성은 `fenced` 상태로 delivery를 중지합니다. 이때 AX watcher는 읽기 전용 enrichment일 뿐 자동 fallback이나 재전송을 하지 않습니다. 복구는 owner lock 획득, 대상 재검증, watermark/gap 및 불확실한 전송 수동 조정, 새 epoch 생성, 명시적 `ready` 승인이 필요합니다.
+
+Unattended worker는 일반 `allow_ax_send`와 별도로 `allow_bujamentor_auto_reply = true`가 필요하며, 기존 exact chat allowlist와 author 정책도 그대로 적용됩니다. 모델은 `model.privacy_mode = "local"`처럼 명시해야 하며, 알 수 없는 모드는 fail-closed입니다. `remote_explicit`은 `allow_egress`, provider, retention을 모두 명시해야 합니다. “no-server”는 모델/site egress가 없다는 뜻이 아닙니다.
 
 읽기 전용 작업은 항상 사용 가능합니다:
 

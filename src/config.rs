@@ -16,6 +16,8 @@ pub struct OpenKakaoConfig {
     pub auth: AuthConfig,
     #[serde(default)]
     pub safety: SafetyConfig,
+    #[serde(default)]
+    pub model: ModelConfig,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -29,6 +31,16 @@ pub struct SendConfig {
     #[serde(default)]
     pub allow_non_interactive: bool,
     pub default_prefix: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ModelConfig {
+    /// `local` or explicitly opted-in `remote_explicit`; unknown values fail closed.
+    pub privacy_mode: Option<String>,
+    #[serde(default)]
+    pub allow_egress: bool,
+    pub provider: Option<String>,
+    pub retention: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -72,6 +84,9 @@ pub struct SafetyConfig {
     /// allowed to send.
     #[serde(default)]
     pub allowed_send_chats: Vec<String>,
+    /// Independent opt-in required by unattended Bujamentor workers.
+    #[serde(default)]
+    pub allow_bujamentor_auto_reply: bool,
 }
 
 impl Default for SafetyConfig {
@@ -85,6 +100,7 @@ impl Default for SafetyConfig {
             allow_insecure_webhooks: false,
             allow_loco_write: false,
             allow_ax_send: false,
+            allow_bujamentor_auto_reply: false,
             allowed_send_chats: Vec::new(),
         }
     }
@@ -108,6 +124,36 @@ pub fn load_config() -> Result<OpenKakaoConfig> {
     Ok(config)
 }
 
+/// Validate the model privacy contract before an unattended worker starts.
+pub fn validate_model_privacy(config: &OpenKakaoConfig) -> Result<()> {
+    match config.model.privacy_mode.as_deref() {
+        Some("local") => Ok(()),
+        Some("remote_explicit")
+            if config.model.allow_egress
+                && config
+                    .model
+                    .provider
+                    .as_deref()
+                    .is_some_and(|v| !v.trim().is_empty())
+                && config
+                    .model
+                    .retention
+                    .as_deref()
+                    .is_some_and(|v| !v.trim().is_empty()) =>
+        {
+            Ok(())
+        }
+        Some(mode) => {
+            anyhow::bail!("model privacy mode '{mode}' is not eligible for unattended use")
+        }
+        None => anyhow::bail!("model privacy mode must be explicitly configured"),
+    }
+}
+
+pub fn unattended_auto_reply_enabled(config: &OpenKakaoConfig) -> bool {
+    config.safety.allow_bujamentor_auto_reply
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -127,5 +173,23 @@ mod tests {
         assert_eq!(config.safety.webhook_timeout_secs, Some(10));
         assert!(!config.safety.allow_insecure_webhooks);
         assert!(!config.safety.allow_loco_write);
+        assert!(!config.safety.allow_bujamentor_auto_reply);
+        assert!(config.model.privacy_mode.is_none());
+        assert!(!config.model.allow_egress);
+    }
+
+    #[test]
+    fn model_privacy_and_auto_reply_gate_fail_closed() {
+        let mut config = OpenKakaoConfig::default();
+        assert!(validate_model_privacy(&config).is_err());
+        assert!(!unattended_auto_reply_enabled(&config));
+
+        config.model.privacy_mode = Some("unknown".into());
+        assert!(validate_model_privacy(&config).is_err());
+
+        config.model.privacy_mode = Some("local".into());
+        config.safety.allow_bujamentor_auto_reply = true;
+        assert!(validate_model_privacy(&config).is_ok());
+        assert!(unattended_auto_reply_enabled(&config));
     }
 }

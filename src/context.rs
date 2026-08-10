@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use chrono::{NaiveDateTime, Utc};
 use csv::ReaderBuilder;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::fs;
@@ -68,6 +68,7 @@ pub struct ReplyDecisionMatch {
     pub category: String,
     pub status: String,
     pub reply: Option<String>,
+    pub evidence_json: String,
     pub score: f32,
 }
 
@@ -276,7 +277,27 @@ pub fn record_reply_decision(db_path: &Path, record_json: &str) -> Result<()> {
         anyhow::bail!("reply decision must be 'reply' or 'skip'");
     }
     let conn = open_db(db_path)?;
+    let incoming_rank = reply_status_rank(&input.status)
+        .ok_or_else(|| anyhow::anyhow!("unknown reply decision status '{}'", input.status))?;
     let now = Utc::now().to_rfc3339();
+    let existing_status = conn
+        .query_row(
+            "SELECT status FROM reply_decisions WHERE event_id=?1",
+            [&input.event_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if let Some(previous_status) = existing_status {
+        let previous_rank = reply_status_rank(&previous_status).unwrap_or(6);
+        if !can_apply_reply_status(
+            &previous_status,
+            &input.status,
+            previous_rank,
+            incoming_rank,
+        ) {
+            return Ok(());
+        }
+    }
     conn.execute(
         "INSERT INTO reply_decisions(
             event_id, chat, author, received_at, message, vector, decision, reason,
@@ -337,6 +358,22 @@ pub fn update_reply_decision(
         anyhow::bail!("reply decision event_id and status must not be empty");
     }
     let conn = open_db(db_path)?;
+    let incoming_rank = reply_status_rank(status)
+        .ok_or_else(|| anyhow::anyhow!("unknown reply decision status '{status}'"))?;
+    let previous_status = conn
+        .query_row(
+            "SELECT status FROM reply_decisions WHERE event_id=?1",
+            [event_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    let Some(previous_status) = previous_status else {
+        return Ok(false);
+    };
+    let previous_rank = reply_status_rank(&previous_status).unwrap_or(6);
+    if !can_apply_reply_status(&previous_status, status, previous_rank, incoming_rank) {
+        return Ok(false);
+    }
     let changed = conn.execute(
         "UPDATE reply_decisions
          SET status = ?2,
@@ -365,12 +402,13 @@ pub fn reply_decision_search(
     let conn = open_db(db_path)?;
     let mut stmt = conn.prepare(
         "SELECT event_id, chat, author, received_at, message, decision, reason,
-                category, status, reply, vector
+                category, status, reply, substr(evidence_json, 1, 16384), vector
          FROM reply_decisions
          WHERE chat = ?1",
     )?;
     let rows = stmt.query_map([chat], |row| {
-        let bytes: Vec<u8> = row.get(10)?;
+        let evidence_json: String = row.get(10)?;
+        let bytes: Vec<u8> = row.get(11)?;
         Ok((
             ReplyDecisionMatch {
                 event_id: row.get(0)?,
@@ -383,6 +421,7 @@ pub fn reply_decision_search(
                 category: row.get(7)?,
                 status: row.get(8)?,
                 reply: row.get(9)?,
+                evidence_json,
                 score: 0.0,
             },
             bytes_to_vector(&bytes),
@@ -471,6 +510,176 @@ pub fn style_search(
     Ok(results)
 }
 
+pub const REPLY_DECISION_STATUSES: &[&str] = &[
+    "pending",
+    "processing",
+    "projection_pending",
+    "scheduled",
+    "sending",
+    "accepted_unconfirmed",
+    "sent",
+    "skipped",
+    "failed",
+    "delivery_unknown",
+    "reconcile_required",
+    "poison",
+];
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ReplyDecision {
+    pub event_id: String,
+    pub status: String,
+    pub evidence_json: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ReplyDecisionUpdate {
+    pub applied: bool,
+    pub updated: bool,
+    pub decision: Option<ReplyDecision>,
+    pub reason: Option<String>,
+}
+
+fn reply_status_rank(status: &str) -> Option<u8> {
+    Some(match status {
+        "pending" => 0,
+        "processing" => 1,
+        "projection_pending" => 2,
+        "scheduled" => 3,
+        "sending" => 4,
+        "accepted_unconfirmed" => 5,
+        "sent" | "skipped" | "poison" => 6,
+        "failed" => 4,
+        "delivery_unknown" | "reconcile_required" => 6,
+        _ => return None,
+    })
+}
+
+/// Apply a monotonic audit projection. The queue remains the delivery authority.
+pub fn project_reply_decision(
+    db_path: &Path,
+    event_id: &str,
+    status: &str,
+    evidence_json: &str,
+) -> Result<ReplyDecisionUpdate> {
+    if event_id.trim().is_empty() {
+        anyhow::bail!("reply event identity must not be empty");
+    }
+    if evidence_json.len() > 16 * 1024 {
+        anyhow::bail!("reply evidence exceeds 16 KiB");
+    }
+    let incoming_rank = reply_status_rank(status)
+        .ok_or_else(|| anyhow::anyhow!("unknown reply decision status '{status}'"))?;
+    let conn = open_db(db_path)?;
+    let now = chrono::Utc::now().to_rfc3339();
+    let existing = conn
+        .query_row(
+            "SELECT status,evidence_json,updated_at FROM reply_decisions WHERE event_id=?1",
+            [event_id],
+            |row| {
+                Ok(ReplyDecision {
+                    event_id: event_id.to_string(),
+                    status: row.get(0)?,
+                    evidence_json: row.get(1)?,
+                    updated_at: row.get(2)?,
+                })
+            },
+        )
+        .optional()?;
+    if let Some(previous) = existing {
+        let previous_rank = reply_status_rank(&previous.status).unwrap_or(6);
+        if !can_apply_reply_status(&previous.status, status, previous_rank, incoming_rank) {
+            return Ok(ReplyDecisionUpdate {
+                applied: false,
+                updated: false,
+                decision: Some(previous),
+                reason: Some("terminal_or_newer_status_cannot_regress".into()),
+            });
+        }
+        if previous.status == status && previous.evidence_json == evidence_json {
+            return Ok(ReplyDecisionUpdate {
+                applied: true,
+                updated: false,
+                decision: Some(previous),
+                reason: Some("already_current".into()),
+            });
+        }
+        conn.execute(
+            "UPDATE reply_decisions
+             SET status=?2,evidence_json=?3,updated_at=?4
+             WHERE event_id=?1",
+            params![event_id, status, evidence_json, now],
+        )?;
+    } else {
+        conn.execute(
+            "INSERT INTO reply_decisions(
+                event_id, chat, author, received_at, message, vector, decision,
+                reason, category, context_match_count, style_match_count,
+                best_context_score, best_style_score, prior_similarity,
+                scheduled_delay_seconds, status, reply, sent_at, created_at,
+                updated_at, evidence_json
+             ) VALUES(
+                ?1, '__projection__', '', ?2, ?1, ?3, 'skip', 'projection',
+                'uncertain', 0, 0, 0, 0, 0, 0, ?4, NULL, NULL, ?2, ?2, ?5
+             )",
+            params![
+                event_id,
+                now,
+                vector_to_bytes(&encode_vector(event_id)),
+                status,
+                evidence_json,
+            ],
+        )?;
+    }
+    Ok(ReplyDecisionUpdate {
+        applied: true,
+        updated: true,
+        decision: Some(ReplyDecision {
+            event_id: event_id.to_string(),
+            status: status.to_string(),
+            evidence_json: evidence_json.to_string(),
+            updated_at: now,
+        }),
+        reason: None,
+    })
+}
+
+fn can_apply_reply_status(
+    previous: &str,
+    incoming: &str,
+    previous_rank: u8,
+    incoming_rank: u8,
+) -> bool {
+    if incoming_rank < previous_rank {
+        return false;
+    }
+    if previous == incoming {
+        return true;
+    }
+    if matches!(previous, "sent" | "skipped" | "poison") {
+        return false;
+    }
+    true
+}
+
+pub fn get_reply_decision(db_path: &Path, event_id: &str) -> Result<Option<ReplyDecision>> {
+    let conn = open_db(db_path)?;
+    conn.query_row(
+        "SELECT event_id,status,evidence_json,updated_at FROM reply_decisions WHERE event_id=?1",
+        [event_id],
+        |row| {
+            Ok(ReplyDecision {
+                event_id: row.get(0)?,
+                status: row.get(1)?,
+                evidence_json: row.get(2)?,
+                updated_at: row.get(3)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(Into::into)
+}
 fn open_db(path: &Path) -> Result<Connection> {
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         fs::create_dir_all(parent)?;
@@ -515,7 +724,8 @@ fn open_db(path: &Path) -> Result<Connection> {
             reply TEXT,
             sent_at TEXT,
             created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
+            updated_at TEXT NOT NULL,
+            evidence_json TEXT NOT NULL DEFAULT '{}'
         );
         CREATE INDEX IF NOT EXISTS idx_reply_decisions_chat_created ON reply_decisions(chat, created_at);
         CREATE INDEX IF NOT EXISTS idx_reply_decisions_chat_status ON reply_decisions(chat, status);")?;
@@ -529,6 +739,19 @@ fn open_db(path: &Path) -> Result<Connection> {
     {
         conn.execute(
             "ALTER TABLE response_time_stats ADD COLUMN stddev_seconds REAL NOT NULL DEFAULT 0.0",
+            [],
+        )?;
+    }
+    let reply_decision_columns = conn
+        .prepare("PRAGMA table_info(reply_decisions)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if !reply_decision_columns
+        .iter()
+        .any(|name| name == "evidence_json")
+    {
+        conn.execute(
+            "ALTER TABLE reply_decisions ADD COLUMN evidence_json TEXT NOT NULL DEFAULT '{}'",
             [],
         )?;
     }
@@ -853,5 +1076,23 @@ mod tests {
         .unwrap());
         let updated = reply_decision_search(&db, "부자멘토멘티", "세금 신고", 5).unwrap();
         assert_eq!(updated[0].status, "sent");
+    }
+
+    #[test]
+    fn reply_projection_reports_updates_and_rejects_regression() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("reply.sqlite3");
+        let first =
+            project_reply_decision(&db, "db:7:42", "scheduled", r#"{"source":"db"}"#).unwrap();
+        assert!(first.applied);
+        assert!(first.updated);
+        let sent = project_reply_decision(&db, "db:7:42", "sent", r#"{"confirmed":true}"#).unwrap();
+        assert!(sent.updated);
+        let stale = project_reply_decision(&db, "db:7:42", "pending", "{}").unwrap();
+        assert!(!stale.updated);
+        assert_eq!(
+            get_reply_decision(&db, "db:7:42").unwrap().unwrap().status,
+            "sent"
+        );
     }
 }
