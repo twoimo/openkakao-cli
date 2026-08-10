@@ -68,6 +68,7 @@ def _state(state: dict) -> dict:
         "last_observed_log_id": 0, "acked_watermark": 0, "pending_log_ids": [],
         "observed_log_ids": [], "acked_log_ids": [], "source_epoch": state.get("source_epoch", 0),
         "capability_state": "starting", "delivery_enabled": False, "fence_reason": "",
+        "heartbeat_at": "", "fence": "starting",
     }
     defaults.update(state)
     defaults["schema_version"] = STATE_VERSION
@@ -178,10 +179,14 @@ def poll_once(state: dict) -> tuple[dict, int]:
             raise DbFence("target chat identity changed")
         state.update(target_chat_id=chat["chat_id"], target_chat_name=CHAT,
                      capability_state="ready", delivery_enabled=True, fence_reason="")
+        state["heartbeat_at"] = time.time()
+        state["fence"] = "ready"
         messages = _validate_messages(
             run_json(["local-read", str(chat["chat_id"]), "--count", "50"]), chat["chat_id"])
     except (DbFence, OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as exc:
         state.update(capability_state="fenced", delivery_enabled=False, fence_reason=str(exc))
+        state["heartbeat_at"] = time.time()
+        state["fence"] = "db_unavailable"
         return state, 0
 
     pending = {int(x) for x in state["pending_log_ids"]}

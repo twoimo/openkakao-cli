@@ -110,7 +110,10 @@ def save_state(state: dict) -> None:
             os.unlink(name)
 def _queue_connection() -> sqlite3.Connection:
     QUEUE.parent.mkdir(parents=True, exist_ok=True)
-    os.chmod(QUEUE.parent, 0o700)
+    try:
+        os.chmod(QUEUE.parent, 0o700)
+    except OSError:
+        pass
     connection = sqlite3.connect(str(QUEUE), timeout=5.0)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA busy_timeout = 5000")
@@ -279,6 +282,33 @@ def semantic_event_key(event: dict, message: str, attachment: str) -> str:
         ]
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+def emit_ack(status: str, event_id: str = "", reason: str = "") -> None:
+    """Emit the machine-readable hook result consumed by DB ingress."""
+    payload = {"ack": status}
+    if event_id:
+        payload["event_id"] = event_id
+    if reason:
+        payload["reason"] = reason
+    print(json.dumps(payload, ensure_ascii=False), flush=True)
+
+
+def canonical_db_event(event: dict) -> bool:
+    if event.get("method") != "local_db" or event.get("event_type") != "local_db_message":
+        return True
+    try:
+        expected = f"db:{int(event['chat_id'])}:{int(event['log_id'])}"
+    except (KeyError, TypeError, ValueError):
+        return False
+    return str(event.get("event_id") or "") == expected and (
+        str(event.get("canonical_event_id") or expected) == expected
+    )
+
+
+def ack_return(status: str, event_id: str = "", reason: str = "") -> int:
+    emit_ack(status, event_id, reason)
+    return 0
+
+
 
 
 def claim_event(fingerprint: str, semantic_key: str | None = None) -> tuple[dict, bool]:
@@ -1084,48 +1114,47 @@ def main() -> int:
     try:
         event = json.load(sys.stdin)
     except (json.JSONDecodeError, OSError):
-        return 2
+        emit_ack("skipped", reason="invalid_event")
+        return 0
+    event_id = str(event.get("event_id") or "").strip()
     if event.get("chat_name") != CHAT:
-        return 0
+        return ack_return("skipped", event_id, "wrong_chat")
     if event.get("event_type") not in {"apple_ax_message", "local_db_message"} or event.get("method") not in {"system_events_ax", "local_db"}:
-        return 0
+        return ack_return("skipped", event_id, "unsupported_source")
+    if not canonical_db_event(event):
+        return ack_return("skipped", event_id, "noncanonical_db_identity")
     if not db_authoritative_event_allowed(event):
-        return 0
+        return ack_return("skipped", event_id, "db_authoritative")
     if not auto_reply_enabled() and os.environ.get("OPENKAKAO_HOOK_DRY_RUN") != "1":
-        return 0
+        return ack_return("skipped", event_id, "auto_reply_disabled")
     if event.get("direction") != "incoming" or not str(event.get("author_nickname") or "").strip():
-        return 0
+        return ack_return("skipped", event_id, "not_incoming")
     self_nickname = os.environ.get("OPENKAKAO_SELF_NICKNAME", "").strip()
     if not self_nickname or str(event.get("author_nickname")).strip() == self_nickname:
-        return 0
+        return ack_return("skipped", event_id, "self_or_unconfigured_author")
     if not is_reply_author(event.get("author_nickname")):
-        return 0
-    if not str(event.get("event_id") or "").strip():
-        return 0
+        return ack_return("skipped", event_id, "author_not_allowlisted")
+    if not event_id:
+        return ack_return("skipped", reason="missing_event_id")
 
     message = str(event.get("message") or "").strip()
     attachment = str(event.get("attachment") or "").strip()
     if not message and attachment:
         message = "[사진]" if attachment == "image" else "[파일]"
     if not message or (message in {"[사진]", "[파일]"} and not attachment):
-        return 0
+        return ack_return("skipped", event_id, "empty_message")
     event["message"] = message
 
-    fingerprint = str(event["event_id"]).strip()
+    fingerprint = event_id
     semantic_key = semantic_event_key(event, message, attachment)
     _, claimed = claim_event(fingerprint, semantic_key)
     if not claimed:
-        return 0
+        return ack_return("duplicate", fingerprint)
 
     if os.environ.get("OPENKAKAO_HOOK_DRY_RUN") == "1":
-        print(
-            json.dumps(
-                {"dry_run": True, "queued": False, "event_id": fingerprint},
-                ensure_ascii=False,
-            )
-        )
         complete_event(fingerprint, "")
-        return 0
+        return ack_return("skipped", fingerprint, "dry_run")
+
     try:
         inserted = enqueue_event(event)
     except (OSError, sqlite3.Error, TypeError, ValueError):
@@ -1134,10 +1163,9 @@ def main() -> int:
     if not inserted:
         # INSERT OR IGNORE reports an already durable event as a duplicate.
         complete_event(fingerprint, "")
-        return 0
-        return 1
+        return ack_return("duplicate", fingerprint)
     complete_event(fingerprint, "")
-    return 0
+    return ack_return("accepted", fingerprint)
 
 
 if __name__ == "__main__":
