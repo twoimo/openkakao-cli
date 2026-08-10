@@ -8,11 +8,18 @@ import os
 import signal
 import subprocess
 import time
+import tomllib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 BINARY = ROOT / "target/release/openkakao-cli"
 LOG_DIR = Path.home() / "Library/Application Support/openkakao/bujamentor"
+CONFIG_PATH = Path(
+    os.environ.get(
+        "OPENKAKAO_CONFIG",
+        str(Path.home() / ".config/openkakao/config.toml"),
+    )
+)
 SELF = os.environ.get("OPENKAKAO_SELF_NICKNAME", "").strip()
 children: list[subprocess.Popen] = []
 
@@ -36,6 +43,31 @@ def db_ready() -> bool:
     except json.JSONDecodeError:
         return False
 
+def auto_reply_config() -> tuple[bool, str]:
+    try:
+        with CONFIG_PATH.open("rb") as stream:
+            config = tomllib.load(stream)
+    except (FileNotFoundError, OSError, tomllib.TOMLDecodeError):
+        return False, "config_unavailable"
+    safety = config.get("safety")
+    model = config.get("model")
+    if not isinstance(safety, dict) or safety.get("allow_bujamentor_auto_reply") is not True:
+        return False, "auto_reply_not_opted_in"
+    if not isinstance(model, dict):
+        return False, "model_privacy_not_configured"
+    privacy_mode = model.get("privacy_mode")
+    if privacy_mode == "local":
+        return True, "local_model"
+    if (
+        privacy_mode == "remote_explicit"
+        and model.get("allow_egress") is True
+        and isinstance(model.get("provider"), str)
+        and model["provider"].strip()
+        and isinstance(model.get("retention"), str)
+        and model["retention"].strip()
+    ):
+        return True, "remote_explicit"
+    return False, "model_privacy_not_attested"
 
 def start(command: list[str], log_name: str) -> subprocess.Popen:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -49,6 +81,8 @@ def write_status(
     database_started: bool,
     database_reason: str,
     reply_worker: subprocess.Popen | None = None,
+    auto_reply_enabled: bool = False,
+    auto_reply_reason: str = "disabled",
 ) -> None:
     watcher_path = LOG_DIR / "apple-watch-status.json"
     try:
@@ -72,6 +106,8 @@ def write_status(
             if reply_worker is not None and reply_worker.poll() is None
             else "stopped"
         ),
+        "auto_reply_enabled": auto_reply_enabled,
+        "auto_reply_reason": auto_reply_reason,
         "updated_at": time.time(),
     }
     (LOG_DIR / "supervisor-status.json").write_text(
@@ -102,23 +138,53 @@ def main() -> int:
         raise SystemExit("OPENKAKAO_SELF_NICKNAME must be configured")
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
-    start(["python3", "scripts/bujamentor-apple-watch.py", "--interval", str(args.interval), "--allow-send"], "apple-watch.log")
-    reply_worker = start(["python3", "scripts/bujamentor-auto-reply.py", "--worker"], "reply-worker.log")
+
     database_started = False
     database_reason = "preflight_not_run"
     if db_ready():
-        start(["python3", "scripts/bujamentor-db-watch.py", "--interval", str(args.interval)], "db-watch.log")
         database_started = True
         database_reason = "ready"
     else:
         database_reason = "local_db_unavailable"
-    write_status(database_started, database_reason, reply_worker)
+    auto_reply_enabled, auto_reply_reason = auto_reply_config()
+    # AX is observation-only. It is never a send-capable fallback for DB
+    # ingress, including while the DB is unavailable.
+    os.environ["OPENKAKAO_DB_AUTHORITATIVE"] = "1"
+    os.environ["OPENKAKAO_AUTO_REPLY_ENABLED"] = (
+        "1" if database_started and auto_reply_enabled else "0"
+    )
+    start(
+        ["python3", "scripts/bujamentor-apple-watch.py", "--interval", str(args.interval)],
+        "apple-watch.log",
+    )
+    if database_started:
+        start(
+            ["python3", "scripts/bujamentor-db-watch.py", "--interval", str(args.interval)],
+            "db-watch.log",
+        )
+    reply_worker = start(
+        ["python3", "scripts/bujamentor-auto-reply.py", "--worker"],
+        "reply-worker.log",
+    )
+    write_status(
+        database_started,
+        database_reason,
+        reply_worker,
+        auto_reply_enabled=database_started and auto_reply_enabled,
+        auto_reply_reason=auto_reply_reason,
+    )
     if args.once:
         stop()
     while True:
         if any(child.poll() is not None for child in children):
             stop()
-        write_status(database_started, database_reason, reply_worker)
+        write_status(
+            database_started,
+            database_reason,
+            reply_worker,
+            auto_reply_enabled=database_started and auto_reply_enabled,
+            auto_reply_reason=auto_reply_reason,
+        )
         time.sleep(1)
 
 

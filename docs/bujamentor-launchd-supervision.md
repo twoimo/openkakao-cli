@@ -18,6 +18,7 @@ Automatic replies stay suspended after any binary change until both conditions a
 Successful installation, quiet terminal output, and `launchctl print` are not enough to prove AX/TCC access.
 The watcher isolates each AX scrape in a bounded helper process. A KakaoTalk Accessibility call that hangs cannot leave the long-lived watcher stuck with an old heartbeat; the parent records a fresh `ax_unavailable` degradation instead.
 The alternate System Events source (`scripts/bujamentor-apple-watch.py`) is GUI-session-only: it reads the exact already-open `부자멘토멘티` window, derives direction from bubble geometry, requires a visible sender label, and records `apple-watch-status.json`. Run it from a user-owned terminal/tmux session; launchd cannot be treated as equivalent because TCC and protected project paths differ. `--allow-send` is the explicit side-effect switch, and delivery is accepted only after a new exact outgoing bubble is visible.
+The alternate System Events source (`scripts/bujamentor-apple-watch.py`) is GUI-session-only and observation-only in DB-authoritative mode: it reads the exact already-open `부자멘토멘티` window, derives direction from bubble geometry, requires a visible sender label, and records `apple-watch-status.json`. The supervisor starts it without `--allow-send`; `OPENKAKAO_DB_AUTHORITATIVE=1` fences any accidental direct send flag. DB loss therefore disables delivery rather than falling back to AX. The DB watcher is the sole automatic ingress and send decision source. Run the GUI observer from a user-owned terminal/tmux session; launchd cannot be treated as equivalent because TCC and protected project paths differ.
 
 ## Install
 
@@ -31,7 +32,7 @@ sh scripts/install-bujamentor-launchd.sh \
   [--state-root /absolute/path/to/state-root]
 ```
 
-Production mode keeps the same service-mode watcher argv, adds the fixed unattended flags, and passes a direct `--hook-path` only:
+Production mode keeps the same service-mode watcher argv and adds the fixed unattended flags, but the Bujamentor supervisor still enforces the independent `OPENKAKAO_AUTO_REPLY_ENABLED=1` gate only after a healthy local DB preflight. It passes a direct `--hook-path` only:
 
 ```bash
 sh scripts/install-bujamentor-launchd.sh \

@@ -64,17 +64,23 @@ def save_state(state: dict) -> None:
             os.unlink(name)
 def write_status(state_name: str, rows: int, events: int, allow_send: bool) -> None:
     STATUS.parent.mkdir(parents=True, exist_ok=True)
+    db_authoritative = os.environ.get("OPENKAKAO_DB_AUTHORITATIVE") == "1"
+    effective_send = allow_send and not db_authoritative
     payload = {
         "schema_version": 1,
         "pid": os.getpid(),
+        "owner_id": os.environ.get("OPENKAKAO_WATCH_OWNER", str(os.getpid())),
+        "epoch": int(os.environ.get("OPENKAKAO_WATCH_EPOCH", "0") or 0),
         "self_nickname_configured": bool(os.environ.get("OPENKAKAO_SELF_NICKNAME", "").strip()),
         "state": state_name,
+        "readiness": "ready" if state_name == "healthy" else "fenced",
         "source": "system_events_ax",
         "chat_name": CHAT,
         "heartbeat_at": datetime.now(timezone.utc).isoformat(),
         "rows": rows,
         "events_emitted": events,
-        "allow_send": allow_send,
+        "allow_send": effective_send,
+        "delivery_state": "fenced_db_authoritative" if db_authoritative else ("enabled" if effective_send else "disabled"),
     }
     fd, name = tempfile.mkstemp(prefix="apple-watch-status.", dir=STATUS.parent)
     try:
@@ -281,10 +287,11 @@ def main() -> int:
     parser.add_argument("--allow-send", action="store_true")
     parser.add_argument("--snapshot-timeout", type=float, default=15.0)
     args = parser.parse_args()
+    effective_allow_send = args.allow_send and os.environ.get("OPENKAKAO_DB_AUTHORITATIVE") != "1"
 
     state = load_state()
     while True:
-        results = poll_once(state, args.dry_run, args.allow_send, args.snapshot_timeout)
+        results = poll_once(state, args.dry_run, effective_allow_send, args.snapshot_timeout)
         if results:
             print(json.dumps(results, ensure_ascii=False), flush=True)
         if args.once:
