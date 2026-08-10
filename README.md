@@ -108,10 +108,19 @@ openkakao-cli context-response-time \
   --chat "부자멘토멘티" \
   --user "최연우" \
   --json
+openkakao-cli context-style-search "질문 분위기" \
+  --chat "부자멘토멘티" \
+  --limit 10 \
+  --json
+openkakao-cli context-reply-search "지난번 세금 일정" \
+  --chat "부자멘토멘티" \
+  --limit 8 \
+  --json
 ```
 
 `--mode keyword`, `--mode vector`, `--mode hybrid`를 선택할 수 있으며, `--db /path/to/index.sqlite3`로 인덱스 위치를 지정할 수 있습니다. 기본 인덱스는 macOS 로컬 데이터 디렉터리의 `openkakao/context.sqlite3`입니다.
 인덱스는 기본적으로 사용자 전용 권한으로 저장되며, `--db` 사용자 지정 경로는 해당 경로의 파일 권한과 백업 정책을 직접 관리해야 합니다. 같은 표시 이름의 여러 CSV를 함께 검색하지 않으려면 인덱싱한 CSV의 절대 경로를 `--source`로 지정합니다.
+`context-response-time`은 평균·중앙값·p90·표준편차를 함께 보관합니다. 자동 답변 워커는 이 통계로 채팅방별 bounded normal 샘플을 뽑아 답변 시점을 정하고, `reply_decisions` 벡터 테이블에 답변/보류 결정·근거·유사도·전송 상태를 기록해 유사 메시지의 중복 답변을 줄입니다. 모든 검색과 결정 기록은 로컬에서 처리됩니다.
 ### 서버 로그인 기반 (현재 대부분 깨짐)
 
 ```bash

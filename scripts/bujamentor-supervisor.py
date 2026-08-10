@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Keep exactly one AX watcher and start DB media watching only when DB access passes."""
+"""Keep exactly one AX watcher, its reply worker, and start DB media watching only when DB access passes."""
 from __future__ import annotations
 
 import argparse
@@ -45,7 +45,11 @@ def start(command: list[str], log_name: str) -> subprocess.Popen:
     return child
 
 
-def write_status(database_started: bool, database_reason: str) -> None:
+def write_status(
+    database_started: bool,
+    database_reason: str,
+    reply_worker: subprocess.Popen | None = None,
+) -> None:
     watcher_path = LOG_DIR / "apple-watch-status.json"
     try:
         watcher = json.loads(watcher_path.read_text(encoding="utf-8"))
@@ -62,6 +66,12 @@ def write_status(database_started: bool, database_reason: str) -> None:
         "ax_rows": watcher.get("rows", 0),
         "ax_events_emitted": watcher.get("events_emitted", 0),
         "delivery_state": "enabled" if watcher.get("allow_send") else "disabled",
+        "reply_worker_pid": reply_worker.pid if reply_worker else 0,
+        "reply_worker_state": (
+            "running"
+            if reply_worker is not None and reply_worker.poll() is None
+            else "stopped"
+        ),
         "updated_at": time.time(),
     }
     (LOG_DIR / "supervisor-status.json").write_text(
@@ -93,6 +103,7 @@ def main() -> int:
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
     start(["python3", "scripts/bujamentor-apple-watch.py", "--interval", str(args.interval), "--allow-send"], "apple-watch.log")
+    reply_worker = start(["python3", "scripts/bujamentor-auto-reply.py", "--worker"], "reply-worker.log")
     database_started = False
     database_reason = "preflight_not_run"
     if db_ready():
@@ -101,13 +112,13 @@ def main() -> int:
         database_reason = "ready"
     else:
         database_reason = "local_db_unavailable"
-    write_status(database_started, database_reason)
+    write_status(database_started, database_reason, reply_worker)
     if args.once:
         stop()
     while True:
         if any(child.poll() is not None for child in children):
             stop()
-        write_status(database_started, database_reason)
+        write_status(database_started, database_reason, reply_worker)
         time.sleep(1)
 
 

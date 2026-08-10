@@ -575,6 +575,8 @@ enum Commands {
         limit: usize,
         #[arg(long)]
         db: Option<String>,
+        #[arg(long)]
+        chat: Option<String>,
     },
     /// Show Choi Yeonwoo's response-time statistics from the local vector database
     ContextResponseTime {
@@ -584,6 +586,36 @@ enum Commands {
         user: String,
         #[arg(long)]
         source: Option<String>,
+        #[arg(long)]
+        db: Option<String>,
+    },
+    /// Search previous reply decisions stored in the local context vector database
+    ContextReplySearch {
+        query: String,
+        #[arg(long)]
+        chat: String,
+        #[arg(short = 'n', long, default_value_t = 8)]
+        limit: usize,
+        #[arg(long)]
+        db: Option<String>,
+    },
+    /// Record a structured reply decision in the local context vector database
+    ContextReplyRecord {
+        #[arg(long)]
+        record: String,
+        #[arg(long)]
+        db: Option<String>,
+    },
+    /// Update the delivery status of a structured reply decision
+    ContextReplyUpdate {
+        #[arg(long)]
+        event_id: String,
+        #[arg(long)]
+        status: String,
+        #[arg(long)]
+        reply: Option<String>,
+        #[arg(long)]
+        sent_at: Option<String>,
         #[arg(long)]
         db: Option<String>,
     },
@@ -652,6 +684,9 @@ fn is_local_only_command(command: &Commands) -> bool {
             | Commands::ContextIndex { .. }
             | Commands::ContextSearch { .. }
             | Commands::ContextStyleSearch { .. }
+            | Commands::ContextReplySearch { .. }
+            | Commands::ContextReplyRecord { .. }
+            | Commands::ContextReplyUpdate { .. }
             | Commands::AxServiceScrapeOnce
             | Commands::LocalSend { .. }
             | Commands::AxRead { .. }
@@ -1415,11 +1450,17 @@ fn main() -> Result<()> {
                 println!("{} results (offline {} search)", results.len(), mode);
             }
         }
-        Commands::ContextStyleSearch { query, limit, db } => {
+        Commands::ContextStyleSearch {
+            query,
+            limit,
+            db,
+            chat,
+        } => {
             let db_path = db
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(openkakao_cli::context::default_db_path);
-            let results = openkakao_cli::context::style_search(&db_path, &query, limit)?;
+            let results =
+                openkakao_cli::context::style_search(&db_path, chat.as_deref(), &query, limit)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&results)?);
             } else {
@@ -1467,6 +1508,91 @@ fn main() -> Result<()> {
                 );
             } else {
                 println!("No response-time samples for '{}' in '{}'.", user, chat);
+            }
+        }
+        Commands::ContextReplySearch {
+            query,
+            chat,
+            limit,
+            db,
+        } => {
+            let db_path = db
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(openkakao_cli::context::default_db_path);
+            let results =
+                openkakao_cli::context::reply_decision_search(&db_path, &chat, &query, limit)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&results)?);
+            } else {
+                for result in &results {
+                    println!(
+                        "[{:.3}] {} {} [{}] {}: {}",
+                        result.score,
+                        result.decision,
+                        result.status,
+                        result.category,
+                        result.author,
+                        util::truncate(&result.message, 160)
+                    );
+                }
+                println!(
+                    "{} results (offline reply-decision vector search)",
+                    results.len()
+                );
+            }
+        }
+        Commands::ContextReplyRecord { record, db } => {
+            let db_path = db
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(openkakao_cli::context::default_db_path);
+            openkakao_cli::context::record_reply_decision(&db_path, &record)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "recorded": true,
+                        "db": db_path,
+                        "network": false
+                    })
+                );
+            } else {
+                println!(
+                    "Recorded reply decision in {} (offline).",
+                    db_path.display()
+                );
+            }
+        }
+        Commands::ContextReplyUpdate {
+            event_id,
+            status,
+            reply,
+            sent_at,
+            db,
+        } => {
+            let db_path = db
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(openkakao_cli::context::default_db_path);
+            let updated = openkakao_cli::context::update_reply_decision(
+                &db_path,
+                &event_id,
+                &status,
+                reply.as_deref(),
+                sent_at.as_deref(),
+            )?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "updated": updated,
+                        "event_id": event_id,
+                        "db": db_path,
+                        "network": false
+                    })
+                );
+            } else if updated {
+                println!("Updated reply decision {} (offline).", event_id);
+            } else {
+                println!("Reply decision {} was not found.", event_id);
             }
         }
         Commands::AxServiceScrapeOnce => {

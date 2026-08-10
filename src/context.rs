@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
-use chrono::NaiveDateTime;
+use chrono::{NaiveDateTime, Utc};
 use csv::ReaderBuilder;
 use rusqlite::{params, Connection};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -23,6 +23,7 @@ pub struct ResponseTimeStats {
     pub min_seconds: f64,
     pub max_seconds: f64,
     pub max_window_seconds: i64,
+    pub stddev_seconds: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -34,6 +35,40 @@ pub struct ContextResult {
     pub message: String,
     pub score: f32,
     pub mode: String,
+}
+#[derive(Debug, Clone, Deserialize)]
+struct ReplyDecisionInput {
+    event_id: String,
+    chat: String,
+    author: String,
+    received_at: String,
+    message: String,
+    decision: String,
+    reason: String,
+    category: String,
+    context_match_count: usize,
+    style_match_count: usize,
+    best_context_score: f32,
+    best_style_score: f32,
+    prior_similarity: f32,
+    scheduled_delay_seconds: f64,
+    status: String,
+    reply: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ReplyDecisionMatch {
+    pub event_id: String,
+    pub chat: String,
+    pub author: String,
+    pub received_at: String,
+    pub message: String,
+    pub decision: String,
+    pub reason: String,
+    pub category: String,
+    pub status: String,
+    pub reply: Option<String>,
+    pub score: f32,
 }
 
 pub fn default_db_path() -> PathBuf {
@@ -129,7 +164,7 @@ pub fn index_csv(db_path: &Path, chat: &str, input: &Path) -> Result<usize> {
     )?;
     if let Some(stats) = summarize_response_delays(chat, &source, STYLE_USER, response_delays) {
         tx.execute(
-            "INSERT INTO response_time_stats(chat, source, user_name, sample_count, average_seconds, median_seconds, p90_seconds, min_seconds, max_seconds, max_window_seconds) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT INTO response_time_stats(chat, source, user_name, sample_count, average_seconds, median_seconds, p90_seconds, min_seconds, max_seconds, max_window_seconds, stddev_seconds) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 stats.chat,
                 stats.source,
@@ -141,6 +176,7 @@ pub fn index_csv(db_path: &Path, chat: &str, input: &Path) -> Result<usize> {
                 stats.min_seconds,
                 stats.max_seconds,
                 stats.max_window_seconds,
+                stats.stddev_seconds,
             ],
         )?;
     }
@@ -158,6 +194,16 @@ fn summarize_response_delays(
     }
     delays.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
     let average_seconds = delays.iter().sum::<f64>() / delays.len() as f64;
+    let stddev_seconds = if delays.len() > 1 {
+        (delays
+            .iter()
+            .map(|delay| (delay - average_seconds).powi(2))
+            .sum::<f64>()
+            / (delays.len() - 1) as f64)
+            .sqrt()
+    } else {
+        0.0
+    };
     let percentile = |ratio: f64| {
         let position = (delays.len() - 1) as f64 * ratio;
         let lower = position.floor() as usize;
@@ -179,6 +225,7 @@ fn summarize_response_delays(
         min_seconds: delays[0],
         max_seconds: *delays.last().unwrap_or(&delays[0]),
         max_window_seconds: MAX_RESPONSE_DELAY_SECONDS,
+        stddev_seconds,
     })
 }
 
@@ -190,7 +237,7 @@ pub fn response_time_stats(
 ) -> Result<Option<ResponseTimeStats>> {
     let conn = open_db(db_path)?;
     let mut stmt = conn.prepare(
-        "SELECT chat, source, user_name, sample_count, average_seconds, median_seconds, p90_seconds, min_seconds, max_seconds, max_window_seconds
+        "SELECT chat, source, user_name, sample_count, average_seconds, median_seconds, p90_seconds, min_seconds, max_seconds, max_window_seconds, stddev_seconds
          FROM response_time_stats
          WHERE chat = ?1 AND user_name = ?2 AND (?3 IS NULL OR source = ?3)
          ORDER BY sample_count DESC
@@ -208,12 +255,148 @@ pub fn response_time_stats(
             min_seconds: row.get(7)?,
             max_seconds: row.get(8)?,
             max_window_seconds: row.get(9)?,
+            stddev_seconds: row.get(10)?,
         })
     }) {
         Ok(stats) => Ok(Some(stats)),
         Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
         Err(error) => Err(error.into()),
     }
+}
+pub fn record_reply_decision(db_path: &Path, record_json: &str) -> Result<()> {
+    let input: ReplyDecisionInput =
+        serde_json::from_str(record_json).context("invalid reply decision JSON")?;
+    if input.event_id.trim().is_empty()
+        || input.chat.trim().is_empty()
+        || input.message.trim().is_empty()
+    {
+        anyhow::bail!("reply decision event_id, chat, and message must not be empty");
+    }
+    if !matches!(input.decision.as_str(), "reply" | "skip") {
+        anyhow::bail!("reply decision must be 'reply' or 'skip'");
+    }
+    let conn = open_db(db_path)?;
+    let now = Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT INTO reply_decisions(
+            event_id, chat, author, received_at, message, vector, decision, reason,
+            category, context_match_count, style_match_count, best_context_score,
+            best_style_score, prior_similarity, scheduled_delay_seconds, status,
+            reply, sent_at, created_at, updated_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, NULL, ?18, ?18)
+        ON CONFLICT(event_id) DO UPDATE SET
+            chat=excluded.chat,
+            author=excluded.author,
+            received_at=excluded.received_at,
+            message=excluded.message,
+            vector=excluded.vector,
+            decision=excluded.decision,
+            reason=excluded.reason,
+            category=excluded.category,
+            context_match_count=excluded.context_match_count,
+            style_match_count=excluded.style_match_count,
+            best_context_score=excluded.best_context_score,
+            best_style_score=excluded.best_style_score,
+            prior_similarity=excluded.prior_similarity,
+            scheduled_delay_seconds=excluded.scheduled_delay_seconds,
+            status=excluded.status,
+            reply=COALESCE(excluded.reply, reply),
+            updated_at=excluded.updated_at",
+        params![
+            input.event_id,
+            input.chat,
+            input.author,
+            input.received_at,
+            input.message,
+            vector_to_bytes(&encode_vector(&input.message)),
+            input.decision,
+            input.reason,
+            input.category,
+            input.context_match_count as i64,
+            input.style_match_count as i64,
+            input.best_context_score,
+            input.best_style_score,
+            input.prior_similarity,
+            input.scheduled_delay_seconds,
+            input.status,
+            input.reply,
+            now,
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn update_reply_decision(
+    db_path: &Path,
+    event_id: &str,
+    status: &str,
+    reply: Option<&str>,
+    sent_at: Option<&str>,
+) -> Result<bool> {
+    if event_id.trim().is_empty() || status.trim().is_empty() {
+        anyhow::bail!("reply decision event_id and status must not be empty");
+    }
+    let conn = open_db(db_path)?;
+    let changed = conn.execute(
+        "UPDATE reply_decisions
+         SET status = ?2,
+             reply = COALESCE(?3, reply),
+             sent_at = COALESCE(?4, sent_at),
+             updated_at = ?5
+         WHERE event_id = ?1",
+        params![event_id, status, reply, sent_at, Utc::now().to_rfc3339()],
+    )?;
+    Ok(changed > 0)
+}
+
+pub fn reply_decision_search(
+    db_path: &Path,
+    chat: &str,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<ReplyDecisionMatch>> {
+    if chat.trim().is_empty() || query.trim().is_empty() || limit == 0 {
+        return Ok(Vec::new());
+    }
+    let query_vector = encode_vector(query);
+    if query_vector.iter().all(|value| *value == 0.0) {
+        return Ok(Vec::new());
+    }
+    let conn = open_db(db_path)?;
+    let mut stmt = conn.prepare(
+        "SELECT event_id, chat, author, received_at, message, decision, reason,
+                category, status, reply, vector
+         FROM reply_decisions
+         WHERE chat = ?1",
+    )?;
+    let rows = stmt.query_map([chat], |row| {
+        let bytes: Vec<u8> = row.get(10)?;
+        Ok((
+            ReplyDecisionMatch {
+                event_id: row.get(0)?,
+                chat: row.get(1)?,
+                author: row.get(2)?,
+                received_at: row.get(3)?,
+                message: row.get(4)?,
+                decision: row.get(5)?,
+                reason: row.get(6)?,
+                category: row.get(7)?,
+                status: row.get(8)?,
+                reply: row.get(9)?,
+                score: 0.0,
+            },
+            bytes_to_vector(&bytes),
+        ))
+    })?;
+    let mut results = Vec::new();
+    for row in rows {
+        let (mut result, vector) = row?;
+        result.score = cosine(&query_vector, &vector);
+        results.push(result);
+    }
+    results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
+    results.truncate(limit);
+    Ok(results)
 }
 
 pub fn search(
@@ -240,7 +423,12 @@ pub fn search(
         }
     }
 }
-pub fn style_search(db_path: &Path, query: &str, limit: usize) -> Result<Vec<ContextResult>> {
+pub fn style_search(
+    db_path: &Path,
+    chat: Option<&str>,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<ContextResult>> {
     if query.trim().is_empty() {
         anyhow::bail!("query must not be empty");
     }
@@ -254,9 +442,10 @@ pub fn style_search(db_path: &Path, query: &str, limit: usize) -> Result<Vec<Con
     }
     let mut stmt = conn.prepare(
         "SELECT chat,source,date,user_name,message,vector
-         FROM choi_yeonwoo_style",
+         FROM choi_yeonwoo_style
+         WHERE (?1 IS NULL OR chat = ?1)",
     )?;
-    let rows = stmt.query_map([], |row| {
+    let rows = stmt.query_map(params![chat], |row| {
         let bytes: Vec<u8> = row.get(5)?;
         Ok((
             ContextResult {
@@ -304,8 +493,45 @@ fn open_db(path: &Path) -> Result<Connection> {
         CREATE TRIGGER IF NOT EXISTS context_messages_au AFTER UPDATE ON context_messages BEGIN INSERT INTO context_messages_fts(context_messages_fts,rowid,message,user_name,chat) VALUES('delete',old.id,old.message,old.user_name,old.chat); INSERT INTO context_messages_fts(rowid,message,user_name,chat) VALUES(new.id,new.message,new.user_name,new.chat); END;
         CREATE TABLE IF NOT EXISTS choi_yeonwoo_style(id INTEGER PRIMARY KEY, source TEXT NOT NULL, chat TEXT NOT NULL, date TEXT NOT NULL, user_name TEXT NOT NULL CHECK(user_name = '최연우'), message TEXT NOT NULL, vector BLOB NOT NULL);
         CREATE INDEX IF NOT EXISTS idx_choi_yeonwoo_style_chat_source ON choi_yeonwoo_style(chat, source);
-        CREATE TABLE IF NOT EXISTS response_time_stats(chat TEXT NOT NULL, source TEXT NOT NULL, user_name TEXT NOT NULL CHECK(user_name = '최연우'), sample_count INTEGER NOT NULL, average_seconds REAL NOT NULL, median_seconds REAL NOT NULL, p90_seconds REAL NOT NULL, min_seconds REAL NOT NULL, max_seconds REAL NOT NULL, max_window_seconds INTEGER NOT NULL, PRIMARY KEY(chat, source, user_name));
-        CREATE INDEX IF NOT EXISTS idx_response_time_stats_chat_user ON response_time_stats(chat, user_name);")?;
+        CREATE TABLE IF NOT EXISTS response_time_stats(chat TEXT NOT NULL, source TEXT NOT NULL, user_name TEXT NOT NULL CHECK(user_name = '최연우'), sample_count INTEGER NOT NULL, average_seconds REAL NOT NULL, median_seconds REAL NOT NULL, p90_seconds REAL NOT NULL, min_seconds REAL NOT NULL, max_seconds REAL NOT NULL, max_window_seconds INTEGER NOT NULL, stddev_seconds REAL NOT NULL DEFAULT 0.0, PRIMARY KEY(chat, source, user_name));
+        CREATE INDEX IF NOT EXISTS idx_response_time_stats_chat_user ON response_time_stats(chat, user_name);
+        CREATE TABLE IF NOT EXISTS reply_decisions(
+            event_id TEXT PRIMARY KEY,
+            chat TEXT NOT NULL,
+            author TEXT NOT NULL,
+            received_at TEXT NOT NULL,
+            message TEXT NOT NULL,
+            vector BLOB NOT NULL,
+            decision TEXT NOT NULL CHECK(decision IN ('reply', 'skip')),
+            reason TEXT NOT NULL,
+            category TEXT NOT NULL,
+            context_match_count INTEGER NOT NULL,
+            style_match_count INTEGER NOT NULL,
+            best_context_score REAL NOT NULL,
+            best_style_score REAL NOT NULL,
+            prior_similarity REAL NOT NULL,
+            scheduled_delay_seconds REAL NOT NULL,
+            status TEXT NOT NULL,
+            reply TEXT,
+            sent_at TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_reply_decisions_chat_created ON reply_decisions(chat, created_at);
+        CREATE INDEX IF NOT EXISTS idx_reply_decisions_chat_status ON reply_decisions(chat, status);")?;
+    let response_time_columns = conn
+        .prepare("PRAGMA table_info(response_time_stats)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if !response_time_columns
+        .iter()
+        .any(|name| name == "stddev_seconds")
+    {
+        conn.execute(
+            "ALTER TABLE response_time_stats ADD COLUMN stddev_seconds REAL NOT NULL DEFAULT 0.0",
+            [],
+        )?;
+    }
     Ok(conn)
 }
 
@@ -527,7 +753,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(index_csv(&db, "부자멘토멘티", &path).unwrap(), 2);
-        let results = style_search(&db, "세긴 하네", 5).unwrap();
+        let results = style_search(&db, Some("부자멘토멘티"), "세긴 하네", 5).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].user, STYLE_USER);
         assert_eq!(results[0].message, "ㅋㅋ 이건 좀 세긴 하네");
@@ -566,6 +792,7 @@ mod tests {
         assert_eq!(stats.p90_seconds, 109.0);
         assert_eq!(stats.min_seconds, 10.0);
         assert_eq!(stats.max_seconds, 120.0);
+        assert!(stats.stddev_seconds > 0.0);
     }
     #[test]
     fn reindex_removes_old_rows_and_vector_is_deterministic() {
@@ -588,5 +815,43 @@ mod tests {
         let path = fixture(dir.path(), "chat.csv", "hello");
         index_csv(&db, "방", &path).unwrap();
         assert!(search(&db, Some("방"), None, "!!!", "vector", 5).is_err());
+    }
+    #[test]
+    fn records_and_searches_reply_decisions() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("index.sqlite3");
+        let record = serde_json::json!({
+            "event_id": "event-1",
+            "chat": "부자멘토멘티",
+            "author": "민수",
+            "received_at": "2026-01-01T00:00:00Z",
+            "message": "세금 신고 일정이 궁금해",
+            "decision": "reply",
+            "reason": "direct_question",
+            "category": "question",
+            "context_match_count": 2,
+            "style_match_count": 3,
+            "best_context_score": 0.8,
+            "best_style_score": 0.9,
+            "prior_similarity": 0.0,
+            "scheduled_delay_seconds": 15.0,
+            "status": "scheduled",
+            "reply": "지난번처럼 일정 확인해보면 돼",
+        });
+        record_reply_decision(&db, &record.to_string()).unwrap();
+        let matches = reply_decision_search(&db, "부자멘토멘티", "세금 신고", 5).unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].decision, "reply");
+        assert_eq!(matches[0].status, "scheduled");
+        assert!(update_reply_decision(
+            &db,
+            "event-1",
+            "sent",
+            Some("답변 완료"),
+            Some("2026-01-01T00:00:15Z")
+        )
+        .unwrap());
+        let updated = reply_decision_search(&db, "부자멘토멘티", "세금 신고", 5).unwrap();
+        assert_eq!(updated[0].status, "sent");
     }
 }
