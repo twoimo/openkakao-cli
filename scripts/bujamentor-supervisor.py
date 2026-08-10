@@ -9,6 +9,8 @@ import signal
 import subprocess
 import time
 import tomllib
+import fcntl
+import uuid
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -22,6 +24,9 @@ CONFIG_PATH = Path(
 )
 SELF = os.environ.get("OPENKAKAO_SELF_NICKNAME", "").strip()
 children: list[subprocess.Popen] = []
+owner_lock = None
+owner_id = ""
+source_epoch = ""
 
 
 def db_ready() -> bool:
@@ -69,6 +74,22 @@ def auto_reply_config() -> tuple[bool, str]:
         return True, "remote_explicit"
     return False, "model_privacy_not_attested"
 
+def acquire_owner() -> None:
+    global owner_lock, owner_id, source_epoch
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    owner_lock = (LOG_DIR / "supervisor.owner.lock").open("a+", encoding="utf-8")
+    try:
+        fcntl.flock(owner_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as exc:
+        raise SystemExit("Bujamentor supervisor owner collision") from exc
+    owner_id = f"{os.getpid()}-{uuid.uuid4().hex}"
+    source_epoch = str(time.time_ns())
+    owner_lock.seek(0)
+    owner_lock.truncate()
+    owner_lock.write(json.dumps({"owner": owner_id, "source_epoch": source_epoch}))
+    owner_lock.flush()
+
+
 def start(command: list[str], log_name: str) -> subprocess.Popen:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     log = (LOG_DIR / log_name).open("a", encoding="utf-8")
@@ -90,6 +111,10 @@ def write_status(
     except (FileNotFoundError, json.JSONDecodeError):
         watcher = {}
     state = {
+        "owner": owner_id,
+        "mode": "database_authoritative",
+        "source_epoch": source_epoch,
+        "readiness": "ready" if database_started else "fenced",
         "schema_version": 1,
         "state": "running",
         "self_configured": bool(SELF),
@@ -110,13 +135,18 @@ def write_status(
         "auto_reply_reason": auto_reply_reason,
         "updated_at": time.time(),
     }
-    (LOG_DIR / "supervisor-status.json").write_text(
+    tmp = LOG_DIR / "supervisor-status.json.tmp"
+    tmp.write_text(
         json.dumps(state, ensure_ascii=False),
         encoding="utf-8",
     )
+    tmp.replace(LOG_DIR / "supervisor-status.json")
 
 
 def stop(*_args: object) -> None:
+    if owner_lock is not None:
+        fcntl.flock(owner_lock.fileno(), fcntl.LOCK_UN)
+        owner_lock.close()
     for child in children:
         if child.poll() is None:
             child.terminate()
@@ -139,6 +169,7 @@ def main() -> int:
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
 
+    acquire_owner()
     database_started = False
     database_reason = "preflight_not_run"
     if db_ready():
@@ -150,6 +181,10 @@ def main() -> int:
     # AX is observation-only. It is never a send-capable fallback for DB
     # ingress, including while the DB is unavailable.
     os.environ["OPENKAKAO_DB_AUTHORITATIVE"] = "1"
+    os.environ["OPENKAKAO_DB_MODE"] = "database_authoritative"
+    os.environ["OPENKAKAO_SUPERVISOR_OWNER"] = owner_id
+    os.environ["OPENKAKAO_DB_SOURCE_EPOCH"] = source_epoch
+    os.environ["OPENKAKAO_DB_READY"] = "1" if database_started else "0"
     os.environ["OPENKAKAO_AUTO_REPLY_ENABLED"] = (
         "1" if database_started and auto_reply_enabled else "0"
     )

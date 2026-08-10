@@ -1609,6 +1609,9 @@ fn main() -> Result<()> {
         } => {
             let msg = format_outgoing_message(&message, no_prefix);
             if !dry_run {
+                if std::env::var("OPENKAKAO_BUJAMENTOR_WORKER").as_deref() == Ok("1") {
+                    config::validate_bujamentor_auto_reply(&config)?;
+                }
                 require_ax_send(&config)?;
                 require_allowed_send_chat(&config, &chat_name)?;
             }

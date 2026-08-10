@@ -154,6 +154,34 @@ pub fn unattended_auto_reply_enabled(config: &OpenKakaoConfig) -> bool {
     config.safety.allow_bujamentor_auto_reply
 }
 
+pub fn validate_bujamentor_auto_reply(config: &OpenKakaoConfig) -> Result<()> {
+    if !unattended_auto_reply_enabled(config) {
+        anyhow::bail!("Bujamentor automatic replies are not enabled");
+    }
+    validate_model_privacy(config).context("Bujamentor model privacy attestation failed")?;
+    if std::env::var("OPENKAKAO_DB_AUTHORITATIVE").as_deref() != Ok("1")
+        || std::env::var("OPENKAKAO_AUTO_REPLY_ENABLED").as_deref() != Ok("1")
+        || std::env::var("OPENKAKAO_DB_MODE").as_deref() != Ok("database_authoritative")
+        || std::env::var("OPENKAKAO_DB_READY").as_deref() != Ok("1")
+    {
+        anyhow::bail!("Bujamentor database readiness fence is not satisfied");
+    }
+    if std::env::var("OPENKAKAO_SUPERVISOR_OWNER")
+        .ok()
+        .is_none_or(|value| value.trim().is_empty())
+    {
+        anyhow::bail!("Bujamentor supervisor owner marker is missing");
+    }
+    let epoch = std::env::var("OPENKAKAO_DB_SOURCE_EPOCH")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0);
+    if epoch.is_none() {
+        anyhow::bail!("Bujamentor source epoch marker is invalid");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
