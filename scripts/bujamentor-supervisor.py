@@ -184,6 +184,8 @@ def main() -> int:
     os.environ["OPENKAKAO_DB_MODE"] = "database_authoritative"
     os.environ["OPENKAKAO_SUPERVISOR_OWNER"] = owner_id
     os.environ["OPENKAKAO_DB_SOURCE_EPOCH"] = source_epoch
+    os.environ["OPENKAKAO_WATCH_OWNER"] = owner_id
+    os.environ["OPENKAKAO_WATCH_EPOCH"] = source_epoch
     os.environ["OPENKAKAO_DB_READY"] = "1" if database_started else "0"
     os.environ["OPENKAKAO_AUTO_REPLY_ENABLED"] = (
         "1" if database_started and auto_reply_enabled else "0"

@@ -63,14 +63,22 @@ def save_state(state: dict) -> None:
 
 
 def _state(state: dict) -> dict:
+    configured_epoch = os.environ.get("OPENKAKAO_DB_SOURCE_EPOCH", "").strip()
+    try:
+        epoch = int(configured_epoch) if configured_epoch else int(state.get("source_epoch", 0))
+    except (TypeError, ValueError):
+        epoch = 0
     defaults = {
         "schema_version": STATE_VERSION, "target_chat_id": None, "target_chat_name": CHAT,
         "last_observed_log_id": 0, "acked_watermark": 0, "pending_log_ids": [],
-        "observed_log_ids": [], "acked_log_ids": [], "source_epoch": state.get("source_epoch", 0),
+        "observed_log_ids": [], "acked_log_ids": [], "source_epoch": epoch,
         "capability_state": "starting", "delivery_enabled": False, "fence_reason": "",
+        "owner_id": os.environ.get("OPENKAKAO_SUPERVISOR_OWNER", ""),
         "heartbeat_at": "", "fence": "starting",
     }
     defaults.update(state)
+    if configured_epoch:
+        defaults["source_epoch"] = epoch
     defaults["schema_version"] = STATE_VERSION
     return defaults
 
@@ -172,6 +180,18 @@ def _advance_cursor(state: dict, log_id: int) -> None:
 
 def poll_once(state: dict) -> tuple[dict, int]:
     state = _state(state)
+    if os.environ.get("OPENKAKAO_DB_MODE") != "database_authoritative":
+        state.update(capability_state="fenced", delivery_enabled=False, fence_reason="database_authoritative_mode_missing")
+        return state, 0
+    if os.environ.get("OPENKAKAO_AUTO_REPLY_ENABLED") != "1":
+        state.update(capability_state="fenced", delivery_enabled=False, fence_reason="auto_reply_gate_disabled")
+        return state, 0
+    if not os.environ.get("OPENKAKAO_SUPERVISOR_OWNER", "").strip():
+        state.update(capability_state="fenced", delivery_enabled=False, fence_reason="supervisor_owner_missing")
+        return state, 0
+    if int(state.get("source_epoch", 0)) <= 0:
+        state.update(capability_state="fenced", delivery_enabled=False, fence_reason="source_epoch_missing")
+        return state, 0
     try:
         chat = find_chat()
         old_id = state.get("target_chat_id")
@@ -193,6 +213,7 @@ def poll_once(state: dict) -> tuple[dict, int]:
     candidates = sorted(messages, key=lambda item: int(item["log_id"]))
     emitted = 0
     for message in candidates:
+        message = {**message, "source_epoch": int(state["source_epoch"])}
         log_id = int(message["log_id"])
         if log_id <= int(state["acked_watermark"]) and log_id not in pending:
             continue

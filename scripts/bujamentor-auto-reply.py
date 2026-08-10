@@ -256,21 +256,6 @@ DB_AUTHORITATIVE_ENV = "OPENKAKAO_DB_AUTHORITATIVE"
 AUTO_REPLY_ENABLED_ENV = "OPENKAKAO_AUTO_REPLY_ENABLED"
 
 
-def _prune_semantic_claims(state: dict, now: float) -> dict[str, float]:
-    raw = state.get("semantic_claims", {})
-    if not isinstance(raw, dict):
-        return {}
-    claims: dict[str, float] = {}
-    for key, value in raw.items():
-        try:
-            claimed_at = float(value)
-        except (TypeError, ValueError):
-            continue
-        if now - claimed_at < CLAIM_TTL_SECONDS:
-            claims[str(key)] = claimed_at
-    return claims
-
-
 def semantic_event_key(event: dict, message: str, attachment: str) -> str:
     payload = "\0".join(
         [
@@ -282,6 +267,21 @@ def semantic_event_key(event: dict, message: str, attachment: str) -> str:
         ]
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _prune_inflight_claims(state: dict, now: float) -> dict[str, float]:
+    raw = state.get("inflight_claims", {})
+    if not isinstance(raw, dict):
+        return {}
+    claims: dict[str, float] = {}
+    for key, value in raw.items():
+        try:
+            claimed_at = float(value)
+        except (TypeError, ValueError):
+            continue
+        if now - claimed_at < CLAIM_TTL_SECONDS:
+            claims[str(key)] = claimed_at
+    return claims
 def emit_ack(status: str, event_id: str = "", reason: str = "") -> None:
     """Emit the machine-readable hook result consumed by DB ingress."""
     payload = {"ack": status}
@@ -316,48 +316,37 @@ def claim_event(fingerprint: str, semantic_key: str | None = None) -> tuple[dict
     with LOCK.open("a+", encoding="utf-8") as stream:
         fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
         state = load_state()
-        attempted = state.get("attempted_events", [])
-        if not isinstance(attempted, list):
-            attempted = []
         now = time.time()
-        semantic_claims = _prune_semantic_claims(state, now)
-        if (
-            fingerprint in attempted
-            or fingerprint in {state.get("last_event"), state.get("attempted_event")}
-            or (semantic_key and semantic_key in semantic_claims)
-        ):
-            state["semantic_claims"] = semantic_claims
+        claims = _prune_inflight_claims(state, now)
+        event_claim = f"event:{fingerprint}"
+        semantic_claim = f"semantic:{semantic_key}" if semantic_key else ""
+        if event_claim in claims or (semantic_claim and semantic_claim in claims):
+            state["inflight_claims"] = claims
             save_state(state)
             return state, False
-        attempted.append(fingerprint)
-        state["attempted_events"] = attempted[-512:]
-        state["attempted_event"] = fingerprint
-        state["attempted_at"] = now
-        if semantic_key:
-            semantic_claims[semantic_key] = now
-        state["semantic_claims"] = semantic_claims
+        claims[event_claim] = now
+        if semantic_claim:
+            claims[semantic_claim] = now
+        state["inflight_claims"] = claims
+        state.pop("attempted_events", None)
+        state.pop("attempted_event", None)
+        state.pop("attempted_at", None)
+        state["claim_started_at"] = now
         save_state(state)
         return state, True
 
 
 def release_event(fingerprint: str, semantic_key: str | None = None) -> None:
-    """Release a provisional claim when generation or enqueue fails."""
+    """Release the provisional claim when generation or enqueue fails."""
     LOCK.parent.mkdir(parents=True, exist_ok=True)
     with LOCK.open("a+", encoding="utf-8") as stream:
         fcntl.flock(stream, fcntl.LOCK_EX)
         state = load_state()
-        attempted = state.get("attempted_events", [])
-        if isinstance(attempted, list):
-            state["attempted_events"] = [
-                value for value in attempted if str(value) != fingerprint
-            ][-512:]
-        if state.get("attempted_event") == fingerprint:
-            state.pop("attempted_event", None)
-            state.pop("attempted_at", None)
-        claims = _prune_semantic_claims(state, time.time())
+        claims = _prune_inflight_claims(state, time.time())
+        claims.pop(f"event:{fingerprint}", None)
         if semantic_key:
-            claims.pop(semantic_key, None)
-        state["semantic_claims"] = claims
+            claims.pop(f"semantic:{semantic_key}", None)
+        state["inflight_claims"] = claims
         save_state(state)
 
 
@@ -371,11 +360,20 @@ def db_authoritative_event_allowed(event: dict) -> bool:
     return event.get("method") == "local_db" and event.get("event_type") == "local_db_message"
 
 
-def complete_event(fingerprint: str, reply: str) -> None:
+def complete_event(
+    fingerprint: str,
+    reply: str,
+    semantic_key: str | None = None,
+) -> None:
     LOCK.parent.mkdir(parents=True, exist_ok=True)
     with LOCK.open("a+", encoding="utf-8") as stream:
         fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
         state = load_state()
+        claims = _prune_inflight_claims(state, time.time())
+        claims.pop(f"event:{fingerprint}", None)
+        if semantic_key:
+            claims.pop(f"semantic:{semantic_key}", None)
+        state["inflight_claims"] = claims
         state["last_event"] = fingerprint
         if reply:
             state["last_sent"] = reply
@@ -1162,7 +1160,7 @@ def main() -> int:
         return ack_return("duplicate", fingerprint)
 
     if os.environ.get("OPENKAKAO_HOOK_DRY_RUN") == "1":
-        complete_event(fingerprint, "")
+        complete_event(fingerprint, "", semantic_key)
         return ack_return("skipped", fingerprint, "dry_run")
 
     try:
@@ -1172,9 +1170,9 @@ def main() -> int:
         return 1
     if not inserted:
         # INSERT OR IGNORE reports an already durable event as a duplicate.
-        complete_event(fingerprint, "")
+        complete_event(fingerprint, "", semantic_key)
         return ack_return("duplicate", fingerprint)
-    complete_event(fingerprint, "")
+    complete_event(fingerprint, "", semantic_key)
     return ack_return("accepted", fingerprint)
 
 
