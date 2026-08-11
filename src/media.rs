@@ -166,6 +166,101 @@ pub fn sanitize_filename(name: &str) -> String {
     }
 }
 
+const MAX_MEDIA_BYTES: u64 = 5 * 1024 * 1024;
+
+fn parse_content_length(headers: &reqwest::header::HeaderMap) -> Result<u64> {
+    let mut values = headers.get_all(reqwest::header::CONTENT_LENGTH).iter();
+    let value = values
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("media response has unknown Content-Length"))?;
+    if values.next().is_some() {
+        anyhow::bail!("media response has multiple Content-Length values");
+    }
+
+    let value = value
+        .to_str()
+        .map_err(|_| anyhow::anyhow!("media response has malformed Content-Length"))?;
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        anyhow::bail!("media response has malformed Content-Length");
+    }
+
+    let content_length = value
+        .parse::<u64>()
+        .map_err(|_| anyhow::anyhow!("media response has malformed Content-Length"))?;
+    if content_length > MAX_MEDIA_BYTES {
+        anyhow::bail!("media response exceeds {} byte limit", MAX_MEDIA_BYTES);
+    }
+    Ok(content_length)
+}
+
+fn copy_bounded<R: std::io::Read, W: std::io::Write>(
+    reader: &mut R,
+    writer: &mut W,
+    content_length: u64,
+) -> Result<u64> {
+    if content_length > MAX_MEDIA_BYTES {
+        anyhow::bail!("media response exceeds {} byte limit", MAX_MEDIA_BYTES);
+    }
+
+    let mut copied = 0u64;
+    let mut buffer = [0u8; 16 * 1024];
+    loop {
+        if copied == content_length {
+            // Probe one byte after the declared body. This keeps the output at
+            // or below the cap while detecting an overlong/malformed stream.
+            let probe = reader.read(&mut buffer[..1])?;
+            if probe != 0 {
+                anyhow::bail!("media response exceeds declared Content-Length");
+            }
+            return Ok(copied);
+        }
+
+        let remaining = content_length - copied;
+        let read_len = remaining.min(buffer.len() as u64) as usize;
+        let read = reader.read(&mut buffer[..read_len])?;
+        if read == 0 {
+            anyhow::bail!("media response ended before declared Content-Length");
+        }
+        writer.write_all(&buffer[..read])?;
+        copied += read as u64;
+    }
+}
+
+fn write_bounded_file<R: std::io::Read>(
+    reader: &mut R,
+    path: &Path,
+    content_length: u64,
+) -> Result<u64> {
+    #[cfg(unix)]
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    let mut file = options.open(path)?;
+    #[cfg(unix)]
+    let file_identity = (file.metadata()?.dev(), file.metadata()?.ino());
+    let result = copy_bounded(reader, &mut file, content_length);
+    #[cfg(unix)]
+    let path_matches_file = std::fs::symlink_metadata(path)
+        .map(|metadata| {
+            metadata.file_type().is_file() && (metadata.dev(), metadata.ino()) == file_identity
+        })
+        .unwrap_or(false);
+    #[cfg(not(unix))]
+    let path_matches_file = path.is_file();
+    if result.is_err() || !path_matches_file {
+        drop(file);
+        if path_matches_file {
+            let _ = std::fs::remove_file(path);
+        }
+        if result.is_ok() {
+            anyhow::bail!("media output path changed during download");
+        }
+    }
+    result
+}
+
 /// Download a media file from KakaoTalk CDN.
 pub fn download_media_file(creds: &KakaoCredentials, url: &str, path: &Path) -> Result<u64> {
     if let Some(parent) = path.parent() {
@@ -185,13 +280,20 @@ pub fn download_media_file(creds: &KakaoCredentials, url: &str, path: &Path) -> 
 
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(60))
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
         .build()?;
 
     // Validate URL domain before sending credentials
     let parsed_url = reqwest::Url::parse(url)?;
     let host = parsed_url.host_str().unwrap_or("");
-    if !host.ends_with(".kakao.com") && !host.ends_with(".kakaocdn.net") {
-        anyhow::bail!("Refusing to send credentials to non-Kakao domain: {}", host);
+    if parsed_url.scheme() != "https"
+        || parsed_url.username() != ""
+        || parsed_url.password().is_some()
+        || parsed_url.port().is_some_and(|port| port != 443)
+        || (!host.ends_with(".kakao.com") && !host.ends_with(".kakaocdn.net"))
+    {
+        anyhow::bail!("Refusing unsafe media URL");
     }
 
     let mut response = client
@@ -205,12 +307,11 @@ pub fn download_media_file(creds: &KakaoCredentials, url: &str, path: &Path) -> 
         .send()?;
 
     if !response.status().is_success() {
-        anyhow::bail!("HTTP {}: {}", response.status(), url);
+        anyhow::bail!("HTTP {}", response.status());
     }
 
-    let mut file = std::fs::File::create(path)?;
-    let bytes = std::io::copy(&mut response, &mut file)?;
-    Ok(bytes)
+    let content_length = parse_content_length(response.headers())?;
+    write_bounded_file(&mut response, path, content_length)
 }
 #[cfg(test)]
 mod tests {
@@ -231,6 +332,58 @@ mod tests {
     #[test]
     fn rejects_invalid_attachment_json() {
         assert!(parse_attachment_url("not-json", 2).is_none());
+    }
+
+    #[test]
+    fn bounded_copy_accepts_exact_media_cap() {
+        let mut source = std::io::Cursor::new(vec![0xA5; MAX_MEDIA_BYTES as usize]);
+        let mut output = Vec::new();
+
+        let copied = copy_bounded(&mut source, &mut output, MAX_MEDIA_BYTES).unwrap();
+
+        assert_eq!(copied, MAX_MEDIA_BYTES);
+        assert_eq!(output.len(), MAX_MEDIA_BYTES as usize);
+    }
+
+    #[test]
+    fn bounded_copy_rejects_cap_plus_one_without_extra_write() {
+        let mut source = std::io::Cursor::new(vec![0x5A; MAX_MEDIA_BYTES as usize + 1]);
+        let mut output = Vec::new();
+
+        let result = copy_bounded(&mut source, &mut output, MAX_MEDIA_BYTES);
+
+        assert!(result.is_err());
+        assert_eq!(output.len(), MAX_MEDIA_BYTES as usize);
+    }
+
+    #[test]
+    fn bounded_copy_removes_partial_output_on_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("partial.bin");
+        let mut source = std::io::Cursor::new(vec![0x3C; MAX_MEDIA_BYTES as usize + 1]);
+
+        let result = write_bounded_file(&mut source, &path, MAX_MEDIA_BYTES);
+
+        assert!(result.is_err());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn content_length_is_required_and_bounded() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        assert!(parse_content_length(&headers).is_err());
+
+        headers.insert(
+            reqwest::header::CONTENT_LENGTH,
+            reqwest::header::HeaderValue::from_static("5242881"),
+        );
+        assert!(parse_content_length(&headers).is_err());
+
+        headers.insert(
+            reqwest::header::CONTENT_LENGTH,
+            reqwest::header::HeaderValue::from_static("5242880"),
+        );
+        assert_eq!(parse_content_length(&headers).unwrap(), MAX_MEDIA_BYTES);
     }
 
     #[test]

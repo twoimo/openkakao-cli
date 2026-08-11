@@ -1,10 +1,11 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result};
 use base64::Engine;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use serde::Serialize;
+use serde_json::json;
 use sha2::Digest;
 
 // ---------------------------------------------------------------------------
@@ -34,6 +35,39 @@ pub struct LocalMessage {
     pub message_type: i32,
     pub sent_at: i64,
 }
+pub const LOCAL_POLL_SCHEMA_VERSION: u32 = 2;
+pub const LOCAL_POLL_MAX_ROWS: usize = 200;
+pub const LOCAL_POLL_MAX_BYTES: usize = 1024 * 1024;
+pub const LOCAL_POLL_MAX_FIELD_BYTES: usize = 256 * 1024;
+const LOCAL_POLL_AFTER_ENV: &str = "OPENKAKAO_LOCAL_POLL_AFTER_LOG_ID";
+const LOCAL_POLL_MAX_INT64: i64 = i64::MAX;
+const LOCAL_POLL_ID_DOMAIN: &str = "global_sparse";
+
+// Kakao log IDs are global sparse identifiers, so numeric holes are not gaps.
+// Completeness proves the bounded rowset from one SQLite snapshot instead.
+#[derive(Debug, Clone, Serialize)]
+pub struct LocalPollCompleteness {
+    pub status: String,
+    pub after_log_id: i64,
+    pub first_log_id: Option<i64>,
+    pub last_log_id: Option<i64>,
+    pub chat_last_log_id: i64,
+    pub row_count: i64,
+    pub returned_count: i64,
+    pub available_max_log_id: Option<i64>,
+    pub id_domain: String,
+    pub has_gap: bool,
+    pub has_more: bool,
+    pub proof: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LocalPollEnvelope {
+    pub schema_version: u32,
+    pub chat: LocalChat,
+    pub messages: Vec<LocalMessage>,
+    pub completeness: LocalPollCompleteness,
+}
 
 // ---------------------------------------------------------------------------
 // Device info extraction
@@ -62,38 +96,127 @@ pub fn get_platform_uuid() -> Result<String> {
     }
     anyhow::bail!("IOPlatformUUID not found in ioreg output")
 }
+fn local_db_identity_cache_path() -> Option<PathBuf> {
+    dirs::data_local_dir().map(|dir| dir.join("openkakao").join("local-db-identity.json"))
+}
+
+fn read_cached_user_id(uuid: &str, plist_fingerprint: &str) -> Option<i64> {
+    let path = local_db_identity_cache_path()?;
+    let metadata = std::fs::symlink_metadata(&path).ok()?;
+    if !metadata.file_type().is_file() {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o077 != 0 {
+            return None;
+        }
+    }
+    let value: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).ok()?).ok()?;
+    let matches = value.get("schema_version") == Some(&serde_json::Value::from(2))
+        && value.get("uuid").and_then(|value| value.as_str()) == Some(uuid)
+        && value
+            .get("plist_fingerprint")
+            .and_then(|value| value.as_str())
+            == Some(plist_fingerprint);
+    if !matches {
+        let _ = std::fs::remove_file(path);
+        return None;
+    }
+    value
+        .get("user_id")
+        .and_then(|value| value.as_i64())
+        .filter(|id| *id > 0)
+}
+
+fn cache_user_id(uuid: &str, plist_fingerprint: &str, user_id: i64) {
+    let Some(path) = local_db_identity_cache_path() else {
+        return;
+    };
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if std::fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    let temp = path.with_extension("tmp");
+    let payload = json!({
+        "schema_version": 2,
+        "uuid": uuid,
+        "plist_fingerprint": plist_fingerprint,
+        "user_id": user_id,
+    });
+    if std::fs::write(&temp, serde_json::to_vec(&payload).unwrap_or_default()).is_err() {
+        return;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o600));
+        let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+    }
+    let _ = std::fs::rename(temp, path);
+}
+
+fn plist_fingerprint(path: &Path) -> Option<String> {
+    let bytes = std::fs::read(path).ok()?;
+    Some(hex::encode(sha2::Sha256::digest(&bytes)))
+}
 
 fn get_user_id_from_plist() -> Result<i64> {
     let home = dirs::home_dir().context("No home directory")?;
-
-    // Strategy 1: Container preferences with hex suffix
+    let current_uuid = get_platform_uuid().ok();
     let container_prefs =
         home.join("Library/Containers/com.kakao.KakaoTalkMac/Data/Library/Preferences");
-    if container_prefs.exists() {
-        if let Ok(entries) = std::fs::read_dir(&container_prefs) {
-            for entry in entries.flatten() {
-                let name = entry.file_name().to_string_lossy().to_string();
-                if name.starts_with("com.kakao.KakaoTalkMac.") && name.ends_with(".plist") {
-                    if let Ok(user_id) = extract_user_id_from_plist(&entry.path()) {
-                        return Ok(user_id);
-                    }
+
+    let mut plist_paths = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&container_prefs) {
+        let mut entries: Vec<_> = entries.flatten().collect();
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name == "com.kakao.KakaoTalkMac.plist"
+                || (name.starts_with("com.kakao.KakaoTalkMac.") && name.ends_with(".plist"))
+            {
+                plist_paths.push(entry.path());
+            }
+        }
+    }
+    let global_plist = home.join("Library/Preferences/com.kakao.KakaoTalkMac.plist");
+    if global_plist.is_file() {
+        plist_paths.push(global_plist);
+    }
+    if plist_paths.is_empty() {
+        anyhow::bail!(
+            "Could not extract KakaoTalk user ID from preferences. \
+             Is KakaoTalk installed and logged in?"
+        );
+    }
+
+    if let Some(uuid) = current_uuid.as_deref() {
+        for path in &plist_paths {
+            if let Some(fingerprint) = plist_fingerprint(path) {
+                if let Some(user_id) = read_cached_user_id(uuid, &fingerprint) {
+                    return Ok(user_id);
                 }
             }
         }
     }
 
-    // Strategy 2: Global preferences
-    let global_plist = home.join("Library/Preferences/com.kakao.KakaoTalkMac.plist");
-    if global_plist.exists() {
-        if let Ok(user_id) = extract_user_id_from_plist(&global_plist) {
-            return Ok(user_id);
+    for path in plist_paths {
+        let Ok(user_id) = extract_user_id_from_plist(&path) else {
+            continue;
+        };
+        if let (Some(uuid), Some(fingerprint)) = (current_uuid.as_deref(), plist_fingerprint(&path))
+        {
+            cache_user_id(uuid, &fingerprint, user_id);
         }
+        return Ok(user_id);
     }
 
-    anyhow::bail!(
-        "Could not extract KakaoTalk user ID from preferences. \
-         Is KakaoTalk installed and logged in?"
-    )
+    anyhow::bail!("No userId found in plist")
 }
 
 fn extract_user_id_from_plist(path: &std::path::Path) -> Result<i64> {
@@ -291,7 +414,17 @@ fn hashed_device_uuid(uuid: &str) -> String {
 /// Derive the database file name from userId and UUID.
 fn derive_database_name(user_id: i64, uuid: &str) -> String {
     let reversed_uuid: String = uuid.chars().rev().collect();
-    let hawawa = format!("..F.{}.A.F.{}..|", user_id, reversed_uuid);
+    let hawawa = [
+        ".",
+        "F",
+        &user_id.to_string(),
+        "A",
+        "F",
+        &reversed_uuid,
+        ".",
+        "|",
+    ]
+    .join(".");
 
     // Salt: reversed base64(SHA1 || SHA256) of UUID
     let hashed = hashed_device_uuid(uuid);
@@ -376,11 +509,13 @@ fn find_database_path(db_name: &str) -> Result<PathBuf> {
         "Library/Containers/com.kakao.KakaoTalkMac/Data/Library/Application Support/com.kakao.KakaoTalkMac",
     );
 
-    if !container_dir.exists() {
-        anyhow::bail!(
-            "KakaoTalk container directory not found: {}",
-            container_dir.display()
-        );
+    let container_metadata = std::fs::symlink_metadata(&container_dir)?;
+    if !container_metadata.is_dir() {
+        anyhow::bail!("KakaoTalk container directory is not a regular directory");
+    }
+    let container_root = container_dir.canonicalize()?;
+    if container_root != container_dir {
+        anyhow::bail!("KakaoTalk container path contains a symlink");
     }
 
     // Look for a FILE (not directory) matching the derived database name.
@@ -388,24 +523,27 @@ fn find_database_path(db_name: &str) -> Result<PathBuf> {
     if let Ok(entries) = std::fs::read_dir(&container_dir) {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
-            if (name == db_name || name.starts_with(db_name))
-                && entry.metadata().map(|m| m.is_file()).unwrap_or(false)
+            let path = entry.path();
+            let metadata = match std::fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(_) => continue,
+            };
+            if name == db_name
+                && metadata.file_type().is_file()
+                && path
+                    .canonicalize()
+                    .map(|value| value.strip_prefix(&container_root).is_ok())
+                    .unwrap_or(false)
             {
-                return Ok(entry.path());
-            }
-        }
-    }
-
-    // Fallback: look for any 78-char hex-named FILE (the DB naming convention).
-    // Exclude -shm and -wal sidecar files.
-    if let Ok(entries) = std::fs::read_dir(&container_dir) {
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.len() == 78
-                && name.chars().all(|c| c.is_ascii_hexdigit())
-                && entry.metadata().map(|m| m.is_file()).unwrap_or(false)
-            {
-                return Ok(entry.path());
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o022 != 0
+                    {
+                        continue;
+                    }
+                }
+                return Ok(path);
             }
         }
     }
@@ -416,6 +554,43 @@ fn find_database_path(db_name: &str) -> Result<PathBuf> {
         db_name
     )
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DatabaseIdentity {
+    device: u64,
+    inode: u64,
+}
+
+fn database_identity(path: &Path) -> Result<DatabaseIdentity> {
+    let metadata =
+        std::fs::symlink_metadata(path).with_context(|| "Local database became unavailable")?;
+    if !metadata.file_type().is_file() {
+        anyhow::bail!("Local database is not a regular file");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o022 != 0 {
+            anyhow::bail!("Local database ownership or permissions are unsafe");
+        }
+        Ok(DatabaseIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let modified = metadata
+            .modified()
+            .ok()
+            .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|value| value.as_nanos() as u64)
+            .unwrap_or_default();
+        Ok(DatabaseIdentity {
+            device: metadata.len(),
+            inode: modified,
+        })
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -423,6 +598,8 @@ fn find_database_path(db_name: &str) -> Result<PathBuf> {
 
 pub struct LocalDbReader {
     conn: Connection,
+    db_path: PathBuf,
+    db_identity: DatabaseIdentity,
 }
 
 impl LocalDbReader {
@@ -436,6 +613,7 @@ impl LocalDbReader {
         }
         let db_path =
             find_database_path(&db_name).context("Failed to locate KakaoTalk local database")?;
+        let db_identity = database_identity(&db_path)?;
 
         let secure_key = derive_secure_key(user_id, &uuid);
 
@@ -444,10 +622,14 @@ impl LocalDbReader {
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
         .with_context(|| format!("Failed to open database: {}", db_path.display()))?;
+        if database_identity(&db_path)? != db_identity {
+            anyhow::bail!("Local database identity changed during open");
+        }
 
-        // Configure SQLCipher
-        conn.pragma_update(None, "cipher_compatibility", 3)?;
+        // Set the passphrase first; changing cipher compatibility resets cipher
+        // state in SQLCipher builds used by current KakaoTalk databases.
         conn.pragma_update(None, "key", &secure_key)?;
+        conn.pragma_update(None, "cipher_compatibility", 3)?;
 
         // Verify the key works
         conn.execute_batch("SELECT count(*) FROM sqlite_master")
@@ -456,7 +638,18 @@ impl LocalDbReader {
                  Ensure KakaoTalk is installed and logged in.",
             )?;
 
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            db_path,
+            db_identity,
+        })
+    }
+    fn ensure_database_identity(&self) -> Result<()> {
+        let current = database_identity(&self.db_path)?;
+        if current != self.db_identity {
+            anyhow::bail!("Local database identity changed");
+        }
+        Ok(())
     }
 
     /// Check if the local database is accessible (for doctor command).
@@ -500,6 +693,7 @@ impl LocalDbReader {
     }
 
     pub fn list_chats(&self, limit: usize) -> Result<Vec<LocalChat>> {
+        self.ensure_database_identity()?;
         let mut stmt = self.conn.prepare(
             "SELECT r.chatId, r.type, r.chatName, r.activeMembersCount,
                     r.lastLogId, r.lastUpdatedAt, r.countOfNewMessage,
@@ -532,6 +726,7 @@ impl LocalDbReader {
             })?
             .collect::<Result<Vec<_>, _>>()?;
 
+        self.ensure_database_identity()?;
         Ok(rows)
     }
 
@@ -541,6 +736,7 @@ impl LocalDbReader {
         limit: usize,
         since_ts: Option<i64>,
     ) -> Result<Vec<LocalMessage>> {
+        self.ensure_database_identity()?;
         let (sql, params): (String, Vec<Box<dyn rusqlite::types::ToSql>>) =
             if let Some(ts) = since_ts {
                 (
@@ -588,10 +784,12 @@ impl LocalDbReader {
             })?
             .collect::<Result<Vec<_>, _>>()?;
 
+        self.ensure_database_identity()?;
         Ok(rows)
     }
 
     pub fn search_messages(&self, query: &str, limit: usize) -> Result<Vec<LocalMessage>> {
+        self.ensure_database_identity()?;
         let mut stmt = self.conn.prepare(
             "SELECT m.logId, m.chatId, m.authorId,
                     COALESCE(u.displayName, u.friendNickName, u.nickName, '') as senderName,
@@ -619,10 +817,12 @@ impl LocalDbReader {
             })?
             .collect::<Result<Vec<_>, _>>()?;
 
+        self.ensure_database_identity()?;
         Ok(rows)
     }
 
     pub fn schema(&self) -> Result<Vec<(String, String)>> {
+        self.ensure_database_identity()?;
         let mut stmt = self
             .conn
             .prepare("SELECT name, sql FROM sqlite_master WHERE type='table' ORDER BY name")?;
@@ -634,19 +834,199 @@ impl LocalDbReader {
                 ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
+        self.ensure_database_identity()?;
         Ok(rows)
     }
 
     /// Find the memo chat (나와의 채팅) ID. Type 0 with activeMembersCount = 1.
     pub fn find_memo_chat_id(&self) -> Result<Option<i64>> {
+        self.ensure_database_identity()?;
         let mut stmt = self.conn.prepare(
             "SELECT chatId FROM NTChatRoom WHERE type = 0 AND activeMembersCount = 1 LIMIT 1",
         )?;
         let result = stmt.query_row([], |row| row.get::<_, i64>(0)).ok();
+        self.ensure_database_identity()?;
         Ok(result)
     }
-}
 
+    pub fn poll(&self, chat_id: i64, limit: usize) -> Result<LocalPollEnvelope> {
+        let after_log_id = match std::env::var(LOCAL_POLL_AFTER_ENV) {
+            Ok(value) => {
+                let parsed = value
+                    .parse::<i64>()
+                    .with_context(|| format!("{LOCAL_POLL_AFTER_ENV} is malformed"))?;
+                if parsed < 0 {
+                    anyhow::bail!("{LOCAL_POLL_AFTER_ENV} must be non-negative");
+                }
+                Some(parsed)
+            }
+            Err(std::env::VarError::NotPresent) => None,
+            Err(std::env::VarError::NotUnicode(_)) => {
+                anyhow::bail!("{LOCAL_POLL_AFTER_ENV} is malformed");
+            }
+        };
+        self.poll_after(chat_id, limit, after_log_id)
+    }
+
+    /// Return a bounded page strictly after the supplied log ID.
+    pub fn poll_after(
+        &self,
+        chat_id: i64,
+        limit: usize,
+        after_log_id: Option<i64>,
+    ) -> Result<LocalPollEnvelope> {
+        self.ensure_database_identity()?;
+        if chat_id <= 0 {
+            anyhow::bail!("local poll chat ID must be positive");
+        }
+        let after_log_id = after_log_id.unwrap_or(0);
+        if after_log_id < 0 || after_log_id == LOCAL_POLL_MAX_INT64 {
+            anyhow::bail!("reconcile_required");
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        let mut stmt = tx.prepare(
+            "SELECT r.chatId, r.type, r.chatName, r.activeMembersCount,
+                    r.lastLogId, r.lastUpdatedAt, r.countOfNewMessage,
+                    COALESCE(u.displayName, u.friendNickName, u.nickName, '') as displayName
+             FROM NTChatRoom r
+             LEFT JOIN NTUser u ON r.directChatMemberUserId = u.userId AND u.linkId = 0
+             WHERE r.chatId = ?
+             LIMIT 1",
+        )?;
+        let chat = stmt
+            .query_row([chat_id], |row| {
+                let chat_name: String = row.get::<_, String>(2).unwrap_or_default();
+                let display_name: String = row.get::<_, String>(7).unwrap_or_default();
+                let title = if chat_name.is_empty() {
+                    display_name.clone()
+                } else {
+                    chat_name
+                };
+                Ok(LocalChat {
+                    chat_id: row.get(0)?,
+                    chat_type: row.get(1)?,
+                    chat_name: title,
+                    active_members_count: row.get(3).unwrap_or(0),
+                    last_log_id: row.get(4).unwrap_or(0),
+                    last_updated_at: row.get(5).unwrap_or(0),
+                    unread_count: row.get(6).unwrap_or(0),
+                    display_name,
+                })
+            })
+            .optional()?
+            .with_context(|| "Target chat is no longer available")?;
+        drop(stmt);
+        if chat.last_log_id < 0 || chat.last_log_id == LOCAL_POLL_MAX_INT64 {
+            anyhow::bail!("reconcile_required");
+        }
+
+        let limit = limit.min(LOCAL_POLL_MAX_ROWS);
+        let (total_rows, available_max): (i64, Option<i64>) = tx.query_row(
+            "SELECT COUNT(*), MAX(m.logId)
+             FROM NTChatMessage m
+             WHERE m.chatId = ? AND m.logId > ?",
+            rusqlite::params![chat_id, after_log_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if available_max == Some(LOCAL_POLL_MAX_INT64) {
+            anyhow::bail!("reconcile_required");
+        }
+
+        let mut stmt = tx.prepare(
+            "SELECT m.logId, m.chatId, m.authorId,
+                    COALESCE(u.displayName, u.friendNickName, u.nickName, '') as senderName,
+                    COALESCE(m.message, '') as message,
+                    COALESCE(m.attachment, '') as attachment, m.type, m.sentAt
+             FROM NTChatMessage m
+             LEFT JOIN NTUser u ON m.authorId = u.userId AND u.linkId = 0
+             WHERE m.chatId = ? AND m.logId > ?
+             ORDER BY m.logId ASC, m.sentAt ASC
+             LIMIT ?",
+        )?;
+        let rows = stmt.query_map(
+            rusqlite::params![chat_id, after_log_id, limit as i64],
+            |row| {
+                Ok(LocalMessage {
+                    log_id: row.get(0)?,
+                    chat_id: row.get(1)?,
+                    author_id: row.get(2).unwrap_or(0),
+                    sender_name: row.get(3).unwrap_or_default(),
+                    message: row.get(4).unwrap_or_default(),
+                    attachment: row.get(5).unwrap_or_default(),
+                    message_type: row.get(6).unwrap_or(0),
+                    sent_at: row.get(7).unwrap_or(0),
+                })
+            },
+        )?;
+        let messages = rows.collect::<Result<Vec<_>, _>>()?;
+        drop(stmt);
+
+        if messages.iter().any(|message| {
+            message.log_id <= after_log_id
+                || message.log_id <= 0
+                || message.log_id == LOCAL_POLL_MAX_INT64
+                || message.log_id > chat.last_log_id
+        }) {
+            anyhow::bail!("reconcile_required");
+        }
+        let first_log_id = messages.first().map(|message| message.log_id);
+        let last_log_id = messages.last().map(|message| message.log_id);
+        let rows_match_aggregate = total_rows >= 0 && total_rows as usize == messages.len();
+        let has_more = total_rows >= 0 && total_rows as usize > messages.len();
+        let (status, has_gap) =
+            if chat.last_log_id < after_log_id || (!rows_match_aggregate && !has_more) {
+                ("unknown", true)
+            } else if has_more {
+                ("partial", false)
+            } else if let Some(last) = last_log_id {
+                if chat.last_log_id != last || available_max != Some(last) {
+                    ("gap", true)
+                } else {
+                    ("complete", false)
+                }
+            } else if chat.last_log_id != after_log_id {
+                ("gap", true)
+            } else {
+                ("empty", false)
+            };
+        let completeness = LocalPollCompleteness {
+            status: status.to_string(),
+            after_log_id,
+            first_log_id,
+            last_log_id,
+            chat_last_log_id: chat.last_log_id,
+            row_count: total_rows,
+            returned_count: messages.len() as i64,
+            available_max_log_id: available_max,
+            id_domain: LOCAL_POLL_ID_DOMAIN.to_string(),
+            has_gap,
+            has_more,
+            proof: if has_gap {
+                "reconcile_required".to_string()
+            } else {
+                "sqlite_snapshot_rowset".to_string()
+            },
+        };
+
+        let envelope = LocalPollEnvelope {
+            schema_version: LOCAL_POLL_SCHEMA_VERSION,
+            chat,
+            messages,
+            completeness,
+        };
+        if envelope.messages.iter().any(|message| {
+            message.message.len() > LOCAL_POLL_MAX_FIELD_BYTES
+                || message.attachment.len() > LOCAL_POLL_MAX_FIELD_BYTES
+                || message.sender_name.len() > LOCAL_POLL_MAX_FIELD_BYTES
+        }) || serde_json::to_vec(&envelope)?.len() > LOCAL_POLL_MAX_BYTES
+        {
+            anyhow::bail!("local poll payload exceeds bounded size");
+        }
+        tx.commit()?;
+        self.ensure_database_identity()?;
+        Ok(envelope)
+    }
+}
 #[derive(Debug, Serialize)]
 pub struct LocalDbStatus {
     pub uuid_available: bool,
@@ -724,9 +1104,55 @@ mod tests {
         let hash = hex::encode(sha2::Sha512::digest(b"12345"));
         assert_eq!(recover_user_id_from_sha512(&hash), Some(12345));
     }
+    #[test]
+    fn database_name_matches_reference_derivation() {
+        assert_eq!(
+            derive_database_name(240_061_982, "42C34717-27C3-538C-81E4-8B568287C7A0"),
+            "3080037d7a3b71fbe90b9492c50faf90eb3a8d708baec8ec3f18346bf53568cf84c0251259f2a6"
+        );
+    }
 
     #[test]
     fn sha512_recovery_rejects_malformed_hash() {
         assert_eq!(recover_user_id_from_sha512("not-a-hash"), None);
+    }
+    #[test]
+    fn local_poll_envelope_is_versioned_and_bounded_shape() {
+        let envelope = LocalPollEnvelope {
+            schema_version: LOCAL_POLL_SCHEMA_VERSION,
+            chat: LocalChat {
+                chat_id: 42,
+                chat_type: 1,
+                chat_name: "target".to_string(),
+                active_members_count: 2,
+                last_log_id: 7,
+                last_updated_at: 100,
+                unread_count: 0,
+                display_name: String::new(),
+            },
+            messages: Vec::new(),
+            completeness: LocalPollCompleteness {
+                status: "empty".to_string(),
+                after_log_id: 0,
+                first_log_id: None,
+                last_log_id: None,
+                chat_last_log_id: 7,
+                row_count: 0,
+                returned_count: 0,
+                available_max_log_id: None,
+                id_domain: LOCAL_POLL_ID_DOMAIN.to_string(),
+                has_gap: false,
+                has_more: false,
+                proof: "sqlite_snapshot_rowset".to_string(),
+            },
+        };
+        let value = serde_json::to_value(envelope).expect("envelope serializes");
+        let object = value.as_object().expect("envelope object");
+        assert_eq!(object.len(), 4);
+        assert!(object.contains_key("schema_version"));
+        assert!(object.contains_key("chat"));
+        assert!(object.contains_key("messages"));
+        assert!(object.contains_key("completeness"));
+        assert_eq!(value["schema_version"], LOCAL_POLL_SCHEMA_VERSION);
     }
 }

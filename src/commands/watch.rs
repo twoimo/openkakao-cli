@@ -183,7 +183,7 @@ fn is_loopback_host(host: &str) -> bool {
 
 pub fn validate_webhook_url(webhook_url: &str, allow_insecure_webhooks: bool) -> Result<()> {
     let url = reqwest::Url::parse(webhook_url)
-        .map_err(|e| anyhow::anyhow!("invalid webhook URL '{}': {}", webhook_url, e))?;
+        .map_err(|e| anyhow::anyhow!("invalid webhook URL: {}", e))?;
     match url.scheme() {
         "https" => Ok(()),
         "http" => {
@@ -192,8 +192,7 @@ pub fn validate_webhook_url(webhook_url: &str, allow_insecure_webhooks: bool) ->
                 Ok(())
             } else {
                 anyhow::bail!(
-                    "refusing insecure webhook URL '{}'; use https or localhost, or opt in via config safety.allow_insecure_webhooks = true",
-                    webhook_url
+                    "refusing insecure webhook URL; use https or localhost, or opt in via config safety.allow_insecure_webhooks = true",
                 )
             }
         }
@@ -1105,8 +1104,8 @@ pub fn cmd_watch(options: WatchOptions) -> Result<()> {
                     if let Some(command) = &config.command {
                         eprintln!("[watch] Hook command enabled: {}", command);
                     }
-                    if let Some(webhook_url) = &config.webhook_url {
-                        eprintln!("[watch] Webhook enabled: {}", webhook_url);
+                    if config.webhook_url.is_some() {
+                        eprintln!("[watch] Webhook enabled");
                     }
                 }
                 eprintln!("[watch] Press Ctrl-C to stop.");

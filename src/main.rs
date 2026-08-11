@@ -16,13 +16,18 @@ mod rest;
 mod state;
 mod util;
 
-use std::io;
+use std::fs;
+use std::io::{self, Write};
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
+use std::path::Path;
 use std::sync::atomic::Ordering;
 
 use anyhow::{Context, Result};
 use chrono::TimeZone;
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{generate, Shell};
+use sha2::{Digest, Sha256};
 
 use crate::auth_flow::{set_auth_policy, AuthPolicy};
 use crate::commands::read::ReadCommandOptions;
@@ -47,6 +52,37 @@ fn validate_service_bootstrap_paths(command: &Commands) -> Result<Option<&std::p
         }
         _ => Ok(None),
     }
+}
+
+fn parse_local_poll_interval(value: &str) -> std::result::Result<f64, String> {
+    let interval = value
+        .parse::<f64>()
+        .map_err(|_| "interval must be a number".to_string())?;
+    if !interval.is_finite() || !(0.05..=60.0).contains(&interval) {
+        return Err("interval must be between 0.05 and 60 seconds".to_string());
+    }
+    Ok(interval)
+}
+fn parse_local_poll_count(value: &str) -> std::result::Result<usize, String> {
+    let count = value
+        .parse::<usize>()
+        .map_err(|_| "count must be a positive integer".to_string())?;
+    if !(1..=local_db::LOCAL_POLL_MAX_ROWS).contains(&count) {
+        return Err(format!(
+            "count must be between 1 and {}",
+            local_db::LOCAL_POLL_MAX_ROWS
+        ));
+    }
+    Ok(count)
+}
+fn parse_local_poll_chat_id(value: &str) -> std::result::Result<i64, String> {
+    let chat_id = value
+        .parse::<i64>()
+        .map_err(|_| "chat-id must be a positive integer".to_string())?;
+    if chat_id <= 0 {
+        return Err("chat-id must be a positive integer".to_string());
+    }
+    Ok(chat_id)
 }
 
 #[derive(Parser, Debug)]
@@ -537,6 +573,16 @@ enum Commands {
         #[arg(long, help = "Filter messages after this date (YYYY-MM-DD)")]
         since: Option<String>,
     },
+    #[command(name = "local-poll", hide = true)]
+    /// Stream bounded local database polls as versioned JSONL (no server contact).
+    LocalPoll {
+        #[arg(long = "chat-id", value_parser = parse_local_poll_chat_id)]
+        chat_id: i64,
+        #[arg(long, default_value_t = 50, value_parser = parse_local_poll_count)]
+        count: usize,
+        #[arg(long, default_value_t = 1.0, value_parser = parse_local_poll_interval)]
+        interval: f64,
+    },
     /// Search messages in local KakaoTalk database (no server contact, safe)
     LocalSearch {
         query: String,
@@ -563,6 +609,17 @@ enum Commands {
         mode: String,
         #[arg(short = 'n', long, default_value_t = 10)]
         limit: usize,
+        #[arg(long)]
+        source: Option<String>,
+        #[arg(long)]
+        db: Option<String>,
+    },
+    #[command(name = "context-reply-bundle", hide = true)]
+    /// Retrieve one bounded, snapshot-consistent local context evidence bundle.
+    ContextReplyBundle {
+        query: String,
+        #[arg(long)]
+        chat: String,
         #[arg(long)]
         source: Option<String>,
         #[arg(long)]
@@ -679,10 +736,12 @@ fn is_local_only_command(command: &Commands) -> bool {
         command,
         Commands::LocalChats { .. }
             | Commands::LocalRead { .. }
+            | Commands::LocalPoll { .. }
             | Commands::LocalSearch { .. }
             | Commands::LocalSchema
             | Commands::ContextIndex { .. }
             | Commands::ContextSearch { .. }
+            | Commands::ContextReplyBundle { .. }
             | Commands::ContextStyleSearch { .. }
             | Commands::ContextReplySearch { .. }
             | Commands::ContextReplyRecord { .. }
@@ -705,6 +764,259 @@ fn require_loco_write(config: &config::OpenKakaoConfig) -> Result<()> {
              allow_loco_write = true\n\n\
              Consider using local-read / local-chats / local-search for safe read-only access."
         );
+    }
+    Ok(())
+}
+
+const BUJAMENTOR_READINESS_MAX_AGE_SECONDS: f64 = 15.0;
+const BUJAMENTOR_READINESS_MAX_BYTES: u64 = 64 * 1024;
+const MAX_INT64: i64 = i64::MAX;
+
+fn read_bounded_json_file(path: &Path) -> Result<serde_json::Value> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("read readiness metadata: {}", path.display()))?;
+    if !metadata.file_type().is_file() || metadata.len() > BUJAMENTOR_READINESS_MAX_BYTES {
+        anyhow::bail!("invalid readiness file");
+    }
+    let raw = fs::read(path).with_context(|| format!("read readiness file: {}", path.display()))?;
+    if raw.len() as u64 > BUJAMENTOR_READINESS_MAX_BYTES {
+        anyhow::bail!("readiness file exceeds bound");
+    }
+    serde_json::from_slice(&raw).context("malformed readiness JSON")
+}
+
+fn readiness_integer(value: &serde_json::Value) -> Option<i64> {
+    value.as_i64()
+}
+
+fn readiness_fresh(value: &serde_json::Value, now: f64) -> bool {
+    let stamp = value.as_f64().or_else(|| value.as_i64().map(|v| v as f64));
+    stamp.is_some_and(|stamp| {
+        stamp.is_finite()
+            && -5.0 <= now - stamp
+            && now - stamp <= BUJAMENTOR_READINESS_MAX_AGE_SECONDS
+    })
+}
+
+fn require_persisted_bujamentor_readiness(
+    expected_owner: Option<&str>,
+    expected_epoch: Option<i64>,
+    expected_target: Option<i64>,
+    expected_chat_name: Option<&str>,
+) -> Result<()> {
+    let home = dirs::home_dir().context("cannot resolve home directory")?;
+    let base = home.join("Library/Application Support/openkakao/bujamentor");
+    let supervisor_path = std::env::var_os("OPENKAKAO_SUPERVISOR_STATUS")
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| base.join("supervisor-status.json"));
+    let db_state_path = std::env::var_os("OPENKAKAO_DB_WATCH_STATE")
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| base.join("db-watch-state.json"));
+    let supervisor = read_bounded_json_file(&supervisor_path)?;
+    let db_state = read_bounded_json_file(&db_state_path)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("system clock before UNIX epoch")?
+        .as_secs_f64();
+    let owner = supervisor
+        .get("owner")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .context("supervisor owner missing")?;
+    if expected_owner.is_some_and(|expected| owner != expected) {
+        anyhow::bail!("persisted supervisor owner does not match event");
+    }
+    let source_epoch = readiness_integer(
+        supervisor
+            .get("source_epoch")
+            .context("supervisor source epoch missing")?,
+    )
+    .filter(|value| 0 < *value && *value < MAX_INT64)
+    .context("supervisor source epoch invalid")?;
+    let target = supervisor
+        .get("target_chat_id")
+        .and_then(readiness_integer)
+        .filter(|value| 0 < *value && *value < MAX_INT64)
+        .context("supervisor target chat missing")?;
+    let chat_name = supervisor
+        .get("target_chat_name")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .context("supervisor target chat name missing")?;
+    if expected_epoch.is_some_and(|expected| source_epoch != expected) {
+        anyhow::bail!("persisted supervisor epoch does not match event");
+    }
+    if expected_target.is_some_and(|expected| target != expected) {
+        anyhow::bail!("persisted supervisor target does not match event");
+    }
+    if expected_chat_name.is_some_and(|expected| chat_name != expected) {
+        anyhow::bail!("persisted supervisor target name does not match event");
+    }
+    let privacy_digest = supervisor
+        .get("privacy_digest")
+        .and_then(serde_json::Value::as_str)
+        .context("supervisor privacy attestation missing")?;
+    if privacy_digest.len() != 64 || !privacy_digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        anyhow::bail!("supervisor privacy attestation invalid");
+    }
+    let config_path = std::env::var_os("OPENKAKAO_CONFIG")
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            dirs::home_dir()
+                .unwrap_or_else(|| Path::new(".").to_path_buf())
+                .join(".config/openkakao/config.toml")
+        });
+    let config_digest = hex::encode(Sha256::digest(
+        fs::read(&config_path).with_context(|| "read privacy config")?,
+    ));
+    if config_digest != privacy_digest
+        || std::env::var("OPENKAKAO_PRIVACY_ATTESTATION")
+            .ok()
+            .is_some_and(|value| value != privacy_digest)
+    {
+        anyhow::bail!("privacy attestation changed");
+    }
+    if supervisor.get("schema_version") != Some(&serde_json::Value::from(1))
+        || supervisor.get("mode")
+            != Some(&serde_json::Value::String(
+                "database_authoritative".to_string(),
+            ))
+    {
+        anyhow::bail!("supervisor readiness schema invalid");
+    }
+    if supervisor.get("readiness") != Some(&serde_json::Value::String("ready".to_string()))
+        || supervisor.get("state") != Some(&serde_json::Value::String("running".to_string()))
+        || supervisor.get("database_started") != Some(&serde_json::Value::Bool(true))
+        || supervisor.get("auto_reply_enabled") != Some(&serde_json::Value::Bool(true))
+        || supervisor.get("ax_state") != Some(&serde_json::Value::String("healthy".to_string()))
+        || supervisor
+            .get("ax_pid")
+            .and_then(readiness_integer)
+            .filter(|value| 0 < *value && *value < MAX_INT64)
+            .is_none()
+        || supervisor.get("ax_allow_send") != Some(&serde_json::Value::Bool(false))
+        || supervisor.get("ax_delivery_state")
+            != Some(&serde_json::Value::String(
+                "fenced_db_authoritative".to_string(),
+            ))
+        || supervisor.get("delivery_state")
+            != Some(&serde_json::Value::String(
+                "fenced_db_authoritative".to_string(),
+            ))
+        || supervisor
+            .get("watcher_fence")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|value| value.get("ax_allow_send"))
+            != Some(&serde_json::Value::Bool(false))
+        || supervisor
+            .get("fence_reason")
+            .and_then(serde_json::Value::as_str)
+            != Some("")
+        || !readiness_fresh(
+            supervisor
+                .get("updated_at")
+                .context("supervisor heartbeat missing")?,
+            now,
+        )
+    {
+        anyhow::bail!("persisted supervisor readiness is fenced");
+    }
+    let db_owner = db_state
+        .get("owner_id")
+        .and_then(serde_json::Value::as_str)
+        .context("DB owner missing")?;
+    if db_owner != owner {
+        anyhow::bail!("persisted DB owner mismatch");
+    }
+    let db_epoch = db_state
+        .get("source_epoch")
+        .and_then(readiness_integer)
+        .filter(|value| 0 < *value && *value < MAX_INT64)
+        .context("DB source epoch invalid")?;
+    let db_target = db_state
+        .get("target_chat_id")
+        .and_then(readiness_integer)
+        .filter(|value| 0 < *value && *value < MAX_INT64)
+        .context("DB target chat missing")?;
+    if db_state.get("schema_version") != Some(&serde_json::Value::from(2))
+        || db_state.get("target_chat_name")
+            != Some(&serde_json::Value::String(chat_name.to_string()))
+    {
+        anyhow::bail!("DB readiness schema or target name invalid");
+    }
+    if db_epoch != source_epoch
+        || db_target != target
+        || db_state.get("capability_state") != Some(&serde_json::Value::String("ready".to_string()))
+        || db_state.get("delivery_enabled") != Some(&serde_json::Value::Bool(true))
+        || db_state.get("fence") != Some(&serde_json::Value::String("ready".to_string()))
+        || db_state
+            .get("fence_reason")
+            .and_then(serde_json::Value::as_str)
+            != Some("")
+        || !readiness_fresh(
+            db_state
+                .get("heartbeat_at")
+                .context("DB heartbeat missing")?,
+            now,
+        )
+        || db_state.get("pending_log_ids") != Some(&serde_json::Value::Array(Vec::new()))
+        || db_state.get("pending_gaps") != Some(&serde_json::Value::Array(Vec::new()))
+    {
+        anyhow::bail!("persisted DB readiness is fenced");
+    }
+    let watermark = db_state
+        .get("acked_watermark")
+        .and_then(readiness_integer)
+        .filter(|value| 0 <= *value && *value < MAX_INT64)
+        .context("DB watermark invalid")?;
+    db_state
+        .get("last_observed_log_id")
+        .and_then(readiness_integer)
+        .filter(|value| watermark <= *value && *value < MAX_INT64)
+        .context("DB observed watermark invalid")?;
+    let observed = db_state
+        .get("observed_log_ids")
+        .and_then(serde_json::Value::as_array)
+        .context("DB observed IDs missing")?;
+    let acked = db_state
+        .get("acked_log_ids")
+        .and_then(serde_json::Value::as_array)
+        .context("DB acked IDs missing")?;
+    let pending = db_state
+        .get("pending_log_ids")
+        .and_then(serde_json::Value::as_array)
+        .context("DB pending IDs missing")?;
+    let parse_ids = |values: &[serde_json::Value]| -> Result<Vec<i64>> {
+        values
+            .iter()
+            .map(|value| {
+                value
+                    .as_i64()
+                    .filter(|id| 0 < *id && *id < MAX_INT64)
+                    .context("DB readiness ID invalid")
+            })
+            .collect()
+    };
+    let observed_ids = parse_ids(observed)?;
+    let acked_ids = parse_ids(acked)?;
+    let pending_ids = parse_ids(pending)?;
+    let observed_set: std::collections::BTreeSet<i64> = observed_ids.iter().copied().collect();
+    let acked_set: std::collections::BTreeSet<i64> = acked_ids.iter().copied().collect();
+    let pending_set: std::collections::BTreeSet<i64> = pending_ids.iter().copied().collect();
+    let expected_last_observed = observed_set.iter().next_back().copied().unwrap_or(0);
+    if !acked_set.is_subset(&observed_set)
+        || pending_set != observed_set.difference(&acked_set).copied().collect()
+        || !pending_set.is_disjoint(&acked_set)
+        || watermark != acked_set.iter().next_back().copied().unwrap_or(0)
+        || db_state
+            .get("last_observed_log_id")
+            .and_then(readiness_integer)
+            != Some(expected_last_observed)
+    {
+        anyhow::bail!("DB readiness cursor sets invalid");
     }
     Ok(())
 }
@@ -1340,6 +1652,19 @@ fn main() -> Result<()> {
                 }
             }
         }
+        Commands::LocalPoll {
+            chat_id,
+            count,
+            interval,
+        } => {
+            let reader = local_db::LocalDbReader::open()?;
+            loop {
+                let envelope = reader.poll(chat_id, count)?;
+                println!("{}", serde_json::to_string(&envelope)?);
+                io::stdout().flush()?;
+                std::thread::sleep(std::time::Duration::from_secs_f64(interval));
+            }
+        }
         Commands::LocalSearch { query, count } => {
             let reader = local_db::LocalDbReader::open()?;
             let results = reader.search_messages(&query, count)?;
@@ -1400,8 +1725,10 @@ fn main() -> Result<()> {
                     serde_json::json!({
                         "action": "index",
                         "chat": chat,
-                        "input": input,
-                        "db": db_path,
+                        "input": openkakao_cli::context::provenance_id(&input),
+                        "db": openkakao_cli::context::provenance_id(
+                            &db_path.display().to_string()
+                        ),
                         "messages": count,
                         "network": false
                     })
@@ -1426,7 +1753,7 @@ fn main() -> Result<()> {
             let db_path = db
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(openkakao_cli::context::default_db_path);
-            let results = openkakao_cli::context::search(
+            let mut results = openkakao_cli::context::search(
                 &db_path,
                 chat.as_deref(),
                 source.as_deref(),
@@ -1435,6 +1762,7 @@ fn main() -> Result<()> {
                 limit,
             )?;
             if json {
+                openkakao_cli::context::redact_context_results(&mut results);
                 println!("{}", serde_json::to_string_pretty(&results)?);
             } else {
                 for result in &results {
@@ -1450,6 +1778,23 @@ fn main() -> Result<()> {
                 println!("{} results (offline {} search)", results.len(), mode);
             }
         }
+        Commands::ContextReplyBundle {
+            query,
+            chat,
+            source,
+            db,
+        } => {
+            let db_path = db
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(openkakao_cli::context::default_db_path);
+            let output = openkakao_cli::context::context_reply_bundle_json(
+                &db_path,
+                &chat,
+                &query,
+                source.as_deref(),
+            )?;
+            println!("{output}");
+        }
         Commands::ContextStyleSearch {
             query,
             limit,
@@ -1459,9 +1804,10 @@ fn main() -> Result<()> {
             let db_path = db
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(openkakao_cli::context::default_db_path);
-            let results =
+            let mut results =
                 openkakao_cli::context::style_search(&db_path, chat.as_deref(), &query, limit)?;
             if json {
+                openkakao_cli::context::redact_context_results(&mut results);
                 println!("{}", serde_json::to_string_pretty(&results)?);
             } else {
                 for result in &results {
@@ -1496,7 +1842,9 @@ fn main() -> Result<()> {
                 source.as_deref(),
             )?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&stats)?);
+                let mut redacted_stats = stats;
+                openkakao_cli::context::redact_response_time_stats(&mut redacted_stats);
+                println!("{}", serde_json::to_string_pretty(&redacted_stats)?);
             } else if let Some(stats) = stats {
                 println!(
                     "{} average response: {:.1}s (median {:.1}s, p90 {:.1}s, {} samples)",
@@ -1519,9 +1867,10 @@ fn main() -> Result<()> {
             let db_path = db
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(openkakao_cli::context::default_db_path);
-            let results =
+            let mut results =
                 openkakao_cli::context::reply_decision_search(&db_path, &chat, &query, limit)?;
             if json {
+                openkakao_cli::context::redact_reply_decisions(&mut results);
                 println!("{}", serde_json::to_string_pretty(&results)?);
             } else {
                 for result in &results {
@@ -1545,21 +1894,26 @@ fn main() -> Result<()> {
             let db_path = db
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(openkakao_cli::context::default_db_path);
-            openkakao_cli::context::record_reply_decision(&db_path, &record)?;
+            let applied = openkakao_cli::context::record_reply_decision(&db_path, &record)?;
             if json {
                 println!(
                     "{}",
                     serde_json::json!({
-                        "recorded": true,
-                        "db": db_path,
+                        "recorded": applied,
+                        "applied": applied,
+                        "db": openkakao_cli::context::provenance_id(
+                            &db_path.display().to_string()
+                        ),
                         "network": false
                     })
                 );
-            } else {
+            } else if applied {
                 println!(
                     "Recorded reply decision in {} (offline).",
                     db_path.display()
                 );
+            } else {
+                println!("Reply decision was stale and was not recorded (offline).");
             }
         }
         Commands::ContextReplyUpdate {
@@ -1584,8 +1938,11 @@ fn main() -> Result<()> {
                     "{}",
                     serde_json::json!({
                         "updated": updated,
+                        "applied": updated,
                         "event_id": event_id,
-                        "db": db_path,
+                        "db": openkakao_cli::context::provenance_id(
+                            &db_path.display().to_string()
+                        ),
                         "network": false
                     })
                 );
@@ -1608,9 +1965,54 @@ fn main() -> Result<()> {
             dry_run,
         } => {
             let msg = format_outgoing_message(&message, no_prefix);
+            let is_bujamentor_worker =
+                !dry_run && std::env::var("OPENKAKAO_BUJAMENTOR_WORKER").as_deref() == Ok("1");
+            let _generation_lock = if is_bujamentor_worker {
+                let home = dirs::home_dir().context("cannot resolve home directory")?;
+                let lock_path = std::env::var_os("OPENKAKAO_BUJAMENTOR_LOCK")
+                    .filter(|value| !value.is_empty())
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| {
+                        home.join(
+                            "Library/Application Support/openkakao/bujamentor/.owner-generation.lock",
+                        )
+                    });
+                let lock = fs::OpenOptions::new()
+                    .create(true)
+                    .read(true)
+                    .write(true)
+                    .open(lock_path)?;
+                #[cfg(unix)]
+                if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
+                    anyhow::bail!("failed to acquire owner-generation lock");
+                }
+                Some(lock)
+            } else {
+                None
+            };
             if !dry_run {
-                if std::env::var("OPENKAKAO_BUJAMENTOR_WORKER").as_deref() == Ok("1") {
+                if is_bujamentor_worker {
                     config::validate_bujamentor_auto_reply(&config)?;
+                    let expected_owner = std::env::var("OPENKAKAO_SUPERVISOR_OWNER")
+                        .ok()
+                        .filter(|value| !value.trim().is_empty())
+                        .context("worker owner missing")?;
+                    let expected_epoch = std::env::var("OPENKAKAO_DB_SOURCE_EPOCH")
+                        .ok()
+                        .and_then(|value| value.parse::<i64>().ok())
+                        .filter(|value| 0 < *value && *value < MAX_INT64)
+                        .context("worker source epoch invalid")?;
+                    let expected_target = std::env::var("OPENKAKAO_TARGET_CHAT_ID")
+                        .ok()
+                        .and_then(|value| value.parse::<i64>().ok())
+                        .filter(|value| 0 < *value && *value < MAX_INT64)
+                        .context("worker target chat invalid")?;
+                    require_persisted_bujamentor_readiness(
+                        Some(expected_owner.as_str()),
+                        Some(expected_epoch),
+                        Some(expected_target),
+                        Some(&chat_name),
+                    )?;
                 }
                 require_ax_send(&config)?;
                 require_allowed_send_chat(&config, &chat_name)?;
@@ -2714,6 +3116,41 @@ mod tests {
             other => panic!("expected local-read, got {other:?}"),
         }
     }
+    #[test]
+    fn local_poll_command_parses_bounded_options() {
+        let cli = Cli::try_parse_from([
+            "openkakao-cli",
+            "local-poll",
+            "--chat-id",
+            "123",
+            "--count",
+            "13",
+            "--interval",
+            "0.5",
+        ])
+        .expect("local-poll should parse");
+        match cli.command {
+            Commands::LocalPoll {
+                chat_id,
+                count,
+                interval,
+            } => {
+                assert_eq!(chat_id, 123);
+                assert_eq!(count, 13);
+                assert_eq!(interval, 0.5);
+            }
+            other => panic!("expected local-poll, got {other:?}"),
+        }
+        assert!(Cli::try_parse_from([
+            "openkakao-cli",
+            "local-poll",
+            "--chat-id",
+            "123",
+            "--interval",
+            "0.01",
+        ])
+        .is_err());
+    }
 
     #[test]
     fn local_search_command_parses() {
@@ -2761,6 +3198,15 @@ mod tests {
         let local_send = Cli::try_parse_from(["openkakao-cli", "local-send", "나와의 채팅", "hi"])
             .expect("local-send should parse");
         assert!(is_local_only_command(&local_send.command));
+        let bundle = Cli::try_parse_from([
+            "openkakao-cli",
+            "context-reply-bundle",
+            "query",
+            "--chat",
+            "chat-a",
+        ])
+        .expect("context-reply-bundle should parse");
+        assert!(is_local_only_command(&bundle.command));
 
         let login = Cli::try_parse_from(["openkakao-cli", "login"]).expect("login should parse");
         assert!(!is_local_only_command(&login.command));

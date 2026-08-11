@@ -4,7 +4,7 @@ use anyhow::Result;
 
 use crate::loco_helpers::{check_loco_status, loco_connect_with_auto_refresh};
 use crate::media::{download_media_file, parse_attachment_url, sanitize_filename};
-use crate::util::{get_bson_i32, get_bson_i64, get_bson_str, get_creds, truncate};
+use crate::util::{get_bson_i32, get_bson_i64, get_bson_str, get_creds};
 
 pub fn cmd_download(chat_id: i64, log_id: i64, output_dir: Option<&str>, json: bool) -> Result<()> {
     let creds = get_creds()?;
@@ -97,11 +97,20 @@ pub fn cmd_download(chat_id: i64, log_id: i64, output_dir: Option<&str>, json: b
 
         match parse_attachment_url(&attachment, msg_type) {
             Some((url, filename)) => {
-                let dir = Path::new(out_dir).join(chat_id.to_string());
+                let output_dir = Path::new(out_dir);
+                let dir = if output_dir
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("bujamentor-db-media-"))
+                {
+                    output_dir.to_path_buf()
+                } else {
+                    output_dir.join(chat_id.to_string())
+                };
                 let save_name = format!("{}_{}", log_id, sanitize_filename(&filename));
                 let save_path = dir.join(&save_name);
 
-                eprintln!("Downloading: {}", url);
+                eprintln!("Downloading media attachment");
                 let bytes = download_media_file(&creds, &url, &save_path)?;
                 if json {
                     crate::util::output_json(&serde_json::json!({
@@ -115,11 +124,7 @@ pub fn cmd_download(chat_id: i64, log_id: i64, output_dir: Option<&str>, json: b
                 }
             }
             None => {
-                anyhow::bail!(
-                    "Cannot parse attachment URL from message logId={}. Raw: {}",
-                    log_id,
-                    truncate(&attachment, 100)
-                );
+                anyhow::bail!("Cannot parse attachment for message logId={}", log_id);
             }
         }
 

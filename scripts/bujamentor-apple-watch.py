@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 import re
+import selectors
 import subprocess
 import sys
 import tempfile
@@ -27,6 +28,7 @@ def reply_authors() -> set[str]:
     configured = os.environ.get("OPENKAKAO_REPLY_AUTHORS", "").strip()
     return {name.strip() for name in configured.split(",") if name.strip()}
 HOOK = ROOT / "scripts" / "bujamentor-auto-reply.py"
+MAX_HOOK_OUTPUT_BYTES = 64 * 1024
 STATE = Path(
     os.environ.get(
         "OPENKAKAO_APPLE_WATCH_STATE",
@@ -165,6 +167,7 @@ def normalize_rows(rows: list[dict], _previous_sender: str) -> tuple[list[dict],
                 "author_nickname": sender if direction == "incoming" and is_sender_label(sender) else "",
                 "message": text,
                 "attachment": str(row.get("attachment") or ""),
+                "image_rect": str(row.get("image_rect") or ""),
                 "timestamp": timestamp_from_statics(statics),
             }
         )
@@ -209,17 +212,56 @@ def invoke_hook(event: dict, dry_run: bool) -> tuple[int, str]:
     env = os.environ.copy()
     if dry_run:
         env["OPENKAKAO_HOOK_DRY_RUN"] = "1"
-    result = subprocess.run(
+    payload = json.dumps(event, ensure_ascii=False).encode("utf-8")
+    process = subprocess.Popen(
         [sys.executable, str(HOOK)],
         cwd=ROOT,
         env=env,
-        input=json.dumps(event, ensure_ascii=False),
-        text=True,
-        capture_output=True,
-        timeout=35,
-        check=False,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
     )
-    return result.returncode, result.stdout.strip()
+    try:
+        if process.stdin is not None:
+            process.stdin.write(payload)
+            process.stdin.close()
+        streams = {
+            stream: bytearray()
+            for stream in (process.stdout, process.stderr)
+            if stream is not None
+        }
+        selector = selectors.DefaultSelector()
+        for stream in streams:
+            selector.register(stream, selectors.EVENT_READ)
+        deadline = time.monotonic() + 35.0
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                process.kill()
+                process.wait(timeout=1)
+                return 124, ""
+            for key, _ in selector.select(remaining):
+                chunk = key.fileobj.read(8192)
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    continue
+                streams[key.fileobj].extend(chunk)
+                if len(streams[key.fileobj]) > MAX_HOOK_OUTPUT_BYTES:
+                    process.kill()
+                    process.wait(timeout=1)
+                    return 1, ""
+        returncode = process.wait(timeout=1)
+        stdout = bytes(next(
+            value for stream, value in streams.items() if stream is process.stdout
+        )).decode("utf-8", "replace").strip()
+        return returncode, stdout
+    except (BrokenPipeError, OSError, subprocess.TimeoutExpired):
+        try:
+            process.kill()
+            process.wait(timeout=1)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        return 1, ""
 
 
 def poll_once(
