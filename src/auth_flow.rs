@@ -128,6 +128,21 @@ pub fn resolve_base_credentials() -> Result<KakaoCredentials> {
     get_credentials_interactive()
 }
 
+/// Resolve credentials without ever reading stdin or writing an interactive
+/// prompt to stdout. Local database-driven automation uses this only when an
+/// attachment exposes a Kakao media key instead of a signed CDN URL.
+pub fn resolve_base_credentials_noninteractive() -> Result<KakaoCredentials> {
+    if let Some(saved) = load_credentials()? {
+        return Ok(saved);
+    }
+
+    let candidates = get_credential_candidates(8)?;
+    if candidates.is_empty() {
+        anyhow::bail!("Kakao credentials are unavailable non-interactively");
+    }
+    select_best_credential(candidates)
+}
+
 /// Attempt to refresh the REST bearer token from Cache.db.
 /// Returns true if a new token was extracted and saved.
 /// Used by REST retry logic when a pilsner endpoint returns UNAUTHENTICATED.

@@ -33,6 +33,18 @@ jobs:
       - name: Cargo test
         run: cargo test --manifest-path Cargo.toml
 
+      - name: Fake-only Python Bujamentor tests
+        run: >-
+          python3 -m unittest
+          tests.test_bujamentor_cli_runtime
+          tests.test_bujamentor_service_entry
+          tests.test_bujamentor_session_monitor
+          tests.test_bujamentor_session_packager
+          tests.test_bujamentor_tui
+
+      - name: Verify fake-only Bujamentor launchd harness
+        run: sh scripts/test-bujamentor-launchd-artifacts.sh
+
   build-aarch64:
     runs-on: macos-14
     env:
@@ -57,8 +69,44 @@ jobs:
       - name: Package artifact
         run: |
           ASSET="openkakao-cli-${TARGET}.tar.gz"
-          tar -C "target/${TARGET}/release" -czf "$ASSET" openkakao-cli
+          PACKAGE_DIR="${RUNNER_TEMP}/openkakao-cli-package"
+          rm -rf "$PACKAGE_DIR"
+          mkdir -p "$PACKAGE_DIR/scripts" "$PACKAGE_DIR/docs"
+          cp "target/${TARGET}/release/openkakao-cli" "$PACKAGE_DIR/openkakao-cli"
+          cp scripts/bujamentor*.py "$PACKAGE_DIR/scripts/"
+          cp scripts/bujamentor-reply-schema.json "$PACKAGE_DIR/scripts/"
+          cp \
+            scripts/prepare-bujamentor-session-runtime.py \
+            scripts/install-bujamentor-auto-reply-service.sh \
+            scripts/status-bujamentor-auto-reply-service.sh \
+            scripts/uninstall-bujamentor-auto-reply-service.sh \
+            scripts/uninstall-bujamentor-session-monitor.sh \
+            "$PACKAGE_DIR/scripts/"
+          cp config.example.toml "$PACKAGE_DIR/config.example.toml"
+          cp docs/bujamentor-launchd-supervision.md "$PACKAGE_DIR/docs/"
+          tar -C "$PACKAGE_DIR" -czf "$ASSET" .
           shasum -a 256 "$ASSET" > "$ASSET.sha256"
+          tar -tzf "$ASSET" | sed 's#^\./##' | grep -Fx 'openkakao-cli'
+          tar -tzf "$ASSET" | sed 's#^\./##' | grep -Fx 'config.example.toml'
+          tar -tzf "$ASSET" | sed 's#^\./##' | grep -Fx 'docs/bujamentor-launchd-supervision.md'
+          for runtime in \
+            scripts/bujamentor-supervisor.py \
+            scripts/bujamentor-db-watch.py \
+            scripts/bujamentor-auto-reply.py \
+            scripts/bujamentor-apple-watch.py \
+            scripts/bujamentor_ax_ui.py \
+            scripts/bujamentor_metrics.py \
+            scripts/bujamentor-auto-reply-service.py \
+            scripts/bujamentor-session-monitor.py \
+            scripts/bujamentor-tui.py \
+            scripts/bujamentor-reply-schema.json \
+            scripts/prepare-bujamentor-session-runtime.py \
+            scripts/install-bujamentor-auto-reply-service.sh \
+            scripts/status-bujamentor-auto-reply-service.sh \
+            scripts/uninstall-bujamentor-auto-reply-service.sh \
+            scripts/uninstall-bujamentor-session-monitor.sh; do
+            tar -tzf "$ASSET" | sed 's#^\./##' | grep -Fx "$runtime"
+          done
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -92,8 +140,44 @@ jobs:
       - name: Package artifact
         run: |
           ASSET="openkakao-cli-${TARGET}.tar.gz"
-          tar -C "target/${TARGET}/release" -czf "$ASSET" openkakao-cli
+          PACKAGE_DIR="${RUNNER_TEMP}/openkakao-cli-package"
+          rm -rf "$PACKAGE_DIR"
+          mkdir -p "$PACKAGE_DIR/scripts" "$PACKAGE_DIR/docs"
+          cp "target/${TARGET}/release/openkakao-cli" "$PACKAGE_DIR/openkakao-cli"
+          cp scripts/bujamentor*.py "$PACKAGE_DIR/scripts/"
+          cp scripts/bujamentor-reply-schema.json "$PACKAGE_DIR/scripts/"
+          cp \
+            scripts/prepare-bujamentor-session-runtime.py \
+            scripts/install-bujamentor-auto-reply-service.sh \
+            scripts/status-bujamentor-auto-reply-service.sh \
+            scripts/uninstall-bujamentor-auto-reply-service.sh \
+            scripts/uninstall-bujamentor-session-monitor.sh \
+            "$PACKAGE_DIR/scripts/"
+          cp config.example.toml "$PACKAGE_DIR/config.example.toml"
+          cp docs/bujamentor-launchd-supervision.md "$PACKAGE_DIR/docs/"
+          tar -C "$PACKAGE_DIR" -czf "$ASSET" .
           shasum -a 256 "$ASSET" > "$ASSET.sha256"
+          tar -tzf "$ASSET" | sed 's#^\./##' | grep -Fx 'openkakao-cli'
+          tar -tzf "$ASSET" | sed 's#^\./##' | grep -Fx 'config.example.toml'
+          tar -tzf "$ASSET" | sed 's#^\./##' | grep -Fx 'docs/bujamentor-launchd-supervision.md'
+          for runtime in \
+            scripts/bujamentor-supervisor.py \
+            scripts/bujamentor-db-watch.py \
+            scripts/bujamentor-auto-reply.py \
+            scripts/bujamentor-apple-watch.py \
+            scripts/bujamentor_ax_ui.py \
+            scripts/bujamentor_metrics.py \
+            scripts/bujamentor-auto-reply-service.py \
+            scripts/bujamentor-session-monitor.py \
+            scripts/bujamentor-tui.py \
+            scripts/bujamentor-reply-schema.json \
+            scripts/prepare-bujamentor-session-runtime.py \
+            scripts/install-bujamentor-auto-reply-service.sh \
+            scripts/status-bujamentor-auto-reply-service.sh \
+            scripts/uninstall-bujamentor-auto-reply-service.sh \
+            scripts/uninstall-bujamentor-session-monitor.sh; do
+            tar -tzf "$ASSET" | sed 's#^\./##' | grep -Fx "$runtime"
+          done
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -204,6 +288,7 @@ jobs:
             homepage "https://github.com/${REPO}"
             version "${VERSION}"
             license "MIT"
+            depends_on "python@3.13"
 
             on_macos do
               if Hardware::CPU.arm?
@@ -217,10 +302,34 @@ jobs:
 
             def install
               bin.install "openkakao-cli"
+              libexec.install "scripts"
+              pkgshare.install "config.example.toml"
+              pkgshare.install "docs"
             end
 
             test do
               assert_match "openkakao-cli", shell_output("#{bin}/openkakao-cli --help")
+              %w[
+                bujamentor-supervisor.py
+                bujamentor-db-watch.py
+                bujamentor-auto-reply.py
+                bujamentor-apple-watch.py
+                bujamentor_ax_ui.py
+                bujamentor_metrics.py
+                bujamentor-auto-reply-service.py
+                bujamentor-session-monitor.py
+                bujamentor-tui.py
+                bujamentor-reply-schema.json
+                prepare-bujamentor-session-runtime.py
+                install-bujamentor-auto-reply-service.sh
+                status-bujamentor-auto-reply-service.sh
+                uninstall-bujamentor-auto-reply-service.sh
+                uninstall-bujamentor-session-monitor.sh
+              ].each do |runtime|
+                assert_predicate libexec/"scripts/#{runtime}", :exist?
+              end
+              assert_predicate pkgshare/"config.example.toml", :exist?
+              assert_predicate pkgshare/"docs/bujamentor-launchd-supervision.md", :exist?
             end
           end
           FORMULA

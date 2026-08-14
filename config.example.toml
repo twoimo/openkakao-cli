@@ -50,3 +50,73 @@
 
 # Allow http:// webhook URLs to non-loopback hosts (default: false)
 # allow_insecure_webhooks = false
+
+# LOCO write operations are disabled by default.
+# allow_loco_write = false
+
+# AX-based local-send is a separate, real-window write path.
+# allow_ax_send = false
+# allowed_send_chats = ["부자멘토멘티"]
+
+# Independent unattended Bujamentor opt-in.
+# allow_bujamentor_auto_reply = false
+
+[model]
+# Required for unattended Bujamentor replies: use "local", or explicitly
+# attest remote egress with allow_egress, provider, and retention.
+# The Codex configuration below requires these exact remote-explicit values.
+# privacy_mode = "remote_explicit"
+# allow_egress = true
+# provider = "openai-codex"
+# retention = "provider-policy"
+
+[bujamentor]
+# Exact selectors used by `openkakao-cli auto-reply` when --chat is omitted.
+# CLI selectors replace this list. Repeat --chat or use escaped commas.
+# Managed multi-room service mode should declare the complete exact set here
+# and omit service-entry --chat flags, keeping room names out of child argv.
+# chats = ["bind:417780809780519:부자멘토멘티", "id:123456789"]
+# If a group room has an empty local DB name, attest the already-open exact AX
+# window against its local transcript: bind:<positive-id>:<exact-name>
+
+# Required for unattended operation; keep these explicit rather than relying
+# on inherited shell state.
+# self_nickname = "내 닉네임"
+# Legacy fallback applied only to selected rooms that have no exact per-room
+# entry below.
+# reply_authors = ["참여자A", "참여자B"]
+# Fetching a posted URL contacts that third-party host and may trigger tracking
+# or action links. Keep disabled unless this separate egress is explicitly wanted.
+# allow_link_fetch = false
+# Sending authorized-room image bytes to the configured reply model is a
+# separate media-egress boundary. Keep disabled unless explicitly intended.
+# allow_image_analysis = false
+
+# Required absolute paths for deterministic foreground or LaunchAgent
+# activation. The interpreter must resolve to trusted CPython 3.11, 3.12, or
+# 3.13. The 24/7 installer additionally requires the supplied path itself not
+# to be a symlink.
+# python_interpreter = "/opt/homebrew/opt/python@3.13/bin/python3.13"
+# Codex must point at the native user-owned executable installed by the
+# Homebrew Codex package, not its Node wrapper. Paste the absolute path found
+# under @openai/codex/node_modules/@openai/codex-darwin-*/vendor/*/bin/codex.
+# reply_runner = "/opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex"
+# reply_runner_kind = "codex"
+# These exact values select GPT-5.6 Luna, maximum reasoning, and the priority
+# service tier used by Codex Fast mode. Startup fails closed if they drift.
+# reply_model = "gpt-5.6-luna"
+# reply_reasoning_effort = "max"
+# reply_service_tier = "priority"
+# Dedicated private (0700) Codex home containing a private auth.json. Keeping
+# it isolated prevents unrelated user skills/plugins from entering replies.
+# reply_codex_home = "/Users/me/Library/Application Support/openkakao/bujamentor/codex-home"
+# state_root = "/Users/me/Library/Application Support/openkakao/bujamentor"
+
+# Optional per-room allowlists. Keep this subtable after all [bujamentor]
+# scalar settings. Keys are canonical positive Kakao chat IDs; exact room
+# policy prevents participant names from leaking across rooms. Every configured
+# key must be part of the current auto-reply selection. Commas are not allowed
+# in author nicknames because workers receive a bounded comma-delimited value.
+# [bujamentor.room_reply_authors]
+# "417780809780519" = ["참여자A", "참여자B"]
+# "123456789" = ["다른방참여자"]

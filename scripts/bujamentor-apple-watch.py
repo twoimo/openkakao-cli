@@ -14,6 +14,7 @@ import json
 import os
 import re
 import selectors
+import stat
 import subprocess
 import sys
 import tempfile
@@ -21,13 +22,15 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from bujamentor_ax_ui import CHAT, snapshot
+from bujamentor_ax_ui import CHAT, exact_window_available, snapshot
 
 ROOT = Path(__file__).resolve().parents[1]
 def reply_authors() -> set[str]:
     configured = os.environ.get("OPENKAKAO_REPLY_AUTHORS", "").strip()
     return {name.strip() for name in configured.split(",") if name.strip()}
 HOOK = ROOT / "scripts" / "bujamentor-auto-reply.py"
+HOOK_PYTHON_ISOLATION_FLAGS = ("-E", "-B", "-S")
+SUPPORTED_HOOK_PYTHON_VERSIONS = frozenset({(3, 11), (3, 12), (3, 13)})
 MAX_HOOK_OUTPUT_BYTES = 64 * 1024
 STATE = Path(
     os.environ.get(
@@ -208,19 +211,77 @@ def event_for(row: dict) -> dict:
     }
 
 
+class HookInterpreterFence(OSError):
+    """Fail closed when the running hook interpreter is not trusted."""
+
+
+def _hook_python_contract_matches(
+    configured: Path,
+    running: Path,
+    version: tuple[int, int],
+) -> bool:
+    """Mirror the DB watcher and Rust launcher's Python contract."""
+    return configured == running and version in SUPPORTED_HOOK_PYTHON_VERSIONS
+
+
+def _verified_hook_command() -> list[str]:
+    """Run the hook with this verified interpreter, never its env shebang."""
+    executable = str(sys.executable or "").strip()
+    path = Path(executable)
+    if not executable or not path.is_absolute():
+        raise HookInterpreterFence("hook interpreter unavailable")
+    try:
+        resolved = path.resolve(strict=True)
+        metadata = resolved.stat()
+    except OSError as exc:
+        raise HookInterpreterFence("hook interpreter unavailable") from exc
+    mode = stat.S_IMODE(metadata.st_mode)
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or mode & 0o022
+        or not mode & 0o111
+    ):
+        raise HookInterpreterFence("hook interpreter unsafe")
+
+    version = tuple(sys.version_info[:2])
+    if version not in SUPPORTED_HOOK_PYTHON_VERSIONS:
+        raise HookInterpreterFence("hook interpreter contract mismatch")
+
+    configured = os.environ.get("OPENKAKAO_PYTHON", "").strip()
+    if configured:
+        configured_path = Path(configured)
+        try:
+            configured_resolved = configured_path.resolve(strict=True)
+        except OSError as exc:
+            raise HookInterpreterFence(
+                "hook interpreter contract mismatch"
+            ) from exc
+        if (
+            not configured_path.is_absolute()
+            or not _hook_python_contract_matches(
+                configured_resolved,
+                resolved,
+                version,
+            )
+        ):
+            raise HookInterpreterFence("hook interpreter contract mismatch")
+    return [executable, *HOOK_PYTHON_ISOLATION_FLAGS, str(HOOK)]
+
+
 def invoke_hook(event: dict, dry_run: bool) -> tuple[int, str]:
     env = os.environ.copy()
     if dry_run:
         env["OPENKAKAO_HOOK_DRY_RUN"] = "1"
     payload = json.dumps(event, ensure_ascii=False).encode("utf-8")
     process = subprocess.Popen(
-        [sys.executable, str(HOOK)],
+        _verified_hook_command(),
         cwd=ROOT,
         env=env,
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
+    selector: selectors.BaseSelector | None = None
     try:
         if process.stdin is not None:
             process.stdin.write(payload)
@@ -262,6 +323,12 @@ def invoke_hook(event: dict, dry_run: bool) -> tuple[int, str]:
         except (OSError, subprocess.TimeoutExpired):
             pass
         return 1, ""
+    finally:
+        if selector is not None:
+            selector.close()
+        for stream in (process.stdin, process.stdout, process.stderr):
+            if stream is not None:
+                stream.close()
 
 
 def poll_once(
@@ -274,6 +341,17 @@ def poll_once(
     rows, sender = normalize_rows(raw_rows, str(state.get("last_sender") or ""))
     state["last_sender"] = sender
     if not raw_rows:
+        if (
+            os.environ.get("OPENKAKAO_DB_AUTHORITATIVE") == "1"
+            and exact_window_available(limit_seconds=max(snapshot_timeout, 0.5))
+        ):
+            # In DB-authoritative mode this worker is only a liveness sensor.
+            # Window-title availability cannot emit an event or grant delivery
+            # authority; the DB watcher and final Rust re-attestation remain the
+            # sole source and send gate.
+            write_status("healthy", 0, 0, False)
+            save_state(state)
+            return []
         write_status("degraded", 0, 0, allow_send)
         save_state(state)
         return []

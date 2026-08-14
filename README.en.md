@@ -189,6 +189,192 @@ allow_ax_send = true
 allowed_send_chats = ["your memo chat's display name", "another allowed chat"]
 ```
 
+### Foreground automatic replies
+
+Use the database-authoritative foreground command to select one or more exact
+rooms. Preview first; `allow_loco_write` does not authorize this AX path:
+
+```bash
+openkakao-cli auto-reply --chat 'name:부자멘토멘티' --check --json
+openkakao-cli auto-reply \
+  --chat 'bind:417780809780519:부자멘토멘티' --check --json
+openkakao-cli auto-reply \
+  --chat 'name:부자멘토멘티' \
+  --chat id:123456789
+# Per-run overrides are also available:
+openkakao-cli auto-reply \
+  --chat 'name:부자멘토멘티' \
+  --self-nickname 'your nickname' \
+  --reply-author 'allowed participant'
+```
+
+`--chat` can be repeated or comma-separated. Selectors support exact
+`id:<positive-id>` and `name:<exact-name>` forms. If KakaoTalk leaves a group
+room's local database name empty, `bind:<positive-id>:<exact-name>` performs a
+read-only transcript attestation against exactly one already-open AX window and
+persists only hashed identity evidence. The command remains attached
+to the terminal and stops only its owned workers on `Ctrl-C`; it does not
+adopt or kill an existing supervisor. For a `bind:` selector, `--check` also
+requires exactly one already-open AX window and performs the same read-only
+transcript attestation used at activation; other selectors validate static
+eligibility and do not prove AX-window visibility. A
+previous scalar supervisor is never adopted: an existing stopped state must
+carry `legacy_drained=true` with only terminal `sent`/`skipped` queue rows;
+uncertain or interrupted legacy state is rejected for manual reconciliation. Activation
+also requires explicit trusted paths in `[bujamentor]`: CPython 3.11, 3.12, or
+3.13 via `python_interpreter`, and a pinned native Codex executable via
+`reply_runner`.
+
+The live context index is not a one-time CSV snapshot. On startup the DB
+watcher backfills the selected local KakaoTalk room, then performs an
+account-fingerprint- and checkpoint-bound incremental sync every 60 seconds.
+Only a complete source is authoritative; missing, timed-out, or mismatched
+syncs fence delivery instead of answering from stale context. Confirmed
+auto-generated self replies are excluded from the learning samples.
+
+Each decision uses a versioned, room-specific timing mixture. The historical
+`log1p` delays are divided into empirical immediate, short, and delayed modes;
+one mode is chosen by its observed weight and a bounded Gaussian is drawn
+inside that mode. The empirical p90 is a separate stale cutoff. The selected
+mode, policy version, delay, and due time are persisted once and are not drawn
+again after restart. If the conversation advances before a delayed job is sent,
+the old plain-text reply is durably skipped as `conversation_advanced`. This
+avoids both a fixed average interval and a single tail-biased normal. Reply/skip
+category, reason, similarity, schedule, and delivery state are stored in
+structured `reply_decisions` evidence and consulted for later similar messages.
+Contiguous messages by the same author within eight seconds are coalesced (up
+to six) so a short burst does not receive one reply per line.
+
+The worker prioritizes a recipient-specific profile for honorific/casual
+register, length, endings, and punctuation. It falls back explicitly to the
+room-wide profile until it has at least three direct samples with a confidence
+sum of at least two. A direct question such as “is this AI/a bot/an automatic
+reply?” is recorded as `identity_question_requires_owner` and skipped so the
+account owner can answer personally; the worker does not make a human identity
+claim.
+
+```toml
+[safety]
+allow_ax_send = true
+allowed_send_chats = ["부자멘토멘티"]
+allow_bujamentor_auto_reply = true
+
+[model]
+privacy_mode = "remote_explicit"
+allow_egress = true
+provider = "openai-codex"
+retention = "provider-policy"
+
+[bujamentor]
+chats = ["bind:417780809780519:부자멘토멘티"]
+self_nickname = "your nickname"
+reply_authors = ["allowed participant"]
+python_interpreter = "/absolute/path/to/cpython-3.11-through-3.13"
+reply_runner = "/opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex"
+reply_runner_kind = "codex"
+reply_model = "gpt-5.6-luna"
+reply_reasoning_effort = "max"
+reply_service_tier = "priority" # Codex Fast mode
+reply_codex_home = "/Users/me/Library/Application Support/openkakao/bujamentor/codex-home"
+allow_image_analysis = true # Separate opt-in for authorized-room image egress to Luna
+
+[bujamentor.room_reply_authors]
+"417780809780519" = ["allowed participant", "second participant"]
+"123456789" = ["other-room participant"]
+```
+
+Keys in `[bujamentor.room_reply_authors]` must be canonical positive chat IDs.
+An exact room entry takes precedence over the legacy global `reply_authors`
+list; the global list is used only for a selected room without an exact entry.
+Startup rejects keys for unselected rooms and any selected room that has no
+valid resulting allowlist. Repeated CLI `--reply-author` values are one per-run
+allowlist for every selected room and replace the per-room map.
+
+`allow_image_analysis = true` is a separate image-egress opt-in, independent
+of text egress. When enabled, only the exact local-DB attachment bound to the
+authorized `(chat_id, log_id, author_id)` is fetched from Kakao's CDN under
+strict byte and format limits, validated, and supplied to Luna. Single images
+and ordered bundles of up to ten images are supported; every member must match
+the attested count, order, size, format, dimensions, and digest or the model is
+not called. Database-authoritative mode never falls back to an AX screenshot.
+Temporary files and path capabilities are removed after analysis or a terminal
+outcome. If the option is absent or false, image bytes are neither fetched nor
+sent to the model and the event is skipped as `image_analysis_not_opted_in`.
+
+`reply_runner` must be the platform's native Codex binary, not its Node wrapper
+(the platform path differs on Intel Macs). `reply_codex_home` must be a private
+`0700` directory with a private `0600` `auth.json`; this keeps unrelated Codex
+configuration, plugins, and skills out of replies. Startup pins and validates
+the runner version and SHA-256 plus the exact GPT-5.6 Luna / max / priority
+combination. Model generation is explicit remote egress even though context
+storage and retrieval are local.
+
+The single authority for Luna call state is the private mode-`0600`
+`model-circuit.sqlite3` under the Bujamentor state root. Every room worker for
+the same account/state root shares a durable lease and cooldown keyed by runner
+kind, model, reasoning effort, and service tier. Multi-room operation therefore
+observes one room's in-flight call, rate limit, usage limit, or exhausted quota
+from every other room. A temporary rate limit honors the provider's
+`Retry-After` as a minimum and adds bounded exponential backoff with jitter;
+usage limits cool down for at least six hours (up to 24 hours after repeated
+failures), while an exhausted quota cools down for 24 hours. An open circuit or
+another in-flight call durably defers the message only within that message's
+original response window instead of misclassifying it as a terminal skip. Once
+the window expires it becomes `stale_backlog`, so an old plain-text answer
+cannot suddenly be sent when capacity returns. There is no automatic fallback
+to another model. Circuit storage contains only the failure class, count, retry
+time, and bounded lease—not the prompt, conversation, generated answer, or raw
+stderr. If an older room queue contains a non-empty legacy breaker, activation
+fails closed with `legacy_model_circuit_reconciliation_required` instead of
+silently bypassing or merging that authority; reconcile it explicitly first.
+
+For current-user persistence, do not run the AX/database worker directly from a
+bare LaunchAgent. The recommended layout uses a Kakao-blind, one-shot monitor
+LaunchAgent only to request an immutable, SHA-256-pinned private `.command`
+through Terminal. Terminal is the existing user-approved Accessibility/TCC
+trust boundary. The Terminal-hosted session watchdog takes an exclusive owner
+lock and performs a fresh read-only preflight before every child start. A
+separate guardian then owns the foreground worker under `caffeinate -i`; EOF on
+its liveness pipes tears down every worker group before restart if either the
+watchdog or guardian dies. See the
+[Bujamentor launchd runbook](docs/bujamentor-launchd-supervision.md#persistent-auto-reply-launchagent)
+for the trust boundary and status checks.
+
+This provides recovery after the same user logs back in and Aqua, Terminal,
+the existing TCC authorization, logged-in KakaoTalk, and the exact window are
+available. It does not operate while the Mac is powered off or the user is
+logged out, and it does not bypass a KakaoTalk logout or missing TCC access.
+A separately signed native host with its own user-granted macOS authorization
+is the long-term option for removing the Terminal dependency.
+
+#### Read-only real-time dashboard
+
+`python3 scripts/bujamentor-tui.py` displays service state, per-room
+supervisor/DB/AX/worker heartbeats, the account-global model circuit, and the
+queue without making any change. Each room retains up to 4,096 metadata-only
+durable transitions, so detection, authorization, media, context, model,
+delay, pre-send, AX authorization, local-DB confirmation, and terminal phases
+remain visible after dashboard and service restarts. The journal never stores
+chat or generated-reply bodies, names, prompts, URLs, paths, provider output,
+or free-form exception text. Message and generated-reply bodies are redacted
+by default, and the dashboard never starts, stops, retries, acknowledges, or
+sends. Repeat `--room <chat-id>` to filter rooms; `--once` prints one plain
+snapshot and `--once --json` prints a structured snapshot that always remains
+content-redacted.
+
+Only use `--show-content` in an interactive Terminal when bodies are actually
+needed. After the warning, type uppercase `SHOW CONTENT` exactly. Non-interactive
+use is rejected, and `--json` can never be combined with content display. The
+interactive keys are `q` to quit, `↑`/`↓` or `j`/`k` to change rooms,
+`Page Up`/`Page Down` or `[`/`]` to page the selected room's durable timeline,
+`Home` for its newest retained entry, `End` for its oldest retained entry, `r`
+to refresh immediately, `p` to pause, and `?` for help. Each refresh validates
+and loads all 4,096 or fewer retained entries per room, while the screen
+displays eight at once. `history_truncated=true` means older history was pruned
+at the retention boundary or a sequence gap exists; it never means retained
+entries are hidden. The offline packager's `open-bujamentor-tui.command` opens
+the same redacted dashboard without opting in to content.
+
 Read-only operations are always available:
 
 | Command | Description | Server Contact |

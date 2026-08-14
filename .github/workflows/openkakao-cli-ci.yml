@@ -58,6 +58,15 @@ jobs:
       - name: Cargo test
         run: cargo test --manifest-path $MANIFEST
 
+      - name: Fake-only Python Bujamentor tests
+        run: >-
+          python3 -m unittest
+          tests.test_bujamentor_cli_runtime
+          tests.test_bujamentor_service_entry
+          tests.test_bujamentor_session_monitor
+          tests.test_bujamentor_session_packager
+          tests.test_bujamentor_tui
+
   lint:
     runs-on: ubuntu-latest
     steps:
@@ -91,6 +100,15 @@ jobs:
 
       - name: Launchd artifact harness
         run: sh scripts/test-bujamentor-launchd-artifacts.sh
+
+      - name: Fake-only Python Bujamentor tests
+        run: >-
+          python3 -m unittest
+          tests.test_bujamentor_cli_runtime
+          tests.test_bujamentor_service_entry
+          tests.test_bujamentor_session_monitor
+          tests.test_bujamentor_session_packager
+          tests.test_bujamentor_tui
 
   macos:
     runs-on: macos-14

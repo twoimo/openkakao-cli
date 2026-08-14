@@ -14,15 +14,44 @@ import time
 from typing import Any
 import bujamentor_metrics as perf
 
-CHAT = "부자멘토멘티"
+CHAT = os.environ.get("OPENKAKAO_TARGET_CHAT_NAME", "부자멘토멘티").strip() or "부자멘토멘티"
 _FIELD = chr(31)
 _RECORD = chr(30)
 MAX_AX_OUTPUT_BYTES = 128 * 1024
+MAX_EXACT_WINDOW_ATTEMPTS = 3
+EXACT_WINDOW_RETRY_DELAY_SECONDS = 0.05
+
+_EXACT_WINDOW_SCRIPT = r'''
+tell application "System Events"
+  tell process "KakaoTalk"
+    set exactWindowCount to 0
+    repeat with candidateWindow in every window
+      try
+        if (name of candidateWindow as text) is __OPENKAKAO_CHAT_LITERAL__ then
+          set exactWindowCount to exactWindowCount + 1
+        end if
+      end try
+    end repeat
+    return exactWindowCount
+  end tell
+end tell
+'''
 
 _SCRIPT = r'''
 tell application "System Events"
   tell process "KakaoTalk"
-    set w to window "부자멘토멘티"
+    set allWindows to every window
+    set exactWindowCount to 0
+    set w to missing value
+    repeat with candidateWindow in allWindows
+      try
+        if (name of candidateWindow as text) is __OPENKAKAO_CHAT_LITERAL__ then
+          set exactWindowCount to exactWindowCount + 1
+          set w to contents of candidateWindow
+        end if
+      end try
+    end repeat
+    if exactWindowCount is not 1 then error "ambiguous or missing exact KakaoTalk chat window"
     set {wx, wy} to position of w
     set {ww, wh} to size of w
     set centerX to wx + (ww / 2)
@@ -103,7 +132,18 @@ end tell
 _CONFIRM_SCRIPT = r'''
 tell application "System Events"
   tell process "KakaoTalk"
-    set w to window "부자멘토멘티"
+    set allWindows to every window
+    set exactWindowCount to 0
+    set w to missing value
+    repeat with candidateWindow in allWindows
+      try
+        if (name of candidateWindow as text) is __OPENKAKAO_CHAT_LITERAL__ then
+          set exactWindowCount to exactWindowCount + 1
+          set w to contents of candidateWindow
+        end if
+      end try
+    end repeat
+    if exactWindowCount is not 1 then error "ambiguous or missing exact KakaoTalk chat window"
     set {wx, wy} to position of w
     set {ww, wh} to size of w
     set centerX to wx + (ww / 2)
@@ -224,13 +264,50 @@ def _run_bounded_osascript(
                 stream.close()
         selector.close()
 
+
+@perf.timed("ax.exact_window_available")
+def exact_window_available(limit_seconds: float = 3.0) -> bool:
+    """Return whether exactly one target window exists without reading its content."""
+    if limit_seconds <= 0.0:
+        return False
+    deadline = time.monotonic() + limit_seconds
+    for attempt in range(MAX_EXACT_WINDOW_ATTEMPTS):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.0:
+            return False
+        try:
+            returncode, stdout_bytes, _ = _run_bounded_osascript(
+                ["/usr/bin/osascript", "-"],
+                _script_for_chat(_EXACT_WINDOW_SCRIPT),
+                remaining,
+            )
+        except (OSError, subprocess.TimeoutExpired, ValueError):
+            returncode, stdout_bytes = 1, b""
+        if returncode == 0:
+            try:
+                count = int(stdout_bytes.decode("utf-8").strip())
+            except (UnicodeDecodeError, ValueError):
+                count = 0
+            if count > 1:
+                return False
+            if count == 1:
+                return True
+        if attempt + 1 >= MAX_EXACT_WINDOW_ATTEMPTS:
+            return False
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.0:
+            return False
+        time.sleep(min(EXACT_WINDOW_RETRY_DELAY_SECONDS, remaining))
+    return False
+
+
 @perf.timed("ax.snapshot")
 def snapshot(limit_seconds: float = 3.0) -> list[dict[str, Any]]:
     """Return rendered rows, or an empty list when GUI access is unavailable."""
     try:
         returncode, stdout_bytes, _ = _run_bounded_osascript(
             ["/usr/bin/osascript"],
-            _SCRIPT,
+            _script_for_chat(_SCRIPT),
             limit_seconds,
         )
     except (OSError, subprocess.TimeoutExpired, ValueError):
@@ -288,9 +365,17 @@ def _apple_script_literal(value: str) -> str:
     return " & ".join(parts)
 
 
+def _script_for_chat(script: str) -> str:
+    if not CHAT or any(ord(char) < 32 for char in CHAT):
+        raise ValueError("chat name contains unsupported control characters")
+    return script.replace("__OPENKAKAO_CHAT_LITERAL__", _apple_script_literal(CHAT))
+
+
 def _confirmation_script(message: str, min_row_index: int) -> str:
     """Build the compact exact-text AX confirmation query."""
-    script = _CONFIRM_SCRIPT.replace("{min_row_index}", str(max(0, min_row_index)))
+    script = _script_for_chat(
+        _CONFIRM_SCRIPT.replace("{min_row_index}", str(max(0, min_row_index)))
+    )
     return script.replace("{apple_script_message}", _apple_script_literal(message))
 
 
@@ -327,7 +412,18 @@ def send_via_system_events(message: str, timeout_seconds: float = 5.0) -> bool:
     script = r'''
 tell application "System Events"
   tell process "KakaoTalk"
-    set w to window "부자멘토멘티"
+    set allWindows to every window
+    set exactWindowCount to 0
+    set w to missing value
+    repeat with candidateWindow in allWindows
+      try
+        if (name of candidateWindow as text) is __OPENKAKAO_CHAT_LITERAL__ then
+          set exactWindowCount to exactWindowCount + 1
+          set w to contents of candidateWindow
+        end if
+      end try
+    end repeat
+    if exactWindowCount is not 1 then error "ambiguous or missing exact KakaoTalk chat window"
     set composer to missing value
     repeat with top in (UI elements of w)
       repeat with e in (UI elements of top)
@@ -356,6 +452,7 @@ tell application "System Events"
   end tell
 end tell
 '''
+    script = _script_for_chat(script)
     script = script.replace("{apple_script_message}", _apple_script_literal(message))
     try:
         returncode, _, _ = _run_bounded_osascript(

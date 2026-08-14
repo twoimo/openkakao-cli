@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -17,6 +18,8 @@ pub struct LocalChat {
     pub chat_id: i64,
     pub chat_type: i32,
     pub chat_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub database_chat_name: Option<String>,
     pub active_members_count: i32,
     pub last_log_id: i64,
     pub last_updated_at: i64,
@@ -24,24 +27,281 @@ pub struct LocalChat {
     pub display_name: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChatSelector {
+    Id(i64),
+    Name(String),
+    Binding { id: i64, name: String },
+}
+
+const MAX_CHAT_SELECTORS: usize = 64;
+const MAX_CHAT_TARGETS: usize = 32;
+const MAX_CHAT_NAME_BYTES: usize = 256;
+const MAX_CHAT_INDEX_ROWS: usize = 10_000;
+
+pub fn parse_chat_selectors(values: &[String]) -> Result<Vec<ChatSelector>> {
+    let mut parts = Vec::new();
+    for value in values {
+        let mut current = String::new();
+        let mut escaped = false;
+        for ch in value.chars() {
+            if escaped {
+                match ch {
+                    ',' | '\\' => current.push(ch),
+                    _ => anyhow::bail!("unsupported chat selector escape; use \\, or \\\\"),
+                }
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == ',' {
+                parts.push(std::mem::take(&mut current));
+            } else {
+                current.push(ch);
+            }
+        }
+        if escaped {
+            anyhow::bail!("chat selector has a dangling escape");
+        }
+        parts.push(current);
+    }
+    if parts.is_empty() {
+        anyhow::bail!("at least one --chat selector is required");
+    }
+    if parts.len() > MAX_CHAT_SELECTORS {
+        anyhow::bail!("too many chat selectors (maximum {MAX_CHAT_SELECTORS})");
+    }
+
+    let mut selectors = Vec::with_capacity(parts.len());
+    for raw in parts {
+        let value = raw.trim();
+        if value.is_empty() {
+            anyhow::bail!("chat selector must not be empty");
+        }
+        if value.chars().any(|ch| ch.is_control()) || value.len() > MAX_CHAT_NAME_BYTES {
+            anyhow::bail!("chat selector is invalid or too long");
+        }
+        if let Some(binding) = value.strip_prefix("bind:") {
+            let (id, name) = binding
+                .split_once(':')
+                .context("bind: selector must use bind:<positive-id>:<exact-name>")?;
+            let id = id
+                .parse::<i64>()
+                .ok()
+                .filter(|id| *id > 0)
+                .context("bind: selector must contain a positive integer ID")?;
+            let name = name.trim();
+            if name.is_empty()
+                || name.len() > MAX_CHAT_NAME_BYTES
+                || name.chars().any(|ch| ch.is_control())
+            {
+                anyhow::bail!("bind: selector exact name is invalid or too long");
+            }
+            selectors.push(ChatSelector::Binding {
+                id,
+                name: name.to_owned(),
+            });
+        } else if let Some(id) = value.strip_prefix("id:") {
+            let id = id
+                .parse::<i64>()
+                .ok()
+                .filter(|id| *id > 0)
+                .context("id: selector must contain a positive integer")?;
+            selectors.push(ChatSelector::Id(id));
+        } else if let Some(name) = value.strip_prefix("name:") {
+            let name = name.trim();
+            if name.is_empty() {
+                anyhow::bail!("name: selector must not be empty");
+            }
+            selectors.push(ChatSelector::Name(name.to_owned()));
+        } else if value.bytes().all(|byte| byte.is_ascii_digit()) {
+            let id = value
+                .parse::<i64>()
+                .ok()
+                .filter(|id| *id > 0)
+                .context("chat ID selector must be a positive integer")?;
+            selectors.push(ChatSelector::Id(id));
+        } else {
+            selectors.push(ChatSelector::Name(value.to_owned()));
+        }
+    }
+    Ok(selectors)
+}
+
+pub fn resolve_chat_selectors(
+    chats: &[LocalChat],
+    selectors: &[ChatSelector],
+) -> Result<Vec<LocalChat>> {
+    if selectors.is_empty() {
+        anyhow::bail!("at least one chat selector is required");
+    }
+    let mut by_id = BTreeMap::new();
+    let mut by_name: BTreeMap<String, Vec<i64>> = BTreeMap::new();
+    for chat in chats {
+        // KakaoTalk stores internal/system rooms under non-positive IDs.
+        // They are not addressable chat targets and must not poison the
+        // positive-ID identity index.
+        if chat.chat_id <= 0 {
+            continue;
+        }
+        if chat.chat_name.len() > MAX_CHAT_NAME_BYTES
+            || chat.chat_name.chars().any(|ch| ch.is_control())
+            || chat.last_log_id < 0
+        {
+            anyhow::bail!("local chat identity is malformed");
+        }
+        if by_id.insert(chat.chat_id, chat.clone()).is_some() {
+            anyhow::bail!("local chat identity is duplicated");
+        }
+        if !chat.chat_name.is_empty() {
+            by_name
+                .entry(chat.chat_name.clone())
+                .or_default()
+                .push(chat.chat_id);
+        }
+    }
+
+    let mut resolved = Vec::new();
+    for selector in selectors {
+        let chat = match selector {
+            ChatSelector::Id(id) => {
+                let chat = by_id
+                    .get(id)
+                    .with_context(|| format!("chat ID {id} was not found"))?;
+                if chat.chat_name.is_empty() {
+                    anyhow::bail!(
+                        "chat ID {id} has no local AX name; use bind:{id}:<exact-name> for read-only transcript attestation"
+                    );
+                }
+                let ids = by_name
+                    .get(&chat.chat_name)
+                    .expect("every chat contributes a name index");
+                if ids.len() != 1 {
+                    anyhow::bail!(
+                        "chat ID {id} has an ambiguous AX name {:?} (candidate IDs: {ids:?})",
+                        chat.chat_name
+                    );
+                }
+                chat
+            }
+            ChatSelector::Name(name) => {
+                let ids = by_name
+                    .get(name)
+                    .with_context(|| format!("chat name {name:?} was not found"))?;
+                if ids.len() != 1 {
+                    anyhow::bail!("chat name {name:?} is ambiguous (candidate IDs: {ids:?})");
+                }
+                by_id
+                    .get(&ids[0])
+                    .expect("name index only contains known IDs")
+            }
+            ChatSelector::Binding { id, name } => {
+                let chat = by_id
+                    .get(id)
+                    .with_context(|| format!("chat ID {id} was not found"))?;
+                if !chat.chat_name.is_empty() && chat.chat_name != *name {
+                    anyhow::bail!(
+                        "chat ID {id} has local AX name {:?}, not the explicit binding {:?}",
+                        chat.chat_name,
+                        name
+                    );
+                }
+                if let Some(ids) = by_name.get(name) {
+                    if ids.len() != 1 || ids[0] != *id {
+                        anyhow::bail!(
+                            "explicit AX name {name:?} is already mapped to different local chat IDs: {ids:?}"
+                        );
+                    }
+                }
+                let mut bound = chat.clone();
+                bound.database_chat_name = Some(chat.chat_name.clone());
+                bound.chat_name = name.clone();
+                if let Some(existing) = resolved
+                    .iter()
+                    .find(|item: &&LocalChat| item.chat_id == *id)
+                {
+                    if existing.chat_name != bound.chat_name {
+                        anyhow::bail!("chat ID {id} was selected with conflicting AX names");
+                    }
+                    continue;
+                }
+                if resolved.len() >= MAX_CHAT_TARGETS {
+                    anyhow::bail!("too many unique chat targets (maximum {MAX_CHAT_TARGETS})");
+                }
+                resolved.push(bound);
+                continue;
+            }
+        };
+        if !resolved
+            .iter()
+            .any(|item: &LocalChat| item.chat_id == chat.chat_id)
+        {
+            if resolved.len() >= MAX_CHAT_TARGETS {
+                anyhow::bail!("too many unique chat targets (maximum {MAX_CHAT_TARGETS})");
+            }
+            resolved.push(chat.clone());
+        }
+    }
+    Ok(resolved)
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct LocalMessage {
     pub log_id: i64,
     pub chat_id: i64,
     pub author_id: i64,
+    /// Derived inside the trusted local DB reader from the Kakao account ID.
+    /// Display nicknames are deliberately not used for self classification.
+    pub is_self: bool,
     pub sender_name: String,
     pub message: String,
     pub attachment: String,
     pub message_type: i32,
     pub sent_at: i64,
 }
-pub const LOCAL_POLL_SCHEMA_VERSION: u32 = 2;
+
+/// Exact attachment metadata read from one immutable local Kakao DB row.
+///
+/// This intentionally excludes the message body and sender identity.  Media
+/// consumers need only the row identity, type, and opaque attachment JSON.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalMediaAttachment {
+    pub chat_id: i64,
+    pub log_id: i64,
+    pub author_id: i64,
+    pub is_self: bool,
+    pub message_type: i32,
+    pub attachment: String,
+}
+pub const LOCAL_POLL_SCHEMA_VERSION: u32 = 3;
 pub const LOCAL_POLL_MAX_ROWS: usize = 200;
 pub const LOCAL_POLL_MAX_BYTES: usize = 1024 * 1024;
 pub const LOCAL_POLL_MAX_FIELD_BYTES: usize = 256 * 1024;
 const LOCAL_POLL_AFTER_ENV: &str = "OPENKAKAO_LOCAL_POLL_AFTER_LOG_ID";
 const LOCAL_POLL_MAX_INT64: i64 = i64::MAX;
 const LOCAL_POLL_ID_DOMAIN: &str = "global_sparse";
+const LOCAL_CONVERSATION_MESSAGE_TYPE_MIN: i32 = 1;
+
+pub(crate) fn is_local_conversation_message_type(message_type: i32) -> bool {
+    message_type >= LOCAL_CONVERSATION_MESSAGE_TYPE_MIN
+}
+
+// KakaoTalk stores edit/other control records in NTChatMessage with a
+// non-positive message type. Those rows can receive a logId newer than the
+// room's lastLogId without becoming a new conversational tail. They are not
+// reply candidates and must not participate in either side of the bounded
+// local-poll completeness proof.
+const LOCAL_POLL_ROW_STATS_SQL: &str = "SELECT COUNT(*), MAX(m.logId)
+     FROM NTChatMessage m
+     WHERE m.chatId = ? AND m.logId > ? AND m.type >= ?";
+const LOCAL_POLL_ROWS_SQL: &str = "SELECT m.logId, m.chatId, m.authorId,
+            COALESCE(u.displayName, u.friendNickName, u.nickName, '') as senderName,
+            COALESCE(m.message, '') as message,
+            COALESCE(m.attachment, '') as attachment, m.type, m.sentAt
+     FROM NTChatMessage m
+     LEFT JOIN NTUser u ON m.authorId = u.userId AND u.linkId = 0
+     WHERE m.chatId = ? AND m.logId > ? AND m.type >= ?
+     ORDER BY m.logId ASC, m.sentAt ASC
+     LIMIT ?";
 
 // Kakao log IDs are global sparse identifiers, so numeric holes are not gaps.
 // Completeness proves the bounded rowset from one SQLite snapshot instead.
@@ -67,6 +327,13 @@ pub struct LocalPollEnvelope {
     pub chat: LocalChat,
     pub messages: Vec<LocalMessage>,
     pub completeness: LocalPollCompleteness,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalAuthorIdentity {
+    pub author_id: i64,
+    pub nickname: String,
+    pub is_self: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -96,11 +363,72 @@ pub fn get_platform_uuid() -> Result<String> {
     }
     anyhow::bail!("IOPlatformUUID not found in ioreg output")
 }
+
+#[cfg(target_os = "macos")]
+fn get_platform_uuid_without_process() -> Result<String> {
+    use core_foundation::base::{kCFAllocatorDefault, CFAllocatorRef, CFTypeRef, TCFType};
+    use core_foundation::string::{CFString, CFStringRef};
+    use std::os::raw::c_char;
+
+    type IoObject = u32;
+    type MachPort = u32;
+
+    #[link(name = "IOKit", kind = "framework")]
+    unsafe extern "C" {
+        fn IORegistryEntryFromPath(master_port: MachPort, path: *const c_char) -> IoObject;
+        fn IORegistryEntryCreateCFProperty(
+            entry: IoObject,
+            key: CFStringRef,
+            allocator: CFAllocatorRef,
+            options: u32,
+        ) -> CFTypeRef;
+        fn IOObjectRelease(object: IoObject) -> i32;
+    }
+
+    let key = CFString::from_static_string("IOPlatformUUID");
+    let path = b"IOService:/\0";
+    let entry = unsafe { IORegistryEntryFromPath(0, path.as_ptr().cast()) };
+    if entry == 0 {
+        anyhow::bail!("IOPlatformExpertDevice registry entry is unavailable");
+    }
+    let property = unsafe {
+        IORegistryEntryCreateCFProperty(entry, key.as_concrete_TypeRef(), kCFAllocatorDefault, 0)
+    };
+    let result = if property.is_null() {
+        Err(anyhow::anyhow!(
+            "IOPlatformUUID registry property is unavailable"
+        ))
+    } else {
+        let value =
+            unsafe { CFString::wrap_under_create_rule(property as CFStringRef) }.to_string();
+        if value.trim().is_empty() {
+            Err(anyhow::anyhow!("IOPlatformUUID registry property is empty"))
+        } else {
+            Ok(value)
+        }
+    };
+    unsafe {
+        IOObjectRelease(entry);
+    }
+    result
+}
+
+#[cfg(not(target_os = "macos"))]
+fn get_platform_uuid_without_process() -> Result<String> {
+    anyhow::bail!("direct platform UUID lookup is only available on macOS")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdentityCacheMode {
+    Normal,
+    NoMutation,
+}
+
 fn local_db_identity_cache_path() -> Option<PathBuf> {
     dirs::data_local_dir().map(|dir| dir.join("openkakao").join("local-db-identity.json"))
 }
 
-fn read_cached_user_id(uuid: &str, plist_fingerprint: &str) -> Option<i64> {
+fn read_cached_user_id(uuid: &str, account_hash: &str) -> Option<i64> {
     let path = local_db_identity_cache_path()?;
     let metadata = std::fs::symlink_metadata(&path).ok()?;
     if !metadata.file_type().is_file() {
@@ -115,14 +443,10 @@ fn read_cached_user_id(uuid: &str, plist_fingerprint: &str) -> Option<i64> {
     }
     let value: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&path).ok()?).ok()?;
-    let matches = value.get("schema_version") == Some(&serde_json::Value::from(2))
+    let matches = value.get("schema_version") == Some(&serde_json::Value::from(3))
         && value.get("uuid").and_then(|value| value.as_str()) == Some(uuid)
-        && value
-            .get("plist_fingerprint")
-            .and_then(|value| value.as_str())
-            == Some(plist_fingerprint);
+        && value.get("account_hash").and_then(|value| value.as_str()) == Some(account_hash);
     if !matches {
-        let _ = std::fs::remove_file(path);
         return None;
     }
     value
@@ -131,7 +455,7 @@ fn read_cached_user_id(uuid: &str, plist_fingerprint: &str) -> Option<i64> {
         .filter(|id| *id > 0)
 }
 
-fn cache_user_id(uuid: &str, plist_fingerprint: &str, user_id: i64) {
+fn cache_user_id(uuid: &str, account_hash: &str, user_id: i64) {
     let Some(path) = local_db_identity_cache_path() else {
         return;
     };
@@ -143,9 +467,9 @@ fn cache_user_id(uuid: &str, plist_fingerprint: &str, user_id: i64) {
     }
     let temp = path.with_extension("tmp");
     let payload = json!({
-        "schema_version": 2,
+        "schema_version": 3,
         "uuid": uuid,
-        "plist_fingerprint": plist_fingerprint,
+        "account_hash": account_hash,
         "user_id": user_id,
     });
     if std::fs::write(&temp, serde_json::to_vec(&payload).unwrap_or_default()).is_err() {
@@ -160,14 +484,17 @@ fn cache_user_id(uuid: &str, plist_fingerprint: &str, user_id: i64) {
     let _ = std::fs::rename(temp, path);
 }
 
-fn plist_fingerprint(path: &Path) -> Option<String> {
-    let bytes = std::fs::read(path).ok()?;
-    Some(hex::encode(sha2::Sha256::digest(&bytes)))
+fn get_user_id_from_plist() -> Result<i64> {
+    get_user_id_from_plist_with_mode(IdentityCacheMode::Normal)
 }
 
-fn get_user_id_from_plist() -> Result<i64> {
+fn get_user_id_from_plist_with_mode(mode: IdentityCacheMode) -> Result<i64> {
     let home = dirs::home_dir().context("No home directory")?;
-    let current_uuid = get_platform_uuid().ok();
+    let current_uuid = if mode == IdentityCacheMode::NoMutation {
+        get_platform_uuid_without_process().ok()
+    } else {
+        get_platform_uuid().ok()
+    };
     let container_prefs =
         home.join("Library/Containers/com.kakao.KakaoTalkMac/Data/Library/Preferences");
 
@@ -195,12 +522,17 @@ fn get_user_id_from_plist() -> Result<i64> {
         );
     }
 
-    if let Some(uuid) = current_uuid.as_deref() {
-        for path in &plist_paths {
-            if let Some(fingerprint) = plist_fingerprint(path) {
-                if let Some(user_id) = read_cached_user_id(uuid, &fingerprint) {
-                    return Ok(user_id);
-                }
+    let active_account_hash = plist_paths.iter().find_map(|path| {
+        let dictionary: plist::Dictionary = plist::from_file(path).ok()?;
+        extract_active_account_hash(&dictionary)
+    });
+    if let (Some(uuid), Some(account_hash)) =
+        (current_uuid.as_deref(), active_account_hash.as_deref())
+    {
+        if let Some(user_id) = read_cached_user_id(uuid, account_hash) {
+            let db_name = derive_database_name(user_id, uuid);
+            if find_database_path(&db_name).is_ok() {
+                return Ok(user_id);
             }
         }
     }
@@ -209,9 +541,12 @@ fn get_user_id_from_plist() -> Result<i64> {
         let Ok(user_id) = extract_user_id_from_plist(&path) else {
             continue;
         };
-        if let (Some(uuid), Some(fingerprint)) = (current_uuid.as_deref(), plist_fingerprint(&path))
-        {
-            cache_user_id(uuid, &fingerprint, user_id);
+        if mode == IdentityCacheMode::Normal {
+            if let (Some(uuid), Some(account_hash)) =
+                (current_uuid.as_deref(), active_account_hash.as_deref())
+            {
+                cache_user_id(uuid, account_hash, user_id);
+            }
         }
         return Ok(user_id);
     }
@@ -308,19 +643,17 @@ fn extract_active_account_hash(dict: &plist::Dictionary) -> Option<String> {
     None
 }
 
-/// Wall-clock budget for the SHA-512 pre-image search. The search is a last
-/// resort and runs on the main thread, so it must not hang the CLI when the
-/// hash has no small pre-image (logged-out account, foreign hash, or a userId
-/// outside the scanned range).
-const SHA512_BRUTE_FORCE_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
+/// Wall-clock budget for the one-time parallel SHA-512 pre-image search.
+const SHA512_BRUTE_FORCE_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+const SHA512_BRUTE_FORCE_MAX_USER_ID: i64 = 1_000_000_000;
+const SHA512_BRUTE_FORCE_CHUNK: i64 = 100_000;
 
 /// Recover a userId by brute-forcing the SHA-512 pre-image.
 /// KakaoTalk stores SHA-512(userId) in plist revision keys. userIds are small
-/// positive integers, so the real value is normally found quickly — but if it
-/// is not present in the scanned range the loop stops at the time budget rather
-/// than burning minutes of CPU.
+/// positive integers. Work is split across the machine's available CPUs and
+/// stops at a bounded deadline if the plist contains a foreign or stale hash.
 fn recover_user_id_from_sha512(hex_hash: &str) -> Option<i64> {
-    use sha2::Digest;
+    use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
     if hex_hash.len() != 128 {
         return None;
@@ -335,34 +668,60 @@ fn recover_user_id_from_sha512(hex_hash: &str) -> Option<i64> {
         target[i] = u8::from_str_radix(s, 16).ok()?;
     }
 
-    let start = std::time::Instant::now();
-    let mut i: i64 = 1;
-    while i <= 10_000_000_000 {
-        let mut hasher = sha2::Sha512::new();
-        hasher.update(i.to_string().as_bytes());
-        let result = hasher.finalize();
-        if result.as_slice() == target {
-            if std::env::var("OPENKAKAO_CLI_DEBUG").is_ok() {
-                eprintln!("[local-db] SHA-512 preimage found: userId={i}");
-            }
-            return Some(i);
+    let started = std::time::Instant::now();
+    let worker_count = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(4)
+        .clamp(1, 32);
+    let next = AtomicI64::new(1);
+    let found = AtomicI64::new(0);
+    let stopped = AtomicBool::new(false);
+
+    std::thread::scope(|scope| {
+        for _ in 0..worker_count {
+            scope.spawn(|| {
+                while !stopped.load(Ordering::Relaxed)
+                    && started.elapsed() < SHA512_BRUTE_FORCE_BUDGET
+                {
+                    let chunk_start = next.fetch_add(SHA512_BRUTE_FORCE_CHUNK, Ordering::Relaxed);
+                    if chunk_start > SHA512_BRUTE_FORCE_MAX_USER_ID {
+                        return;
+                    }
+                    let chunk_end = (chunk_start + SHA512_BRUTE_FORCE_CHUNK)
+                        .min(SHA512_BRUTE_FORCE_MAX_USER_ID.saturating_add(1));
+                    for candidate in chunk_start..chunk_end {
+                        if stopped.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        let result = sha2::Sha512::digest(candidate.to_string().as_bytes());
+                        if result[..] == target {
+                            found.store(candidate, Ordering::SeqCst);
+                            stopped.store(true, Ordering::SeqCst);
+                            return;
+                        }
+                    }
+                }
+            });
         }
-        // Check the deadline periodically to keep the hot loop tight.
-        if i % 1_000_000 == 0 && start.elapsed() >= SHA512_BRUTE_FORCE_BUDGET {
-            if std::env::var("OPENKAKAO_CLI_DEBUG").is_ok()
-                || std::env::var("OPENKAKAO_RS_DEBUG").is_ok()
-            {
-                eprintln!(
-                    "[local-db] SHA-512 userId search hit {}s budget at i={}, giving up",
-                    SHA512_BRUTE_FORCE_BUDGET.as_secs(),
-                    i
-                );
-            }
-            return None;
+    });
+
+    let user_id = found.load(Ordering::SeqCst);
+    if user_id > 0 {
+        if std::env::var("OPENKAKAO_CLI_DEBUG").is_ok() {
+            eprintln!("[local-db] SHA-512 preimage found: userId={user_id}");
         }
-        i += 1;
+        Some(user_id)
+    } else {
+        if std::env::var("OPENKAKAO_CLI_DEBUG").is_ok()
+            || std::env::var("OPENKAKAO_RS_DEBUG").is_ok()
+        {
+            eprintln!(
+                "[local-db] SHA-512 userId search stopped after {}s",
+                SHA512_BRUTE_FORCE_BUDGET.as_secs()
+            );
+        }
+        None
     }
-    None
 }
 
 /// Return the userId shared by every `FSChatWindowFrame_` suffix, but only when
@@ -600,12 +959,34 @@ pub struct LocalDbReader {
     conn: Connection,
     db_path: PathBuf,
     db_identity: DatabaseIdentity,
+    account_fingerprint: String,
+    account_user_id: i64,
+}
+
+fn local_account_fingerprint(user_id: i64, uuid: &str) -> String {
+    hex::encode(sha2::Sha256::digest(
+        format!("openkakao-local-account-v1\0{uuid}\0{user_id}").as_bytes(),
+    ))
 }
 
 impl LocalDbReader {
     pub fn open() -> Result<Self> {
-        let uuid = get_platform_uuid().context("Failed to get IOPlatformUUID")?;
-        let user_id = get_user_id_from_plist().context("Failed to get KakaoTalk user ID")?;
+        Self::open_with_cache_mode(IdentityCacheMode::Normal)
+    }
+
+    pub fn open_no_mutation() -> Result<Self> {
+        Self::open_with_cache_mode(IdentityCacheMode::NoMutation)
+    }
+
+    fn open_with_cache_mode(mode: IdentityCacheMode) -> Result<Self> {
+        let uuid = if mode == IdentityCacheMode::NoMutation {
+            get_platform_uuid_without_process()
+        } else {
+            get_platform_uuid()
+        }
+        .context("Failed to get IOPlatformUUID")?;
+        let user_id =
+            get_user_id_from_plist_with_mode(mode).context("Failed to get KakaoTalk user ID")?;
 
         let db_name = derive_database_name(user_id, &uuid);
         if std::env::var("OPENKAKAO_CLI_DEBUG").is_ok() {
@@ -616,6 +997,7 @@ impl LocalDbReader {
         let db_identity = database_identity(&db_path)?;
 
         let secure_key = derive_secure_key(user_id, &uuid);
+        let account_fingerprint = local_account_fingerprint(user_id, &uuid);
 
         let conn = Connection::open_with_flags(
             &db_path,
@@ -642,7 +1024,21 @@ impl LocalDbReader {
             conn,
             db_path,
             db_identity,
+            account_fingerprint,
+            account_user_id: user_id,
         })
+    }
+
+    /// Stable opaque account identity for scoping derived local indexes.
+    /// The raw Kakao user ID and platform UUID never leave this reader.
+    pub fn account_fingerprint(&self) -> &str {
+        &self.account_fingerprint
+    }
+
+    /// Numeric Kakao account identifier used to distinguish the local user
+    /// from participants who happen to share the same display nickname.
+    pub fn account_user_id(&self) -> i64 {
+        self.account_user_id
     }
     fn ensure_database_identity(&self) -> Result<()> {
         let current = database_identity(&self.db_path)?;
@@ -717,6 +1113,7 @@ impl LocalDbReader {
                     chat_id: row.get(0)?,
                     chat_type: row.get(1)?,
                     chat_name: title,
+                    database_chat_name: None,
                     active_members_count: row.get(3).unwrap_or(0),
                     last_log_id: row.get(4).unwrap_or(0),
                     last_updated_at: row.get(5).unwrap_or(0),
@@ -726,6 +1123,64 @@ impl LocalDbReader {
             })?
             .collect::<Result<Vec<_>, _>>()?;
 
+        self.ensure_database_identity()?;
+        Ok(rows)
+    }
+
+    pub fn list_all_chats(&self) -> Result<Vec<LocalChat>> {
+        self.ensure_database_identity()?;
+        self.conn.execute_batch("BEGIN")?;
+        let result = (|| -> Result<Vec<LocalChat>> {
+            let count: i64 = self
+                .conn
+                .query_row("SELECT COUNT(*) FROM NTChatRoom", [], |row| row.get(0))?;
+            if count < 0 || count > MAX_CHAT_INDEX_ROWS as i64 {
+                anyhow::bail!(
+                    "local chat identity index exceeds the safety bound of {MAX_CHAT_INDEX_ROWS} rooms"
+                );
+            }
+            let mut stmt = self.conn.prepare(
+                "SELECT r.chatId, r.type, r.chatName, r.activeMembersCount,
+                        r.lastLogId, r.lastUpdatedAt, r.countOfNewMessage,
+                        COALESCE(u.displayName, u.friendNickName, u.nickName, '') as displayName
+                 FROM NTChatRoom r
+                 LEFT JOIN NTUser u ON r.directChatMemberUserId = u.userId AND u.linkId = 0
+                 ORDER BY r.chatId ASC",
+            )?;
+            let rows = stmt
+                .query_map([], |row| {
+                    let chat_name: String = row.get::<_, String>(2).unwrap_or_default();
+                    let display_name: String = row.get::<_, String>(7).unwrap_or_default();
+                    let title = if chat_name.is_empty() {
+                        display_name.clone()
+                    } else {
+                        chat_name
+                    };
+                    Ok(LocalChat {
+                        chat_id: row.get(0)?,
+                        chat_type: row.get(1)?,
+                        chat_name: title,
+                        database_chat_name: None,
+                        active_members_count: row.get(3).unwrap_or(0),
+                        last_log_id: row.get(4).unwrap_or(0),
+                        last_updated_at: row.get(5).unwrap_or(0),
+                        unread_count: row.get(6).unwrap_or(0),
+                        display_name,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })();
+        let rows = match result {
+            Ok(rows) => {
+                self.conn.execute_batch("COMMIT")?;
+                rows
+            }
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                return Err(error);
+            }
+        };
         self.ensure_database_identity()?;
         Ok(rows)
     }
@@ -769,12 +1224,15 @@ impl LocalDbReader {
         let mut stmt = self.conn.prepare(&sql)?;
         let params_refs: Vec<&dyn rusqlite::types::ToSql> =
             params.iter().map(|p| p.as_ref()).collect();
+        let account_user_id = self.account_user_id;
         let rows = stmt
             .query_map(params_refs.as_slice(), |row| {
+                let author_id = row.get(2).unwrap_or(0);
                 Ok(LocalMessage {
                     log_id: row.get(0)?,
                     chat_id: row.get(1)?,
-                    author_id: row.get(2).unwrap_or(0),
+                    author_id,
+                    is_self: author_id == account_user_id,
                     sender_name: row.get(3).unwrap_or_default(),
                     message: row.get(4).unwrap_or_default(),
                     attachment: row.get(5).unwrap_or_default(),
@@ -786,6 +1244,27 @@ impl LocalDbReader {
 
         self.ensure_database_identity()?;
         Ok(rows)
+    }
+
+    /// Read one exact media row without contacting Kakao servers.
+    ///
+    /// The database inode is checked before and after the query so callers do
+    /// not accidentally combine attachment metadata from different database
+    /// generations.
+    pub fn exact_media_attachment(
+        &self,
+        chat_id: i64,
+        log_id: i64,
+    ) -> Result<LocalMediaAttachment> {
+        self.ensure_database_identity()?;
+        let attachment = exact_media_attachment_from_connection(
+            &self.conn,
+            chat_id,
+            log_id,
+            self.account_user_id,
+        )?;
+        self.ensure_database_identity()?;
+        Ok(attachment)
     }
 
     pub fn search_messages(&self, query: &str, limit: usize) -> Result<Vec<LocalMessage>> {
@@ -802,12 +1281,15 @@ impl LocalDbReader {
         )?;
 
         let pattern = format!("%{}%", query);
+        let account_user_id = self.account_user_id;
         let rows = stmt
             .query_map(rusqlite::params![pattern, limit as i64], |row| {
+                let author_id = row.get(2).unwrap_or(0);
                 Ok(LocalMessage {
                     log_id: row.get(0)?,
                     chat_id: row.get(1)?,
-                    author_id: row.get(2).unwrap_or(0),
+                    author_id,
+                    is_self: author_id == account_user_id,
                     sender_name: row.get(3).unwrap_or_default(),
                     message: row.get(4).unwrap_or_default(),
                     attachment: String::new(),
@@ -817,6 +1299,44 @@ impl LocalDbReader {
             })?
             .collect::<Result<Vec<_>, _>>()?;
 
+        self.ensure_database_identity()?;
+        Ok(rows)
+    }
+
+    /// Return the current numeric author/name identities observed in one exact
+    /// room without reading message bodies. Callers use this at activation to
+    /// bind a human-readable allowlist to stable Kakao author IDs.
+    pub fn room_author_identities(&self, chat_id: i64) -> Result<Vec<LocalAuthorIdentity>> {
+        self.ensure_database_identity()?;
+        if chat_id <= 0 || chat_id == LOCAL_POLL_MAX_INT64 {
+            anyhow::bail!("room author identity chat ID must be positive");
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT m.authorId,
+                    COALESCE(u.displayName, u.friendNickName, u.nickName, '') AS senderName
+             FROM NTChatMessage m
+             LEFT JOIN NTUser u ON m.authorId = u.userId AND u.linkId = 0
+             WHERE m.chatId = ? AND m.authorId > 0 AND m.authorId < ?
+             ORDER BY m.authorId ASC, senderName ASC",
+        )?;
+        let account_user_id = self.account_user_id;
+        let rows = stmt
+            .query_map(rusqlite::params![chat_id, LOCAL_POLL_MAX_INT64], |row| {
+                let author_id = row.get::<_, i64>(0)?;
+                Ok(LocalAuthorIdentity {
+                    author_id,
+                    nickname: row.get::<_, String>(1).unwrap_or_default(),
+                    is_self: author_id == account_user_id,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        if rows.iter().any(|item| {
+            item.author_id <= 0
+                || item.author_id == LOCAL_POLL_MAX_INT64
+                || item.nickname.len() > LOCAL_POLL_MAX_FIELD_BYTES
+        }) {
+            anyhow::bail!("room author identity row is invalid");
+        }
         self.ensure_database_identity()?;
         Ok(rows)
     }
@@ -906,6 +1426,7 @@ impl LocalDbReader {
                     chat_id: row.get(0)?,
                     chat_type: row.get(1)?,
                     chat_name: title,
+                    database_chat_name: None,
                     active_members_count: row.get(3).unwrap_or(0),
                     last_log_id: row.get(4).unwrap_or(0),
                     last_updated_at: row.get(5).unwrap_or(0),
@@ -922,34 +1443,30 @@ impl LocalDbReader {
 
         let limit = limit.min(LOCAL_POLL_MAX_ROWS);
         let (total_rows, available_max): (i64, Option<i64>) = tx.query_row(
-            "SELECT COUNT(*), MAX(m.logId)
-             FROM NTChatMessage m
-             WHERE m.chatId = ? AND m.logId > ?",
-            rusqlite::params![chat_id, after_log_id],
+            LOCAL_POLL_ROW_STATS_SQL,
+            rusqlite::params![chat_id, after_log_id, LOCAL_CONVERSATION_MESSAGE_TYPE_MIN],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
         if available_max == Some(LOCAL_POLL_MAX_INT64) {
             anyhow::bail!("reconcile_required");
         }
 
-        let mut stmt = tx.prepare(
-            "SELECT m.logId, m.chatId, m.authorId,
-                    COALESCE(u.displayName, u.friendNickName, u.nickName, '') as senderName,
-                    COALESCE(m.message, '') as message,
-                    COALESCE(m.attachment, '') as attachment, m.type, m.sentAt
-             FROM NTChatMessage m
-             LEFT JOIN NTUser u ON m.authorId = u.userId AND u.linkId = 0
-             WHERE m.chatId = ? AND m.logId > ?
-             ORDER BY m.logId ASC, m.sentAt ASC
-             LIMIT ?",
-        )?;
+        let mut stmt = tx.prepare(LOCAL_POLL_ROWS_SQL)?;
+        let account_user_id = self.account_user_id;
         let rows = stmt.query_map(
-            rusqlite::params![chat_id, after_log_id, limit as i64],
+            rusqlite::params![
+                chat_id,
+                after_log_id,
+                LOCAL_CONVERSATION_MESSAGE_TYPE_MIN,
+                limit as i64
+            ],
             |row| {
+                let author_id = row.get(2).unwrap_or(0);
                 Ok(LocalMessage {
                     log_id: row.get(0)?,
                     chat_id: row.get(1)?,
-                    author_id: row.get(2).unwrap_or(0),
+                    author_id,
+                    is_self: author_id == account_user_id,
                     sender_name: row.get(3).unwrap_or_default(),
                     message: row.get(4).unwrap_or_default(),
                     attachment: row.get(5).unwrap_or_default(),
@@ -1027,6 +1544,47 @@ impl LocalDbReader {
         Ok(envelope)
     }
 }
+
+fn exact_media_attachment_from_connection(
+    connection: &Connection,
+    chat_id: i64,
+    log_id: i64,
+    account_user_id: i64,
+) -> Result<LocalMediaAttachment> {
+    if chat_id <= 0 || chat_id == LOCAL_POLL_MAX_INT64 {
+        anyhow::bail!("local media chat ID must be positive");
+    }
+    if log_id <= 0 || log_id == LOCAL_POLL_MAX_INT64 {
+        anyhow::bail!("local media log ID must be positive");
+    }
+    let row = connection
+        .query_row(
+            "SELECT chatId, logId, authorId, type, COALESCE(attachment, '')
+             FROM NTChatMessage
+             WHERE chatId = ? AND logId = ?
+             LIMIT 1",
+            rusqlite::params![chat_id, log_id],
+            |row| {
+                Ok(LocalMediaAttachment {
+                    chat_id: row.get(0)?,
+                    log_id: row.get(1)?,
+                    author_id: row.get(2).unwrap_or(0),
+                    is_self: row.get::<_, i64>(2).unwrap_or(0) == account_user_id,
+                    message_type: row.get(3).unwrap_or(0),
+                    attachment: row.get(4).unwrap_or_default(),
+                })
+            },
+        )
+        .optional()?
+        .with_context(|| "Exact local media message was not found")?;
+    if row.chat_id != chat_id || row.log_id != log_id {
+        anyhow::bail!("Exact local media identity mismatch");
+    }
+    if row.attachment.is_empty() {
+        anyhow::bail!("Exact local media message has no attachment");
+    }
+    Ok(row)
+}
 #[derive(Debug, Serialize)]
 pub struct LocalDbStatus {
     pub uuid_available: bool,
@@ -1040,6 +1598,156 @@ pub struct LocalDbStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn local_media_test_connection() -> Connection {
+        let connection = Connection::open_in_memory().expect("open in-memory database");
+        connection
+            .execute_batch(
+                "CREATE TABLE NTChatMessage(
+                    chatId INTEGER NOT NULL,
+                    logId INTEGER NOT NULL,
+                    authorId INTEGER NOT NULL,
+                    type INTEGER NOT NULL,
+                    attachment TEXT
+                );
+                INSERT INTO NTChatMessage(chatId, logId, authorId, type, attachment)
+                VALUES (42, 100, 700, 2, '{\"k\":\"safe/photo.jpg\"}');
+                INSERT INTO NTChatMessage(chatId, logId, authorId, type, attachment)
+                VALUES (43, 100, 701, 2, '{\"k\":\"other/photo.jpg\"}');
+                INSERT INTO NTChatMessage(chatId, logId, authorId, type, attachment)
+                VALUES (42, 101, 700, 1, '');",
+            )
+            .expect("create exact-media fixture");
+        connection
+    }
+
+    fn local_poll_control_row_test_connection() -> Connection {
+        let connection = Connection::open_in_memory().expect("open in-memory database");
+        connection
+            .execute_batch(
+                "CREATE TABLE NTUser(
+                    userId INTEGER NOT NULL,
+                    linkId INTEGER NOT NULL,
+                    displayName TEXT,
+                    friendNickName TEXT,
+                    nickName TEXT
+                );
+                CREATE TABLE NTChatMessage(
+                    chatId INTEGER NOT NULL,
+                    logId INTEGER NOT NULL,
+                    authorId INTEGER NOT NULL,
+                    message TEXT,
+                    attachment TEXT,
+                    type INTEGER NOT NULL,
+                    sentAt INTEGER NOT NULL
+                );
+                INSERT INTO NTChatMessage
+                    (chatId, logId, authorId, message, attachment, type, sentAt)
+                VALUES (42, 100, 700, 'visible', '', 1, 1000);
+                INSERT INTO NTChatMessage
+                    (chatId, logId, authorId, message, attachment, type, sentAt)
+                VALUES (42, 101, 700, 'edited-control', '', 0, 1001);
+                INSERT INTO NTChatMessage
+                    (chatId, logId, authorId, message, attachment, type, sentAt)
+                VALUES (42, 102, 700, 'internal-control', '', -1, 1002);
+                INSERT INTO NTChatMessage
+                    (chatId, logId, authorId, message, attachment, type, sentAt)
+                VALUES (43, 200, 700, 'visible', '', 1, 2000);
+                INSERT INTO NTChatMessage
+                    (chatId, logId, authorId, message, attachment, type, sentAt)
+                VALUES (43, 201, 700, 'edited-control', '', 0, 2001);
+                INSERT INTO NTChatMessage
+                    (chatId, logId, authorId, message, attachment, type, sentAt)
+                VALUES (43, 202, 701, 'next-visible', '', 1, 2002);",
+            )
+            .expect("create local-poll control-row fixture");
+        connection
+    }
+
+    #[test]
+    fn local_poll_queries_ignore_nonpositive_control_rows_above_conversation_tail() {
+        let connection = local_poll_control_row_test_connection();
+        let (control_only_count, control_only_max): (i64, Option<i64>) = connection
+            .query_row(
+                LOCAL_POLL_ROW_STATS_SQL,
+                rusqlite::params![42_i64, 100_i64, LOCAL_CONVERSATION_MESSAGE_TYPE_MIN],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("control-only stats query");
+        assert_eq!((control_only_count, control_only_max), (0, None));
+
+        let mut control_only = connection
+            .prepare(LOCAL_POLL_ROWS_SQL)
+            .expect("prepare control-only row query");
+        let control_only_ids = control_only
+            .query_map(
+                rusqlite::params![
+                    42_i64,
+                    100_i64,
+                    LOCAL_CONVERSATION_MESSAGE_TYPE_MIN,
+                    200_i64
+                ],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("query control-only rows")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect control-only rows");
+        assert!(control_only_ids.is_empty());
+
+        let (visible_count, visible_max): (i64, Option<i64>) = connection
+            .query_row(
+                LOCAL_POLL_ROW_STATS_SQL,
+                rusqlite::params![43_i64, 200_i64, LOCAL_CONVERSATION_MESSAGE_TYPE_MIN],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("mixed stats query");
+        assert_eq!((visible_count, visible_max), (1, Some(202)));
+
+        let mut mixed = connection
+            .prepare(LOCAL_POLL_ROWS_SQL)
+            .expect("prepare mixed row query");
+        let mixed_ids = mixed
+            .query_map(
+                rusqlite::params![
+                    43_i64,
+                    200_i64,
+                    LOCAL_CONVERSATION_MESSAGE_TYPE_MIN,
+                    200_i64
+                ],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("query mixed rows")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect mixed rows");
+        assert_eq!(mixed_ids, vec![202]);
+    }
+
+    #[test]
+    fn exact_local_media_lookup_binds_chat_log_and_author() {
+        let connection = local_media_test_connection();
+        let row = exact_media_attachment_from_connection(&connection, 42, 100, 900)
+            .expect("exact row should resolve");
+        assert_eq!(row.chat_id, 42);
+        assert_eq!(row.log_id, 100);
+        assert_eq!(row.author_id, 700);
+        assert!(!row.is_self);
+        assert_eq!(row.message_type, 2);
+        assert!(row.attachment.contains("photo.jpg"));
+
+        let self_row = exact_media_attachment_from_connection(&connection, 42, 100, 700)
+            .expect("self identity should be classified");
+        assert!(self_row.is_self);
+    }
+
+    #[test]
+    fn exact_local_media_lookup_rejects_cross_room_missing_and_empty_rows() {
+        let connection = local_media_test_connection();
+        assert!(exact_media_attachment_from_connection(&connection, 42, 999, 900).is_err());
+        assert!(exact_media_attachment_from_connection(&connection, 44, 100, 900).is_err());
+        assert!(exact_media_attachment_from_connection(&connection, 42, 101, 900).is_err());
+        assert!(exact_media_attachment_from_connection(&connection, 0, 100, 900).is_err());
+        assert!(exact_media_attachment_from_connection(&connection, 42, 0, 900).is_err());
+    }
 
     #[test]
     fn pbkdf2_sha256_produces_expected_length() {
@@ -1116,6 +1824,162 @@ mod tests {
     fn sha512_recovery_rejects_malformed_hash() {
         assert_eq!(recover_user_id_from_sha512("not-a-hash"), None);
     }
+
+    #[test]
+    fn chat_selectors_support_ids_names_repetition_and_escaping() {
+        let values = vec![
+            "id:42,name:Ops\\, West".to_string(),
+            "42".to_string(),
+            "name:Ops\\\\ West".to_string(),
+        ];
+        let selectors = parse_chat_selectors(&values).expect("selectors parse");
+        assert_eq!(
+            selectors,
+            vec![
+                ChatSelector::Id(42),
+                ChatSelector::Name("Ops, West".to_string()),
+                ChatSelector::Id(42),
+                ChatSelector::Name("Ops\\ West".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn bound_selector_supplies_an_exact_ax_name_for_unnamed_group_room() {
+        let selectors = parse_chat_selectors(&["bind:42:부자멘토멘티".to_string()])
+            .expect("bound selector parses");
+        assert_eq!(
+            selectors,
+            vec![ChatSelector::Binding {
+                id: 42,
+                name: "부자멘토멘티".to_string(),
+            }]
+        );
+        let chats = vec![LocalChat {
+            chat_id: 42,
+            chat_type: 1,
+            chat_name: String::new(),
+            database_chat_name: None,
+            active_members_count: 5,
+            last_log_id: 7,
+            last_updated_at: 100,
+            unread_count: 0,
+            display_name: String::new(),
+        }];
+        assert!(resolve_chat_selectors(&chats, &[ChatSelector::Id(42)]).is_err());
+        let resolved = resolve_chat_selectors(&chats, &selectors).expect("binding resolves");
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].chat_id, 42);
+        assert_eq!(resolved[0].chat_name, "부자멘토멘티");
+    }
+
+    #[test]
+    fn system_rooms_do_not_poison_positive_chat_resolution() {
+        let chats = vec![
+            LocalChat {
+                chat_id: 0,
+                chat_type: 9999,
+                chat_name: String::new(),
+                database_chat_name: None,
+                active_members_count: 0,
+                last_log_id: 0,
+                last_updated_at: 0,
+                unread_count: 0,
+                display_name: String::new(),
+            },
+            LocalChat {
+                chat_id: 42,
+                chat_type: 1,
+                chat_name: "target".to_string(),
+                database_chat_name: None,
+                active_members_count: 2,
+                last_log_id: 7,
+                last_updated_at: 100,
+                unread_count: 0,
+                display_name: String::new(),
+            },
+        ];
+        let resolved = resolve_chat_selectors(&chats, &[ChatSelector::Id(42)])
+            .expect("system rooms are ignored");
+        assert_eq!(resolved[0].chat_id, 42);
+    }
+
+    #[test]
+    fn bound_selector_rejects_a_conflicting_local_name() {
+        let chats = vec![LocalChat {
+            chat_id: 42,
+            chat_type: 1,
+            chat_name: "different-room".to_string(),
+            database_chat_name: None,
+            active_members_count: 5,
+            last_log_id: 7,
+            last_updated_at: 100,
+            unread_count: 0,
+            display_name: String::new(),
+        }];
+        assert!(resolve_chat_selectors(
+            &chats,
+            &[ChatSelector::Binding {
+                id: 42,
+                name: "부자멘토멘티".to_string(),
+            }],
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn chat_selector_rejects_dangling_and_unknown_escapes() {
+        assert!(parse_chat_selectors(&["name:abc\\".to_string()]).is_err());
+        assert!(parse_chat_selectors(&["name:abc\\q".to_string()]).is_err());
+        assert!(parse_chat_selectors(&["name:".to_string()]).is_err());
+    }
+
+    #[test]
+    fn id_resolution_rejects_unselected_ax_name_collision() {
+        let chat = |id: i64, name: &str| LocalChat {
+            chat_id: id,
+            chat_type: 1,
+            chat_name: name.to_string(),
+            database_chat_name: None,
+            active_members_count: 2,
+            last_log_id: 0,
+            last_updated_at: 0,
+            unread_count: 0,
+            display_name: String::new(),
+        };
+        let chats = vec![chat(42, "same"), chat(99, "same")];
+        assert!(resolve_chat_selectors(&chats, &[ChatSelector::Id(42)]).is_err());
+    }
+
+    #[test]
+    fn name_resolution_deduplicates_in_first_occurrence_order() {
+        let chat = |id: i64, name: &str| LocalChat {
+            chat_id: id,
+            chat_type: 1,
+            chat_name: name.to_string(),
+            database_chat_name: None,
+            active_members_count: 2,
+            last_log_id: 0,
+            last_updated_at: 0,
+            unread_count: 0,
+            display_name: String::new(),
+        };
+        let chats = vec![chat(42, "first"), chat(99, "second")];
+        let result = resolve_chat_selectors(
+            &chats,
+            &[
+                ChatSelector::Name("second".to_string()),
+                ChatSelector::Id(42),
+                ChatSelector::Name("second".to_string()),
+            ],
+        )
+        .expect("names resolve");
+        assert_eq!(
+            result.iter().map(|chat| chat.chat_id).collect::<Vec<_>>(),
+            vec![99, 42]
+        );
+    }
+
     #[test]
     fn local_poll_envelope_is_versioned_and_bounded_shape() {
         let envelope = LocalPollEnvelope {
@@ -1124,6 +1988,7 @@ mod tests {
                 chat_id: 42,
                 chat_type: 1,
                 chat_name: "target".to_string(),
+                database_chat_name: None,
                 active_members_count: 2,
                 last_log_id: 7,
                 last_updated_at: 100,
@@ -1154,5 +2019,43 @@ mod tests {
         assert!(object.contains_key("messages"));
         assert!(object.contains_key("completeness"));
         assert_eq!(value["schema_version"], LOCAL_POLL_SCHEMA_VERSION);
+        assert_eq!(LOCAL_POLL_SCHEMA_VERSION, 3);
+    }
+
+    #[test]
+    fn local_message_serializes_numeric_self_classification() {
+        let self_message = LocalMessage {
+            log_id: 7,
+            chat_id: 42,
+            author_id: 900,
+            is_self: true,
+            sender_name: "shared-name".to_string(),
+            message: String::new(),
+            attachment: String::new(),
+            message_type: 1,
+            sent_at: 100,
+        };
+        let other_message = LocalMessage {
+            author_id: 901,
+            is_self: false,
+            ..self_message.clone()
+        };
+        let self_value = serde_json::to_value(self_message).expect("self row serializes");
+        let other_value = serde_json::to_value(other_message).expect("other row serializes");
+        assert_eq!(self_value["sender_name"], other_value["sender_name"]);
+        assert_eq!(self_value["is_self"], true);
+        assert_eq!(other_value["is_self"], false);
+    }
+
+    #[test]
+    fn local_account_fingerprint_is_stable_and_account_scoped() {
+        let first = local_account_fingerprint(42, "device-a");
+        assert_eq!(first, local_account_fingerprint(42, "device-a"));
+        assert_ne!(first, local_account_fingerprint(43, "device-a"));
+        assert_ne!(first, local_account_fingerprint(42, "device-b"));
+        assert_eq!(first.len(), 64);
+        assert!(first.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert!(!first.contains("42"));
+        assert!(!first.contains("device-a"));
     }
 }

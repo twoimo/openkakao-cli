@@ -27,7 +27,7 @@
 
 > [!NOTE]
 > 서버 로그인(`login --save`/`login --manual`)은 최근 KakaoTalk macOS 빌드에서 대부분 동작하지 않습니다 ([#15](https://github.com/JungHoonGhae/openkakao-cli/issues/15), [#20](https://github.com/JungHoonGhae/openkakao-cli/issues/20), [#22](https://github.com/JungHoonGhae/openkakao-cli/issues/22)). **미등록 기기로 로그인을 반복 시도하지 마세요** — 카카오가 계정의 "서브 디바이스 로그인"을 차단하거나 계정을 제재할 수 있습니다(실제 피해 사례가 보고되었습니다). 로컬 SQLCipher DB(`local-chats`/`local-read`/`local-search`)도 최신 빌드에서 키 유도 공식이 어긋나 신뢰할 수 없습니다 — 대신 `ax-read`를 쓰세요.
-> Bujamentor unattended auto-reply is a separate database-authoritative safety mode. A DB key/account identity mismatch, an unverified target chat ID, or missing launchd registration is **fenced and unsupported, not ready**. Do not infer readiness from a running process, a successful binary probe, or an installed-looking plist.
+> Bujamentor unattended auto-reply는 별도의 database-authoritative 안전 모드입니다. DB key/account identity 불일치나 검증되지 않은 target chat ID는 **fenced and unsupported, not ready**입니다. 로그인 세션 지속 운영에서는 monitor LaunchAgent 등록, 해시로 고정된 Terminal command, Terminal-hosted session watchdog, identity-bound preflight receipt를 모두 확인해야 하며, 실행 중인 프로세스·성공한 binary probe·겉보기 plist만으로 readiness를 추정하지 않습니다.
 
 > [!WARNING]
 > 이 프로젝트는 카카오(Kakao Corp.)와 무관한 비공식 CLI입니다. 연구, 자동화, 로컬 워크플로 용도로 만들었고, 카카오의 승인이나 보증을 받지 않았습니다.
@@ -122,8 +122,9 @@ openkakao-cli context-reply-search "지난번 세금 일정" \
 `--mode keyword`, `--mode vector`, `--mode hybrid`를 선택할 수 있으며, `--db /path/to/index.sqlite3`로 인덱스 위치를 지정할 수 있습니다. 기본 인덱스는 macOS 로컬 데이터 디렉터리의 `openkakao/context.sqlite3`입니다.
 인덱스는 기본적으로 사용자 전용 권한으로 저장되며, `--db` 사용자 지정 경로는 해당 경로의 파일 권한과 백업 정책을 직접 관리해야 합니다. 같은 표시 이름의 여러 CSV를 함께 검색하지 않으려면 인덱싱한 CSV의 절대 경로를 `--source`로 지정합니다.
 읽기 경로는 누락되거나 오래된 FTS 인덱스를 자동 재생성하지 않습니다. `context retrieval index migration required; run context-index` 오류가 나오면 먼저 명시적인 `context-index` 유지보수를 실행하세요.
-`context-response-time`은 평균·중앙값·p90·표준편차를 함께 보관합니다. 자동 답변 워커는 이 통계로 채팅방별 bounded normal 샘플을 뽑아 답변 시점을 정하고, `reply_decisions` 벡터 테이블에 답변/보류 결정·근거·유사도·전송 상태를 기록해 유사 메시지의 중복 답변을 줄입니다. 모든 검색과 결정 기록은 로컬에서 처리됩니다.
-`context-style-search`는 최연우의 일반 대화 말투만 별도 벡터 테이블에 보관합니다. 링크·숫자·목록·다중 행·긴 정보 전달문·복사/요약 표식이 있는 메시지는 맥락 검색에는 남기되 말투 학습에서는 제외합니다.
+`context-response-time`은 평균·중앙값·p90·표준편차와 함께 버전이 지정된 응답시간 혼합분포를 보관합니다. 응답 표본의 `log1p` 간격을 세 군집으로 나누고, 즉답형·단기형·지연형 중 하나를 실제 표본 비율로 선택한 뒤 해당 구간 안에서 bounded Gaussian을 뽑습니다. 상한은 방별 경험적 p90이며, 선택한 성분·분포 버전·예약 시각은 한 번만 내구 저장되어 재시작 때 다시 추첨하지 않습니다. 지연 중 대화가 다음 메시지로 진행되면 오래된 일반 메시지를 보내지 않고 구조화된 `conversation_advanced` 보류로 종결합니다. 따라서 하나의 고정 평균이나 평균 중심의 단일 정규분포로 답하지 않습니다. `reply_decisions` 벡터 테이블에는 답변/보류 결정·근거·분류·유사도·예약/전송 상태를 구조화해 기록하고, 유사하게 보류했던 메시지와 이미 처리한 메시지에 중복 답변하지 않도록 사용합니다.
+`context-style-search`는 최연우의 일반 대화 말투만 별도 벡터 테이블에 보관합니다. 링크·숫자·목록·다중 행·긴 정보 전달문·복사/요약 표식이 있는 메시지는 맥락 검색에는 남기되 말투 학습에서는 제외합니다. 자동 답변에서는 수신자와 바로 이어진 최연우 답변을 별도로 집계해 수신자별 존댓말/반말·길이·종결·구두점 프로필을 우선 사용하고, 직접 표본이 3개 미만이거나 신뢰도 합이 2 미만이면 방 전체 프로필로 명시적으로 fallback합니다.
+포그라운드/Terminal-hosted 세션 자동 답변이 시작되면 로컬 KakaoTalk DB 전체를 최초 1회 backfill한 뒤 60초마다 증분 동기화합니다. 계정 fingerprint·채팅방 ID·checkpoint에 묶인 source가 끝까지 완전하게 처리된 경우에만 authoritative로 승격하며, 동기화가 누락·시간 초과·불일치하면 오래된 인덱스로 계속 답하지 않고 delivery를 fenced합니다. 확정된 자동 생성 자기 메시지는 학습 표본에서 제외됩니다. 이 맥락 검색·결정 기록은 로컬에서 처리되지만, Codex 답변 생성에는 아래의 명시적인 원격 egress 설정이 적용됩니다.
 ### 서버 로그인 기반 (현재 대부분 깨짐)
 
 ```bash
@@ -226,27 +227,102 @@ allowed_send_chats = ["나와의 채팅에 표시되는 이름", "다른 허용 
 
 자동 미디어 답변은 `database_authoritative` 모드에서만 운영합니다. `supervisor-status.json`의 `readiness=ready`는 다음을 모두 증명할 때만 게시됩니다:
 
-1. 운영자가 양의 정수 `target_chat_id`를 `[bujamentor]` 설정 또는 `OPENKAKAO_TARGET_CHAT_ID`로 고정했고, DB에서 정확히 같은 대상 하나가 확인됩니다.
+1. 운영자가 CLI `--chat id:<positive-id>` 또는 exact `name:<name>` selector로 대상을 고정했고, 전체 local DB identity index에서 정확히 같은 대상 하나가 확인됩니다.
 2. DB source epoch와 owner가 현재 supervisor owner lock과 일치하고, DB state의 `capability_state=ready`, `delivery_enabled=true`, `fence=ready` 및 fresh heartbeat가 확인됩니다.
 3. AX observer, DB watcher, reply worker의 child PID가 살아 있고 heartbeat가 fresh합니다. AX는 `allow_send=false` 및 `delivery_state=fenced_db_authoritative`인 관찰 전용 상태여야 합니다.
 4. DB probe/read/media/cursor, pending gap/watermark, 두 opt-in과 모델 privacy attestation이 모두 통과합니다.
 `acked_watermark`는 outbox의 `accepted`, `duplicate`, 또는 내구성 있는 정책 `skipped` ACK 뒤에만 전진하며, DB watcher가 내보내는 이벤트 ID는 `db:<chat_id>:<log_id>`로 고정됩니다.
 
-DB key/account identity mismatch, target chat ID 불일치, owner/epoch 불일치, child exit/EOF 또는 stale heartbeat는 모두 **fenced/unsupported, not ready**입니다. launchd가 등록되지 않았거나 exact label을 확인할 수 없는 경우도 launchd 운영에서는 **fenced/unsupported, not ready**이며, 이 문서는 launchd가 설치되었다고 주장하지 않습니다. `launchctl print` 확인과 등록은 운영자가 별도로 수행해야 합니다.
+DB key/account identity mismatch, target chat ID 불일치, owner/epoch 불일치, child exit/EOF 또는 stale heartbeat는 모두 **fenced/unsupported, not ready**입니다. 로그인 세션 지속 운영에서는 exact monitor label이 등록되지 않았거나, command hash가 달라졌거나, Terminal-hosted watchdog owner lock/heartbeat를 확인할 수 없어도 **fenced/unsupported, not ready**입니다. 이 문서는 monitor가 설치되었다고 주장하지 않으며, `launchctl print`와 두 status 파일을 운영자가 별도로 확인해야 합니다.
 
 전송 결과가 불확실하면 delivery를 중지하고 수동 조정 후 새 epoch와 명시적 `ready` 승인이 필요합니다. AX watcher는 읽기 전용 enrichment일 뿐이며 **automatic AX fallback은 없습니다**. DB가 unavailable이면 자동 답변은 재전송하지 않고 fenced 상태에 머뭅니다.
 
-Unattended worker는 일반 `allow_ax_send`와 별도로 `allow_bujamentor_auto_reply = true`가 필요하며, 기존 exact chat allowlist와 author 정책도 그대로 적용됩니다. 모델은 `model.privacy_mode = "local"`처럼 명시해야 하며, 알 수 없는 모드는 fail-closed입니다. `remote_explicit`은 `allow_egress`, provider, retention을 모두 명시해야 합니다. “no-server”는 모델/site egress가 없다는 뜻이 아닙니다.
+Unattended worker는 일반 `allow_ax_send`와 별도로 `allow_bujamentor_auto_reply = true`가 필요하며, 기존 exact chat allowlist와 author 정책도 그대로 적용됩니다. Codex 경로는 `model.privacy_mode = "remote_explicit"`, `allow_egress = true`, `provider = "openai-codex"`, retention을 모두 명시해야 하며 알 수 없는 값은 fail-closed입니다. “로컬 DB 기반”은 답변 생성의 모델 egress가 없다는 뜻이 아닙니다.
 `최연우` 이름으로 들어온 메시지는 답변 대상에서 제외하고, 채팅방 맥락 검색에만 사용합니다. 다른 참여자 메시지만 reply decision과 지연 샘플링을 거쳐 자동 답변합니다.
-The supervisor also takes an exclusive owner lock so launchd/manual starts cannot run two reply workers. Its atomic status contains the owner identity, database-authoritative mode, source epoch, child PIDs/heartbeats, watcher fence state, target chat ID, and readiness; a collision fails closed. These markers are required by the final unattended sender in addition to both opt-ins and the privacy attestation.
-자동 답변은 단순히 최연우 문장을 복사하지 않습니다. `context-index`가 일반 대화형 문장만 `style_eligible`로 분류하고, 장문·URL·목록·공지·복사 정보는 제외한 뒤 `choi_yeonwoo_style_profile`에 길이·문장 종결·질문·이모지·구두점 통계를 저장합니다. DB watcher는 현재 메시지와 직전 대화 최대 12개를 함께 전달하며, 모델은 스타일 근거를 사실 근거와 분리해 사용합니다. 이는 관찰된 말투의 검색 기반 근사이며 사람의 정체성이나 저작자를 보장하는 복제는 아닙니다.
-최신 KakaoTalk 빌드에서는 DB의 `chat_name`이 비어 있을 수 있으므로 자동 답변 대상은 이름 검색으로 추정하지 않습니다. 이 경우 `~/.config/openkakao/config.toml`에 운영자가 확인한 단일 DB ID를 명시합니다:
-```toml
-[bujamentor]
-target_chat_id = 123456789
+supervisor는 exclusive owner lock을 잡아 Terminal 세션 watchdog과 수동 실행이 두 reply worker를 동시에 띄우지 못하게 합니다. session watchdog도 state root별 owner lock을 잡으므로 monitor가 같은 세션을 중복 실행하지 못합니다. atomic status에는 owner identity, database-authoritative mode, source epoch, child PID/heartbeat, watcher fence, target chat ID와 readiness가 들어가며 충돌은 fail-closed입니다. 최종 unattended sender는 두 opt-in과 privacy attestation에 더해 이 marker를 모두 확인합니다.
+자동 답변은 최연우 문장을 그대로 복사하지 않습니다. `context-index`가 일반 대화형 문장만 `style_eligible`로 분류하고, 장문·URL·목록·공지·복사 정보는 제외한 뒤 길이·문장 종결·질문·이모지·구두점 통계를 저장합니다. DB watcher는 현재 메시지와 직전 대화 최대 12개를 함께 전달하며, 모델은 사실 근거와 말투 근거를 분리합니다. 같은 작성자가 8초 안에 연속으로 보낸 메시지는 최대 6개까지 하나의 burst로 합치고 앞선 job을 내구성 있게 supersede해 줄마다 여러 번 답하지 않습니다. `AI`, `봇`, `자동 답변` 여부를 직접 묻는 메시지는 자동으로 답하지 않고 `identity_question_requires_owner`로 기록해 계정 소유자가 직접 답하게 합니다. 이는 관찰된 말투의 검색 기반 근사이며 사람의 정체성이나 저작자를 보장하는 복제가 아닙니다.
+
+#### CLI로 한 개 또는 여러 채팅방 활성화
+
+자동 답변을 명시적으로 시작할 때는 다음 명령을 사용합니다. 이 명령은 포그라운드에서만 실행되며 `Ctrl-C`로 소유한 워커를 종료합니다.
+
+```bash
+# 시작 전 대상·권한·DB 매핑만 확인 (프로세스/파일/전송 없음)
+openkakao-cli auto-reply --chat 'name:부자멘토멘티' --check --json
+
+# 채팅방 ID 하나 지정
+openkakao-cli auto-reply --chat id:417780809780519
+
+# 그룹방 이름이 로컬 DB에서 비어 있으면 열린 정확한 AX 창과 대조해 결합
+openkakao-cli auto-reply --chat 'bind:417780809780519:부자멘토멘티'
+
+# 여러 채팅방: --chat 반복 또는 이스케이프되지 않은 쉼표
+openkakao-cli auto-reply \
+  --chat 'name:부자멘토멘티' \
+  --chat 'id:123456789'
+openkakao-cli auto-reply \
+  --chat 'name:부자멘토멘티,id:123456789'
+# 설정 파일 대신 이번 실행에서만 닉네임·답변 허용자를 지정
+openkakao-cli auto-reply \
+  --chat 'name:부자멘토멘티' \
+  --self-nickname '내 닉네임' \
+  --reply-author '허용할 참여자'
 ```
-supervisor는 이 ID를 `OPENKAKAO_TARGET_CHAT_ID`로 전달하고, DB watcher는 해당 ID가 정확히 하나일 때만 `부자멘토멘티`로 정규화합니다. ID가 없거나 중복·변경되면 계속 fenced 상태를 유지합니다.
+
+`id:`는 로컬 DB의 양의 정수 ID, `name:`은 정확한 채팅방 이름입니다. 카카오톡이 그룹방 이름을 로컬 DB에 비워둔 경우에만 `bind:<id>:<exact-name>`을 사용합니다. 이 형식은 이미 열린 정확한 제목의 유일한 AX 창과 로컬 DB의 최신 메시지 접미사를 읽기 전용으로 대조하고, 해시된 증거가 일치할 때만 이름을 결합합니다. 이름이 여러 ID에 매핑되거나 ID의 AX 이름이 중복이면 전체 시작이 거부됩니다. CLI의 `--chat` 값은 `[bujamentor].chats`보다 우선하며, 쉼표가 포함된 이름은 `\,`으로 이스케이프합니다. `bind:`를 사용한 `--check`는 시작 때와 같은 읽기 전용 transcript attestation을 수행하므로 정확한 AX 창 하나가 이미 열려 있어야 합니다. 그 밖의 selector에서 `--check`가 성공해도 AX 가시성은 실행 시점에 다시 확인되며, 창이 없으면 해당 방은 fenced 상태로 유지됩니다. 일반 `allow_loco_write` 권한만으로는 이 AX 자동 답변이 활성화되지 않습니다.
+
+```toml
+[safety]
+allow_ax_send = true
+allowed_send_chats = ["부자멘토멘티"]
+allow_bujamentor_auto_reply = true
+
+[model]
+privacy_mode = "remote_explicit"
+allow_egress = true
+provider = "openai-codex"
+retention = "provider-policy"
+
+[bujamentor]
+chats = ["bind:417780809780519:부자멘토멘티", "id:123456789"]
+self_nickname = "내 닉네임"
+reply_authors = ["허용할 참여자"]
+python_interpreter = "/실제/CPython-3.11-3.13/bin/python3"
+reply_runner = "/opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex"
+reply_runner_kind = "codex"
+reply_model = "gpt-5.6-luna"
+reply_reasoning_effort = "max"
+reply_service_tier = "priority" # Codex Fast mode
+reply_codex_home = "/Users/me/Library/Application Support/openkakao/bujamentor/codex-home"
+allow_image_analysis = true # 허용된 방의 이미지 바이트를 Luna에 보내는 별도 opt-in
+
+[bujamentor.room_reply_authors]
+"417780809780519" = ["문승현", "현준"]
+"123456789" = ["다른방 참여자"]
+```
+
+`[bujamentor.room_reply_authors]`의 key는 canonical positive chat ID여야 하며, 각 exact 방 설정이 legacy 전역 `reply_authors`보다 우선합니다. 선택한 방에 exact 설정이 없을 때만 전역 목록을 fallback으로 쓰고, 현재 선택하지 않은 방의 key가 있거나 어느 선택 방에도 유효한 목록이 없으면 시작을 거부합니다. CLI에서 반복한 `--reply-author`는 이번 실행의 모든 선택 방에 동일하게 적용되며 방별 설정을 대체합니다.
+
+`allow_image_analysis = true`는 텍스트 원격 egress와 별개의 명시적 이미지 opt-in입니다. 활성화하면 인가된 발신자의 정확한 로컬 DB `(chat_id, log_id, author_id)` 첨부만 카카오 CDN에서 제한된 크기로 가져와 검증한 뒤 Luna에 전달합니다. 단일 사진과 최대 10장의 묶음 사진을 지원하며, 묶음은 개수·순서·크기·형식·해시가 모두 일치할 때만 전부 전달됩니다. 한 장이라도 누락·변조·초과되면 모델을 호출하지 않습니다. DB-authoritative 모드에서는 화면 캡처로 대체하지 않고, 분석이 끝나거나 terminal 결과가 나면 임시 파일과 경로 capability를 정리합니다. 이 옵션이 없거나 `false`이면 이미지 바이트를 가져오거나 모델에 보내지 않고 `image_analysis_not_opted_in`으로 건너뜁니다.
+
+`reply_runner`는 Node wrapper가 아니라 설치된 플랫폼의 native Codex 실행 파일이어야 합니다(Intel Mac은 경로의 플랫폼 부분이 다릅니다). `reply_codex_home`은 mode `0700`의 전용 디렉터리이고 그 안의 `auth.json`도 사용자 전용 `0600` 파일이어야 합니다. 이 격리된 홈은 일반 Codex 설정·plugin·skill이 자동 답변에 섞이지 않도록 하며, 시작 시 runner version·SHA-256과 위 모델/추론/tier 조합을 고정해 검증합니다.
+
+Luna 호출 상태의 단일 권한은 Bujamentor state root의 private mode-`0600` `model-circuit.sqlite3`입니다. 같은 계정/state root의 모든 방 worker가 runner 종류·model·추론·service tier 조합별 durable lease와 cooldown을 공유하므로, 동시에 여러 방을 운영해도 한 방의 in-flight 호출·rate limit·사용량 한도·quota 소진을 다른 방이 즉시 따릅니다. 일시적인 rate limit은 공급자의 `Retry-After`를 최소 대기시간으로 존중하고 제한된 지수 backoff와 jitter를 더하며, 사용량 한도는 최소 6시간(반복 시 최대 24시간), quota 소진은 24시간 동안 다시 호출하지 않습니다. 회로가 열려 있거나 다른 호출이 진행 중이면 메시지를 terminal skip으로 오분류하지 않고 원래 메시지의 답변 가능 시간 안에서만 내구적으로 연기합니다. 그 시간이 끝나면 `stale_backlog`로 폐기하므로 제한이 풀린 뒤 오래된 평문 답변이 갑자기 전송되지 않습니다. 대체 모델로 자동 전환하지 않으며, 회로 DB에는 오류 종류·실패 횟수·재시도 시각·bounded lease만 저장하고 prompt·대화·생성 답변·stderr 원문은 저장하지 않습니다. 이전 방별 queue에 비어 있지 않은 legacy breaker가 있으면 새 전역 권한을 자동으로 우회하거나 합치지 않고 `legacy_model_circuit_reconciliation_required`로 fail-closed하므로 운영자가 먼저 조정해야 합니다.
+
+이미 실행 중인 기존 supervisor의 scalar 상태는 이 기능이 건드리지 않습니다. 새 CLI 활성화에는 반드시 `--chat` 또는 `[bujamentor].chats`가 필요하며, `[bujamentor].target_chat_id`는 더 이상 자동 채택되지 않습니다. 기존 supervisor를 다시 시작할 때도 `OPENKAKAO_TARGET_CHAT_ID`를 명시적으로 전달해야 합니다. 기존 상태 파일이 남아 있으면 정상 종료 후 queue가 완전히 terminal(`sent`/`skipped`)이고 `legacy_drained=true`가 기록된 경우에만 새 CLI가 시작됩니다. 중단·불확실 전송(`delivery_unknown`)이 있으면 먼저 수동 조정해야 합니다.
 다른 Space에서 작업하는 동안에도 무서버 AX 전송을 유지하려면 KakaoTalk Dock 아이콘의 `옵션 → 다음으로 할당 → 모든 데스크탑`을 한 번 설정해야 합니다. AX가 현재 Space에서 창을 확인하지 못하면 자동 전송은 재시도하지 않고 fenced 됩니다.
+
+#### 로그인된 macOS 세션에서 계속 실행
+
+현재 권장 구조는 자동 답변을 LaunchAgent가 직접 실행하는 방식이 아닙니다. 로그인된 Aqua 세션의 one-shot monitor LaunchAgent는 KakaoTalk DB·AX·설정·Codex 인증을 읽지 않고, watchdog owner lock이 없을 때만 해시로 고정된 private `.command`를 기존 TCC 권한이 있는 Terminal에서 rate-limit을 두고 엽니다. Terminal-hosted session watchdog은 매 child 시작 직전에 read-only preflight를 새로 수행합니다. 성공하면 별도 guardian이 `/usr/bin/caffeinate -i` 아래 foreground auto-reply를 소유하며, watchdog 또는 guardian이 비정상 종료될 때 liveness pipe EOF로 전체 worker 그룹을 정리한 뒤에만 재시작합니다. 자세한 신뢰 경계와 운영 확인 절차는 [Bujamentor launchd supervision](docs/bujamentor-launchd-supervision.md#persistent-auto-reply-launchagent)에 있습니다.
+
+이는 “재부팅을 뚫고 계속 실행되는 데몬”이 아니라 **현재 사용자 로그인 후 복구되는 세션 서비스**입니다. 같은 사용자가 로그인하고 Aqua·Terminal·기존 Accessibility/TCC 권한·로그인된 KakaoTalk·정확한 창을 다시 사용할 수 있을 때 재시작할 수 있습니다. Mac이 꺼져 있거나 사용자가 로그아웃한 동안에는 답변하지 않으며, KakaoTalk 로그아웃이나 TCC 부재도 우회하지 않습니다. 장기적으로 Terminal 의존성을 없애려면 별도의 서명된 native host를 배포하고 그 host에 대해 사용자가 macOS 권한을 부여하는 구조가 필요합니다.
+
+#### 읽기 전용 실시간 대시보드
+
+`python3 scripts/bujamentor-tui.py`는 서비스 상태와 방별 supervisor/DB/AX/worker heartbeat, account-global 모델 회로, queue를 읽기 전용으로 표시합니다. queue DB에는 방마다 최대 4,096개의 본문 없는 durable transition이 저장되며, 감지·인가·미디어 취득·문맥 조회·모델 호출·지연 예약·전송 전 검사·AX mutation 허가·로컬 DB 확인·terminal 확정을 TUI 재시작 뒤에도 추적할 수 있습니다. 저널에는 채팅 본문, 생성 답변, 발신자 이름, prompt, URL, 파일 경로, provider 출력과 자유 형식 오류 문자열을 저장하지 않습니다. 기본 모드는 메시지·생성 답변 본문을 숨기며 시작·중지·재시도·ACK·전송을 수행하지 않습니다. `--room <chat-id>`를 반복해 방을 제한하고, `--once`는 한 번의 평문 snapshot, `--once --json`은 본문이 항상 숨겨진 구조화 snapshot을 출력합니다.
+
+대화 본문이 꼭 필요할 때만 interactive Terminal에서 `--show-content`를 지정하고 경고 뒤에 대문자 `SHOW CONTENT`를 정확히 입력해야 합니다. 비대화형 환경에서는 거부되며 `--json`과 함께 쓸 수 없습니다. interactive 키는 `q` 종료, `↑`/`↓` 또는 `j`/`k` 방 이동, `Page Up`/`Page Down` 또는 `[`/`]` 선택 방의 durable timeline 이동, `Home` 최신 항목, `End` 보존 중인 가장 오래된 항목, `r` 즉시 새로고침, `p` 일시정지, `?` 도움말입니다. 매 새로고침은 방별로 보존된 최대 4,096개 전이를 모두 검증해 불러오고 화면에는 한 번에 8개를 표시합니다. `history_truncated=true`는 화면에서 항목을 숨겼다는 뜻이 아니라, 더 오래된 기록이 이미 보존 한도로 정리됐거나 sequence gap이 있다는 뜻입니다. 오프라인 runtime packager가 만든 `open-bujamentor-tui.command`도 본문 표시 opt-in 없이 같은 redacted 대시보드를 엽니다.
 
 읽기 전용 작업은 항상 사용 가능합니다:
 

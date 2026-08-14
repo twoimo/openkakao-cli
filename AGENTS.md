@@ -42,6 +42,23 @@ openkakao-cli edit <chat_id> <log_id> "new" -y --json
 openkakao-cli react <chat_id> <log_id> --json
 ```
 
+### Foreground automatic replies
+
+Automatic replies use the separate AX/database-authoritative safety gates, not
+`allow_loco_write`. Always run a read-only preflight first:
+
+```bash
+openkakao-cli auto-reply --chat 'name:부자멘토멘티' --check --json
+openkakao-cli auto-reply --chat 'name:부자멘토멘티' --chat id:123456789
+# For an unnamed local group-room row, attest the already-open exact AX window:
+openkakao-cli auto-reply --chat 'bind:417780809780519:부자멘토멘티' --check --json
+```
+
+`--chat` may be repeated or contain comma-separated exact `id:`/`name:`
+selectors. The command is foreground-only and `Ctrl-C` stops its owned
+workers. It never adopts or kills an existing supervisor, and tests must use
+fake database/process/AX adapters rather than a live send.
+
 ## Unattended Mode
 
 For fully non-interactive operation:

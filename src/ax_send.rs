@@ -52,9 +52,392 @@ pub(crate) fn match_chat_row(row_names: &[Option<String>], target: &str) -> Chat
     }
 }
 
+const BOUND_TRANSCRIPT_MIN_SUFFIX: usize = 3;
+const BOUND_TRANSCRIPT_MIN_DISTINCT: usize = 2;
+const BOUND_TRANSCRIPT_MIN_UTF8_BYTES: usize = 24;
+const BOUND_TRANSCRIPT_MIN_TRUNCATED_PREFIX_UTF8_BYTES: usize = 256;
+
+/// Normalize an AX or already-canonical transcript value before comparing it.
+/// Local database rows must go through `normalize_local_binding_message` so
+/// media is classified from its numeric message type and validated attachment,
+/// never guessed from user-controlled text.
+pub(crate) fn normalize_binding_message(value: &str) -> String {
+    value.trim().to_string()
+}
+
+/// Produce the exact AX transcript token for one authoritative local row.
+///
+/// KakaoTalk exposes every rendered image-bearing row as one AX row containing
+/// an `AXImage`, so single photos, image emoticons, and multi-photo messages all
+/// bind to the same `[사진]` token. The attachment is parsed with the production
+/// media validator first: malformed, ambiguous, truncated, or out-of-range
+/// image metadata must fence transcript binding rather than fall back to the
+/// row's display text.
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "the binary target normalizes LocalMessage rows; the library target retains the shared implementation for focused tests"
+    )
+)]
+pub(crate) fn normalize_local_binding_message(
+    message: &crate::local_db::LocalMessage,
+) -> anyhow::Result<String> {
+    match message.message_type {
+        2 | 14 | 27 => {
+            let sources = crate::media::parse_image_download_sources(
+                &message.attachment,
+                message.message_type,
+            )
+            .map_err(|error| {
+                anyhow::anyhow!("local image attachment is invalid for transcript binding: {error}")
+            })?;
+            let valid_count = match message.message_type {
+                2 | 14 => sources.len() == 1,
+                27 => (2..=crate::media::MAX_IMAGE_INPUTS).contains(&sources.len()),
+                _ => unreachable!("image-bearing message types are matched above"),
+            };
+            if !valid_count {
+                anyhow::bail!("local image attachment count is invalid for transcript binding");
+            }
+            Ok("[사진]".to_string())
+        }
+        _ => Ok(normalize_binding_message(&message.message)),
+    }
+}
+
+/// Normalize a chronological local transcript without ever matching across an
+/// invalid media row. Invalid attachment metadata is a hard boundary: discard
+/// every older token, then allow only a independently strong suffix made from
+/// later rows. This keeps an old corrupt row from causing permanent outage
+/// while ensuring it can never be silently omitted from the middle of a match.
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "the binary target consumes this shared source helper; the library target exposes it only to focused tests"
+    )
+)]
+pub(crate) fn normalize_local_binding_suffix(
+    messages: &[crate::local_db::LocalMessage],
+) -> Vec<(i64, String)> {
+    let mut suffix = Vec::new();
+    for message in messages {
+        // Edit/control records are stored in NTChatMessage but are not
+        // independent rendered transcript rows. They must neither become
+        // attestation tokens nor break an otherwise strong room suffix.
+        if !crate::local_db::is_local_conversation_message_type(message.message_type) {
+            continue;
+        }
+        match normalize_local_binding_message(message) {
+            Ok(text) if !text.is_empty() => suffix.push((message.log_id, text)),
+            Ok(_) => {}
+            Err(_) => suffix.clear(),
+        }
+    }
+    suffix
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TranscriptSuffixMatch {
+    pub matched_count: usize,
+    pub matched_distinct: usize,
+    pub matched_utf8_bytes: usize,
+}
+
+impl TranscriptSuffixMatch {
+    pub(crate) fn is_strong(self) -> bool {
+        self.matched_count >= BOUND_TRANSCRIPT_MIN_SUFFIX
+            && self.matched_distinct >= BOUND_TRANSCRIPT_MIN_DISTINCT
+            && self.matched_utf8_bytes >= BOUND_TRANSCRIPT_MIN_UTF8_BYTES
+    }
+}
+
+fn transcript_endpoint_matches(ax: &str, local: &str) -> bool {
+    if ax == local {
+        return true;
+    }
+    let Some(prefix) = ax
+        .strip_suffix('…')
+        .or_else(|| ax.strip_suffix("..."))
+        .map(str::trim_end)
+    else {
+        return false;
+    };
+    prefix.len() >= BOUND_TRANSCRIPT_MIN_TRUNCATED_PREFIX_UTF8_BYTES
+        && local.len() > prefix.len()
+        && local.starts_with(prefix)
+}
+
+/// Compare two chronological, already-normalized transcript tails. Only the
+/// latest endpoint may use KakaoTalk's bounded long-message truncation form;
+/// every preceding row in the matching suffix must remain exact. A matching
+/// run earlier in either transcript must not bind an AX title to a numeric
+/// local chat ID.
+pub(crate) fn match_transcript_suffix(
+    ax_texts: &[String],
+    local_texts: &[String],
+) -> TranscriptSuffixMatch {
+    let mut endpoints = ax_texts.iter().rev().zip(local_texts.iter().rev());
+    let matched_count = match endpoints.next() {
+        Some((ax, local)) if transcript_endpoint_matches(ax, local) => {
+            1 + endpoints.take_while(|(ax, local)| ax == local).count()
+        }
+        _ => 0,
+    };
+    let matched_texts = local_texts.iter().rev().take(matched_count);
+    let mut distinct = std::collections::BTreeSet::new();
+    let mut matched_utf8_bytes = 0;
+    for text in matched_texts {
+        distinct.insert(text);
+        matched_utf8_bytes += text.len();
+    }
+    TranscriptSuffixMatch {
+        matched_count,
+        matched_distinct: distinct.len(),
+        matched_utf8_bytes,
+    }
+}
+
+/// Merge candidates returned by overlapping AX attributes without allowing a
+/// single window exposed through (for example) AXChildren and AXFocusedWindow
+/// to look like two distinct exact-title windows.
+fn extend_unique<T: PartialEq>(target: &mut Vec<T>, candidates: impl IntoIterator<Item = T>) {
+    for candidate in candidates {
+        if !target.iter().any(|existing| existing == &candidate) {
+            target.push(candidate);
+        }
+    }
+}
+
+/// Drive one composer submission through a fail-closed, single-Return state
+/// machine.  The callbacks keep the policy testable without a live AX session:
+/// an unreadable or non-empty composer is never focused or mutated, every
+/// successful write is re-read exactly, and a Return is never retried.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "separate composer callbacks make every AX side effect and the mutation boundary independently testable"
+)]
+fn guarded_composer_send_once<Read, Attest, Focus, Begin, Set, Type, Press>(
+    message: &str,
+    mut read: Read,
+    mut attest: Attest,
+    mut focus: Focus,
+    mut begin_mutation: Begin,
+    mut set_value: Set,
+    mut type_text: Type,
+    mut press_return: Press,
+) -> anyhow::Result<()>
+where
+    Read: FnMut() -> Option<String>,
+    Attest: FnMut(&str) -> anyhow::Result<()>,
+    Focus: FnMut() -> anyhow::Result<()>,
+    Begin: FnMut(),
+    Set: FnMut() -> bool,
+    Type: FnMut() -> anyhow::Result<()>,
+    Press: FnMut() -> anyhow::Result<()>,
+{
+    attest("before composer inspection")?;
+    if read().as_deref() != Some("") {
+        anyhow::bail!("message composer is unreadable or not empty; refusing to overwrite it");
+    }
+
+    // Re-attest both the window and the empty value immediately before the
+    // first text mutation.  This catches a human draft started after the first
+    // inspection without replacing any of it.
+    attest("before composer write")?;
+    if read().as_deref() != Some("") {
+        anyhow::bail!("message composer changed before write; refusing to overwrite it");
+    }
+
+    // This is the first operation that can change composer content. Mark the
+    // boundary immediately before calling AXSetValue; any error from this
+    // point onward has an uncertain mutation outcome.
+    begin_mutation();
+    if !set_value() {
+        // An AX set error has an uncertain mutation outcome.  Use keyboard
+        // typing only when a fresh read proves the field is still exactly
+        // empty; if AX actually applied the requested value despite returning
+        // an error, the common exact-value check below is sufficient.
+        attest("after failed composer write")?;
+        match read() {
+            Some(value) if value == message => {}
+            Some(value) if value.is_empty() => {
+                focus()?;
+                attest("before composer typing")?;
+                if read().as_deref() != Some("") {
+                    anyhow::bail!(
+                        "message composer changed before typing; refusing to append to it"
+                    );
+                }
+                type_text()?;
+            }
+            _ => {
+                anyhow::bail!(
+                    "message composer is unreadable or changed after write failure; refusing to type"
+                )
+            }
+        }
+    }
+
+    attest("after composer write")?;
+    if read().as_deref() != Some(message) {
+        anyhow::bail!("message composer does not exactly match the intended outbound text");
+    }
+
+    focus()?;
+    attest("immediately before send")?;
+    if read().as_deref() != Some(message) {
+        anyhow::bail!("message composer changed before send; refusing to press Return");
+    }
+    press_return()?;
+    // Return only proves that the AX action was posted.  Do not infer delivery
+    // from how quickly AXValue clears and never press Return a second time: the
+    // first send can succeed while KakaoTalk's UI update is delayed.  The outer
+    // worker confirms one exact new self-authored local-DB row and otherwise
+    // records an uncertain terminal outcome without retrying.
+    Ok(())
+}
+
+/// Read-only counterpart to `guarded_composer_send_once`. The first
+/// attestation binds the field inspection to the expected exact-title window;
+/// the second proves that the same unique window is still present after the
+/// inspection. Reading the field twice also fails closed if a human begins a
+/// draft during the probe. There are intentionally no focus, write, typing, or
+/// keyboard callbacks in this API.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn guarded_composer_preflight<Read, Attest>(
+    mut read: Read,
+    mut attest: Attest,
+) -> anyhow::Result<()>
+where
+    Read: FnMut() -> Option<String>,
+    Attest: FnMut(&str) -> anyhow::Result<()>,
+{
+    attest("before preflight composer inspection")?;
+    if read().as_deref() != Some("") {
+        anyhow::bail!("message composer is unreadable or not empty; preflight is unavailable");
+    }
+
+    attest("after preflight composer inspection")?;
+    if read().as_deref() != Some("") {
+        anyhow::bail!("message composer changed during preflight; preflight is unavailable");
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+pub struct BoundSendFailure {
+    mutation_started: bool,
+    error: anyhow::Error,
+}
+
+impl BoundSendFailure {
+    pub(crate) fn new(error: anyhow::Error, mutation_started: bool) -> Self {
+        Self {
+            mutation_started,
+            error,
+        }
+    }
+
+    pub fn mutation_started(&self) -> bool {
+        self.mutation_started
+    }
+
+    pub fn into_error(self) -> anyhow::Error {
+        self.error
+    }
+}
+
 #[cfg(test)]
 mod match_tests {
     use super::*;
+
+    #[derive(Debug, Default)]
+    struct ComposerProbe {
+        reads: std::collections::VecDeque<Option<String>>,
+        attestations: usize,
+        focuses: usize,
+        set_attempts: usize,
+        typed: usize,
+        returns: usize,
+        mutation_begins: usize,
+    }
+
+    fn run_composer_probe(
+        reads: impl IntoIterator<Item = Option<&'static str>>,
+        direct_set_succeeds: bool,
+    ) -> (anyhow::Result<()>, ComposerProbe) {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let probe = Rc::new(RefCell::new(ComposerProbe {
+            reads: reads
+                .into_iter()
+                .map(|value| value.map(str::to_string))
+                .collect(),
+            ..ComposerProbe::default()
+        }));
+        let result = guarded_composer_send_once(
+            "reply",
+            {
+                let probe = Rc::clone(&probe);
+                move || {
+                    probe
+                        .borrow_mut()
+                        .reads
+                        .pop_front()
+                        .expect("test must provide every composer read")
+                }
+            },
+            {
+                let probe = Rc::clone(&probe);
+                move |_| {
+                    probe.borrow_mut().attestations += 1;
+                    Ok(())
+                }
+            },
+            {
+                let probe = Rc::clone(&probe);
+                move || {
+                    probe.borrow_mut().focuses += 1;
+                    Ok(())
+                }
+            },
+            {
+                let probe = Rc::clone(&probe);
+                move || {
+                    probe.borrow_mut().mutation_begins += 1;
+                }
+            },
+            {
+                let probe = Rc::clone(&probe);
+                move || {
+                    probe.borrow_mut().set_attempts += 1;
+                    direct_set_succeeds
+                }
+            },
+            {
+                let probe = Rc::clone(&probe);
+                move || {
+                    probe.borrow_mut().typed += 1;
+                    Ok(())
+                }
+            },
+            {
+                let probe = Rc::clone(&probe);
+                move || {
+                    probe.borrow_mut().returns += 1;
+                    Ok(())
+                }
+            },
+        );
+        let probe = Rc::try_unwrap(probe)
+            .expect("composer test callbacks must release their state")
+            .into_inner();
+        (result, probe)
+    }
 
     #[test]
     fn empty_list_is_not_found() {
@@ -97,6 +480,432 @@ mod match_tests {
         let names = [None, Some("Alice".to_string()), None];
         assert_eq!(match_chat_row(&names, "Alice"), ChatMatch::Found(1));
     }
+
+    #[test]
+    fn fallback_candidates_are_deduplicated_in_source_order() {
+        let mut candidates = Vec::new();
+        extend_unique(&mut candidates, Vec::<u8>::new());
+        extend_unique(&mut candidates, [7, 8]);
+        extend_unique(&mut candidates, [8]);
+        extend_unique(&mut candidates, [7]);
+        assert_eq!(candidates, vec![7, 8]);
+    }
+
+    #[test]
+    fn binding_normalization_aligns_image_rows() {
+        assert_eq!(normalize_binding_message("  사진 2장  "), "사진 2장");
+        assert_eq!(normalize_binding_message("  안녕하세요  "), "안녕하세요");
+        assert!(normalize_binding_message(" \n ").is_empty());
+    }
+
+    fn local_message(
+        message_type: i32,
+        message: &str,
+        attachment: String,
+    ) -> crate::local_db::LocalMessage {
+        crate::local_db::LocalMessage {
+            log_id: 100,
+            chat_id: 42,
+            author_id: 7,
+            is_self: false,
+            sender_name: "sender".to_string(),
+            message: message.to_string(),
+            attachment,
+            message_type,
+            sent_at: 1_000,
+        }
+    }
+
+    fn multi_photo_attachment(count: usize) -> String {
+        let keys = (0..count)
+            .map(|index| format!("safe/{index}.jpg"))
+            .collect::<Vec<_>>();
+        serde_json::json!({
+            "kl": keys,
+            "sl": vec![1; count],
+            "wl": vec![1; count],
+            "hl": vec![1; count],
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn local_binding_normalizes_empty_single_photo_and_image_emoticon() {
+        let photo = local_message(
+            2,
+            "",
+            r#"{"k":"safe/photo.jpg","s":1,"w":1,"h":1,"mt":"jpg"}"#.to_string(),
+        );
+        assert_eq!(normalize_local_binding_message(&photo).unwrap(), "[사진]");
+
+        let emoticon = local_message(
+            14,
+            "",
+            r#"{"path":"safe/emoticon.png","type":"png","width":1,"height":1}"#.to_string(),
+        );
+        assert_eq!(
+            normalize_local_binding_message(&emoticon).unwrap(),
+            "[사진]"
+        );
+    }
+
+    #[test]
+    fn local_binding_normalizes_multi_photo_counts_two_five_and_ten() {
+        for count in [2, 5, 10] {
+            let message = local_message(27, "", multi_photo_attachment(count));
+            assert_eq!(
+                normalize_local_binding_message(&message).unwrap(),
+                "[사진]",
+                "count={count}"
+            );
+        }
+    }
+
+    #[test]
+    fn local_binding_rejects_malformed_ambiguous_and_out_of_range_images() {
+        for attachment in [
+            "not-json".to_string(),
+            multi_photo_attachment(1),
+            multi_photo_attachment(11),
+            serde_json::json!({
+                "kl": ["safe/one.jpg", "safe/two.jpg"],
+                "imageUrls": ["https://talk.kakaocdn.net/one.jpg"],
+                "sl": [1, 1], "wl": [1, 1], "hl": [1, 1],
+            })
+            .to_string(),
+        ] {
+            let message = local_message(27, "사진", attachment);
+            assert!(normalize_local_binding_message(&message).is_err());
+        }
+
+        let malformed_single = local_message(2, "사진", String::new());
+        assert!(normalize_local_binding_message(&malformed_single).is_err());
+    }
+
+    #[test]
+    fn invalid_old_media_is_a_boundary_but_later_strong_suffix_survives() {
+        let mut invalid = local_message(2, "사진", String::new());
+        invalid.log_id = 1;
+        let mut first = local_message(1, "서로 다른 첫 번째 정상 메시지입니다", String::new());
+        first.log_id = 2;
+        let mut second = local_message(1, "서로 다른 두 번째 정상 메시지입니다", String::new());
+        second.log_id = 3;
+        let mut third = local_message(1, "서로 다른 세 번째 정상 메시지입니다", String::new());
+        third.log_id = 4;
+
+        let suffix = normalize_local_binding_suffix(&[invalid, first, second, third]);
+        assert_eq!(
+            suffix.iter().map(|(log_id, _)| *log_id).collect::<Vec<_>>(),
+            vec![2, 3, 4]
+        );
+        let texts = suffix
+            .iter()
+            .map(|(_, text)| text.clone())
+            .collect::<Vec<_>>();
+        assert!(match_transcript_suffix(&texts, &texts).is_strong());
+    }
+
+    #[test]
+    fn edit_control_rows_do_not_break_a_strong_transcript_suffix() {
+        let mut first = local_message(1, "서로 다른 첫 번째 정상 메시지입니다", String::new());
+        first.log_id = 1;
+        let mut second = local_message(1, "서로 다른 두 번째 정상 메시지입니다", String::new());
+        second.log_id = 2;
+        let mut third = local_message(1, "서로 다른 세 번째 정상 메시지입니다", String::new());
+        third.log_id = 3;
+        let mut edit_control = local_message(0, "편집 제어 데이터", String::new());
+        edit_control.log_id = 4;
+
+        let suffix = normalize_local_binding_suffix(&[first, second, third, edit_control]);
+        assert_eq!(
+            suffix.iter().map(|(log_id, _)| *log_id).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        let texts = suffix
+            .iter()
+            .map(|(_, text)| text.clone())
+            .collect::<Vec<_>>();
+        assert!(match_transcript_suffix(&texts, &texts).is_strong());
+    }
+
+    #[test]
+    fn invalid_media_inside_latest_tail_prevents_matching_across_it() {
+        let mut older = local_message(1, "충분히 긴 이전 정상 메시지입니다", String::new());
+        older.log_id = 1;
+        let mut invalid = local_message(27, "사진", multi_photo_attachment(1));
+        invalid.log_id = 2;
+        let mut later_one = local_message(1, "손상 이후 첫 번째 메시지입니다", String::new());
+        later_one.log_id = 3;
+        let mut later_two = local_message(1, "손상 이후 두 번째 메시지입니다", String::new());
+        later_two.log_id = 4;
+
+        let suffix = normalize_local_binding_suffix(&[older, invalid, later_one, later_two]);
+        assert_eq!(
+            suffix.iter().map(|(log_id, _)| *log_id).collect::<Vec<_>>(),
+            vec![3, 4]
+        );
+        let texts = suffix
+            .iter()
+            .map(|(_, text)| text.clone())
+            .collect::<Vec<_>>();
+        assert!(!match_transcript_suffix(&texts, &texts).is_strong());
+
+        let latest_invalid = local_message(2, "사진", String::new());
+        assert!(normalize_local_binding_suffix(&[latest_invalid]).is_empty());
+    }
+
+    #[test]
+    fn transcript_match_requires_the_latest_exact_suffix() {
+        let ax = [
+            "older",
+            "충분히 긴 첫 번째 메시지",
+            "충분히 긴 두 번째 메시지",
+        ]
+        .map(str::to_string);
+        let local = [
+            "different",
+            "충분히 긴 첫 번째 메시지",
+            "충분히 긴 두 번째 메시지",
+        ]
+        .map(str::to_string);
+        let matched = match_transcript_suffix(&ax, &local);
+        assert_eq!(matched.matched_count, 2);
+        assert!(!matched.is_strong());
+
+        let local = ["older", "충분히 긴 첫 번째 메시지", "latest mismatch"].map(str::to_string);
+        assert_eq!(match_transcript_suffix(&ax, &local).matched_count, 0);
+    }
+
+    #[test]
+    fn transcript_match_enforces_count_distinctness_and_utf8_bytes() {
+        let strong = [
+            "서로 다른 첫 번째 메시지입니다",
+            "서로 다른 두 번째 메시지입니다",
+            "마지막 메시지입니다",
+        ]
+        .map(str::to_string);
+        let matched = match_transcript_suffix(&strong, &strong);
+        assert!(matched.is_strong());
+        assert_eq!(matched.matched_count, 3);
+        assert_eq!(matched.matched_distinct, 3);
+        assert!(matched.matched_utf8_bytes >= 24);
+
+        let repeated = ["같음", "같음", "같음"].map(str::to_string);
+        let matched = match_transcript_suffix(&repeated, &repeated);
+        assert_eq!(matched.matched_count, 3);
+        assert_eq!(matched.matched_distinct, 1);
+        assert!(!matched.is_strong());
+    }
+
+    #[test]
+    fn transcript_match_accepts_only_long_truncated_latest_endpoint() {
+        let prefix = "가".repeat(86);
+        assert!(prefix.len() >= BOUND_TRANSCRIPT_MIN_TRUNCATED_PREFIX_UTF8_BYTES);
+        let local_latest = format!("{prefix} 뒤에 남아 있는 원문");
+        let older = [
+            "서로 다른 첫 번째 메시지입니다".to_string(),
+            "서로 다른 두 번째 메시지입니다".to_string(),
+        ];
+
+        for ax_latest in [format!("{prefix}…"), format!("{prefix}...")] {
+            let ax = [older[0].clone(), older[1].clone(), ax_latest];
+            let local = [older[0].clone(), older[1].clone(), local_latest.clone()];
+            let matched = match_transcript_suffix(&ax, &local);
+            assert_eq!(matched.matched_count, 3);
+            assert!(matched.is_strong());
+        }
+
+        let ax = [format!("{prefix}…"), older[0].clone(), older[1].clone()];
+        let local = [local_latest, older[0].clone(), older[1].clone()];
+        let matched = match_transcript_suffix(&ax, &local);
+        assert_eq!(matched.matched_count, 2);
+        assert!(!matched.is_strong());
+    }
+
+    #[test]
+    fn transcript_match_rejects_short_or_mismatched_truncated_endpoint() {
+        let short_prefix = "a".repeat(255);
+        let older = [
+            "첫 번째 메시지입니다".to_string(),
+            "두 번째 메시지입니다".to_string(),
+        ];
+        let short_ax = [
+            older[0].clone(),
+            older[1].clone(),
+            format!("{short_prefix}…"),
+        ];
+        let short_local = [
+            older[0].clone(),
+            older[1].clone(),
+            format!("{short_prefix}tail"),
+        ];
+        assert_eq!(
+            match_transcript_suffix(&short_ax, &short_local).matched_count,
+            0
+        );
+
+        let long_prefix = "b".repeat(256);
+        let mismatch_ax = [
+            older[0].clone(),
+            older[1].clone(),
+            format!("{long_prefix}..."),
+        ];
+        let mismatch_local = [
+            older[0].clone(),
+            older[1].clone(),
+            format!("{}ctail", "b".repeat(255)),
+        ];
+        assert_eq!(
+            match_transcript_suffix(&mismatch_ax, &mismatch_local).matched_count,
+            0
+        );
+    }
+
+    #[test]
+    fn composer_guard_never_mutates_nonempty_or_unreadable_composer() {
+        for initial in [None, Some("human draft")] {
+            let (result, probe) = run_composer_probe([initial], true);
+            assert!(result.is_err());
+            assert_eq!(probe.focuses, 0);
+            assert_eq!(probe.set_attempts, 0);
+            assert_eq!(probe.mutation_begins, 0);
+            assert_eq!(probe.typed, 0);
+            assert_eq!(probe.returns, 0);
+        }
+    }
+
+    #[test]
+    fn composer_guard_rechecks_empty_value_before_first_mutation() {
+        let (result, probe) =
+            run_composer_probe([Some(""), Some("human typed concurrently")], true);
+        assert!(result.is_err());
+        assert_eq!(probe.focuses, 0);
+        assert_eq!(probe.set_attempts, 0);
+        assert_eq!(probe.mutation_begins, 0);
+        assert_eq!(probe.typed, 0);
+        assert_eq!(probe.returns, 0);
+    }
+
+    #[test]
+    fn composer_guard_requires_exact_value_after_write_and_before_return() {
+        let (post_write_result, post_write_probe) = run_composer_probe(
+            [Some(""), Some(""), Some("reply plus concurrent draft")],
+            true,
+        );
+        assert!(post_write_result.is_err());
+        assert_eq!(post_write_probe.set_attempts, 1);
+        assert_eq!(post_write_probe.mutation_begins, 1);
+        assert_eq!(post_write_probe.returns, 0);
+
+        let (pre_return_result, pre_return_probe) = run_composer_probe(
+            [
+                Some(""),
+                Some(""),
+                Some("reply"),
+                Some("changed before Return"),
+            ],
+            true,
+        );
+        assert!(pre_return_result.is_err());
+        assert_eq!(pre_return_probe.set_attempts, 1);
+        assert_eq!(pre_return_probe.mutation_begins, 1);
+        assert_eq!(pre_return_probe.returns, 0);
+    }
+
+    #[test]
+    fn composer_guard_presses_return_once_without_retry() {
+        let (result, probe) =
+            run_composer_probe([Some(""), Some(""), Some("reply"), Some("reply")], true);
+        assert!(result.is_ok());
+        assert_eq!(probe.set_attempts, 1);
+        assert_eq!(probe.mutation_begins, 1);
+        assert_eq!(probe.returns, 1);
+    }
+
+    #[test]
+    fn composer_guard_allows_one_verified_direct_or_keyboard_send() {
+        let (direct_result, direct_probe) =
+            run_composer_probe([Some(""), Some(""), Some("reply"), Some("reply")], true);
+        assert!(direct_result.is_ok());
+        assert_eq!(direct_probe.set_attempts, 1);
+        assert_eq!(direct_probe.typed, 0);
+        assert_eq!(direct_probe.returns, 1);
+
+        let (typed_result, typed_probe) = run_composer_probe(
+            [
+                Some(""),
+                Some(""),
+                Some(""),
+                Some(""),
+                Some("reply"),
+                Some("reply"),
+            ],
+            false,
+        );
+        assert!(typed_result.is_ok());
+        assert_eq!(typed_probe.set_attempts, 1);
+        assert_eq!(typed_probe.typed, 1);
+        assert_eq!(typed_probe.returns, 1);
+    }
+
+    #[test]
+    fn composer_preflight_is_read_only_and_rechecks_empty_state() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let reads = Rc::new(RefCell::new(std::collections::VecDeque::from([
+            Some(String::new()),
+            Some(String::new()),
+        ])));
+        let attestations = Rc::new(RefCell::new(Vec::new()));
+        guarded_composer_preflight(
+            {
+                let reads = Rc::clone(&reads);
+                move || reads.borrow_mut().pop_front().expect("two composer reads")
+            },
+            {
+                let attestations = Rc::clone(&attestations);
+                move |stage| {
+                    attestations.borrow_mut().push(stage.to_string());
+                    Ok(())
+                }
+            },
+        )
+        .expect("an unchanged empty composer should be preflight-ready");
+
+        assert!(reads.borrow().is_empty());
+        assert_eq!(
+            *attestations.borrow(),
+            [
+                "before preflight composer inspection",
+                "after preflight composer inspection"
+            ]
+        );
+    }
+
+    #[test]
+    fn composer_preflight_rejects_unreadable_nonempty_or_changed_state() {
+        for initial in [None, Some("draft".to_string())] {
+            let mut reads = std::collections::VecDeque::from([initial]);
+            let error = guarded_composer_preflight(
+                || reads.pop_front().expect("one composer read"),
+                |_| Ok(()),
+            )
+            .expect_err("an unreadable or non-empty composer must fail closed");
+            assert!(error.to_string().contains("unreadable or not empty"));
+        }
+
+        let mut reads = std::collections::VecDeque::from([
+            Some(String::new()),
+            Some("human draft".to_string()),
+        ]);
+        let error = guarded_composer_preflight(
+            || reads.pop_front().expect("two composer reads"),
+            |_| Ok(()),
+        )
+        .expect_err("a composer that changes during preflight must fail closed");
+        assert!(error.to_string().contains("changed during preflight"));
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -118,7 +927,7 @@ mod imp {
     };
     use anyhow::{anyhow, Context, Result};
     use core_foundation::array::{CFArray, CFArrayRef};
-    use core_foundation::base::{CFType, TCFType};
+    use core_foundation::base::{CFRange, CFType, TCFType};
     use core_foundation::boolean::CFBoolean;
     use core_foundation::string::CFString;
     use core_graphics::event::CGEvent;
@@ -129,6 +938,35 @@ mod imp {
     const OPEN_CHAT_TIMEOUT: Duration = Duration::from_secs(5);
     const SERVICE_AX_TRAVERSAL_TIMEOUT: Duration = Duration::from_secs(10);
     const SERVICE_AX_MESSAGING_TIMEOUT_SECS: f32 = 0.5;
+    const MAX_AX_STRING_UTF16_UNITS: usize = 256 * 1024;
+
+    /// Convert an AX `CFString` without using core-foundation's UTF-8
+    /// `Display` implementation. Some KakaoTalk AX values contain an unpaired
+    /// UTF-16 surrogate; core-foundation 0.10.1 asserts that every code unit
+    /// converted successfully and panics the whole unattended worker. Reading
+    /// the UTF-16 units directly and using Rust's lossy conversion keeps the
+    /// AX boundary non-panicking while an invalid title still cannot equal an
+    /// exact, well-formed room name.
+    fn cf_string_lossy(value: &CFString) -> Option<String> {
+        let length = usize::try_from(value.char_len()).ok()?;
+        if length > MAX_AX_STRING_UTF16_UNITS {
+            return None;
+        }
+        let mut units = vec![0_u16; length];
+        if length > 0 {
+            unsafe {
+                core_foundation::string::CFStringGetCharacters(
+                    value.as_concrete_TypeRef(),
+                    CFRange {
+                        location: 0,
+                        length: value.char_len(),
+                    },
+                    units.as_mut_ptr(),
+                );
+            }
+        }
+        Some(String::from_utf16_lossy(&units))
+    }
 
     /// Find the running KakaoTalk process id via `pgrep -x`.
     ///
@@ -170,7 +1008,10 @@ mod imp {
     }
 
     fn role(el: &AXUIElement) -> String {
-        el.role().map(|s| s.to_string()).unwrap_or_default()
+        el.role()
+            .ok()
+            .and_then(|value| cf_string_lossy(&value))
+            .unwrap_or_default()
     }
 
     /// Read a string attribute by raw name (works for attributes with no typed
@@ -180,7 +1021,7 @@ mod imp {
         el.attribute(&attr)
             .ok()
             .and_then(|v| v.downcast::<CFString>())
-            .map(|s| s.to_string())
+            .and_then(|value| cf_string_lossy(&value))
     }
     fn debug_ax_failure(stage: &str, error: impl std::fmt::Debug) {
         if std::env::var_os("OPENKAKAO_CLI_DEBUG_AX").is_some() {
@@ -202,19 +1043,90 @@ mod imp {
         }
     }
 
+    /// Enumerate application windows through every non-mutating AX route Kakao
+    /// exposes. Some KakaoTalk builds return an empty AXWindows array even
+    /// while AXFocusedWindow/AXMainWindow (and AXChildren) still expose the
+    /// visible window. These sources overlap, so de-duplicate AXUIElements
+    /// before applying any exact-title ambiguity check.
+    fn app_windows_with_fallback(app: &AXUIElement) -> Result<Vec<AXUIElement>> {
+        let mut windows = Vec::new();
+        let mut readable_source = false;
+
+        match app.windows() {
+            Ok(items) => {
+                readable_source = true;
+                super::extend_unique(
+                    &mut windows,
+                    items.iter().map(|item| (*item).clone()).collect::<Vec<_>>(),
+                );
+            }
+            Err(error) => debug_ax_failure("windows", error),
+        }
+        match child_elements(app) {
+            Ok(children) => {
+                readable_source = true;
+                super::extend_unique(
+                    &mut windows,
+                    children
+                        .into_iter()
+                        .filter(|child| role(child) == "AXWindow"),
+                );
+            }
+            Err(()) => debug_ax_failure("application children", "unreadable"),
+        }
+        match app.main_window() {
+            Ok(window) => {
+                readable_source = true;
+                super::extend_unique(&mut windows, [window]);
+            }
+            Err(error) => debug_ax_failure("main window", error),
+        }
+        match app.focused_window() {
+            Ok(window) => {
+                readable_source = true;
+                super::extend_unique(&mut windows, [window]);
+            }
+            Err(error) => debug_ax_failure("focused window", error),
+        }
+
+        if !readable_source {
+            anyhow::bail!(
+                "could not inspect KakaoTalk windows through AXWindows, AXChildren, AXMainWindow, or AXFocusedWindow"
+            );
+        }
+        if std::env::var_os("OPENKAKAO_CLI_DEBUG_AX").is_some() {
+            for (index, window) in windows.iter().enumerate() {
+                eprintln!(
+                    "[ax_send] window[{index}] role={:?} title={:?} identifier={:?}",
+                    role(window),
+                    window
+                        .title()
+                        .ok()
+                        .and_then(|title| cf_string_lossy(&title)),
+                    attr_as_string(window, "AXIdentifier")
+                );
+            }
+        }
+        Ok(windows)
+    }
+
     /// Find KakaoTalk's main chat-list window, as opposed to any individual
     /// open-chat windows (which are separate `AXWindow`s titled with the
     /// other party's — or your own, for the self chat — display name).
     fn find_main_window(app: &AXUIElement) -> Result<AXUIElement> {
-        let windows = app
-            .windows()
-            .map_err(|e| anyhow!("AXWindows read failed: {e:?}"))?;
-        let window = windows
-            .iter()
-            .find(|w| attr_as_string(w, "AXIdentifier").as_deref() == Some("Main Window"))
-            .map(|w| w.clone())
-            .ok_or_else(|| {
-                anyhow!(
+        let windows = app_windows_with_fallback(app)?;
+        let mut matches = windows.iter().filter(|window| {
+            attr_as_string(window, "AXIdentifier").as_deref() == Some("Main Window")
+        });
+        let window = match (matches.next(), matches.next()) {
+            (Some(window), None) => window.clone(),
+            (Some(_), Some(_)) => {
+                return Err(anyhow!(
+                    "found more than one KakaoTalk main chat-list window; refusing an ambiguous AX target"
+                ));
+            }
+            (None, _) => {
+                return Err(anyhow!(
                     "could not find KakaoTalk's main chat-list window. Make sure it's open, not \
                      minimized, and on the Space (virtual desktop) you're currently viewing — the \
                      Accessibility API only sees windows that are visible on the active Space, and \
@@ -222,8 +1134,9 @@ mod imp {
                      foreground focus, which this tool never does. One-time fix if this keeps \
                      happening: right-click the KakaoTalk Dock icon → Options → \
                      Assign To → All Desktops."
-                )
-            })?;
+                ));
+            }
+        };
 
         // Note: a minimized window still shows up here (unlike one on another
         // Space, which disappears from `windows()` entirely), but restoring
@@ -329,7 +1242,7 @@ mod imp {
             values
                 .get(i)
                 .and_then(|v| v.downcast::<CFString>())
-                .map(|s| s.to_string())
+                .and_then(|value| cf_string_lossy(&value))
         };
 
         // Slot 1 is the AXChildren array. `ConcreteCFType` is only implemented
@@ -450,7 +1363,7 @@ mod imp {
             .attribute(&value_attr)
             .ok()
             .and_then(|value| value.downcast::<CFString>())
-            .map(|value| value.to_string())
+            .and_then(|value| cf_string_lossy(&value))
     }
 
     /// Type `text` into the focused field by posting one keyboard CGEvent pair
@@ -671,20 +1584,9 @@ mod imp {
     /// `chat_display_name`. Refuse a whole-app fallback because it could
     /// select a different chat's composer.
     fn find_input_field(app: &AXUIElement, chat_display_name: &str) -> Result<AXUIElement> {
-        let windows = app
-            .windows()
-            .map_err(|e| anyhow!("could not inspect KakaoTalk windows: {e:?}"))?;
-        let window = windows
-            .iter()
-            .find(|w| {
-                w.title()
-                    .map(|t| t.to_string())
-                    .ok()
-                    .is_some_and(|t| t == chat_display_name)
-            })
-            .ok_or_else(|| {
-                anyhow!("could not find the exact chat window for '{chat_display_name}'")
-            })?;
+        let window = find_chat_window(app, chat_display_name)?.ok_or_else(|| {
+            anyhow!("could not find the exact chat window for '{chat_display_name}'")
+        })?;
         find_input_field_in(&window).ok_or_else(|| {
             anyhow!("could not find the message input field in chat '{chat_display_name}'")
         })
@@ -755,17 +1657,24 @@ mod imp {
 
     /// Find an already-open chat window whose title matches `chat_display_name`
     /// (the other party's — or your own, for the self/memo chat — display name).
-    fn find_chat_window(app: &AXUIElement, chat_display_name: &str) -> Option<AXUIElement> {
-        app.windows()
-            .ok()?
+    fn find_chat_window(app: &AXUIElement, chat_display_name: &str) -> Result<Option<AXUIElement>> {
+        let windows = app_windows_with_fallback(app)?;
+        let titles = windows
             .iter()
-            .find(|w| {
-                w.title()
-                    .map(|t| t.to_string())
+            .map(|window| {
+                window
+                    .title()
                     .ok()
-                    .is_some_and(|t| t == chat_display_name)
+                    .and_then(|title| cf_string_lossy(&title))
             })
-            .map(|w| w.clone())
+            .collect::<Vec<_>>();
+        match super::match_chat_row(&titles, chat_display_name) {
+            super::ChatMatch::NotFound => Ok(None),
+            super::ChatMatch::Found(index) => Ok(windows.get(index).cloned()),
+            super::ChatMatch::Ambiguous(count) => Err(anyhow!(
+                "expected at most one KakaoTalk window titled {chat_display_name:?}; found {count}"
+            )),
+        }
     }
 
     /// Read the most recent `count` messages visible in a chat's AX message list,
@@ -786,7 +1695,7 @@ mod imp {
 
         let deadline = Instant::now() + OPEN_CHAT_TIMEOUT;
         let mut messages = loop {
-            if let Some(window) = find_chat_window(&app, chat_display_name) {
+            if let Some(window) = find_chat_window(&app, chat_display_name)? {
                 let msgs = read_visible_messages(&window);
                 if !msgs.is_empty() {
                     break msgs;
@@ -806,9 +1715,181 @@ mod imp {
         Ok(messages)
     }
 
+    /// Read an already-open, exact-title chat window without selecting a chat
+    /// row, focusing a field, or synthesizing keyboard input. Duplicate exact
+    /// window titles are rejected so callers cannot attest an ambiguous target.
+    pub fn read_open_exact_via_ax(chat_display_name: &str, count: usize) -> Result<Vec<AxMessage>> {
+        let pid = find_kakaotalk_pid()?;
+        ensure_ax_permission()?;
+        let app = AXUIElement::application(pid);
+        let window = find_chat_window(&app, chat_display_name)?.ok_or_else(|| {
+            anyhow!(
+                "expected exactly one already-open KakaoTalk window titled {chat_display_name:?}; found 0"
+            )
+        })?;
+        let mut messages = read_visible_messages(&window);
+        if messages.is_empty() {
+            anyhow::bail!("the exact chat window {chat_display_name:?} has no visible messages");
+        }
+        if messages.len() > count {
+            messages = messages.split_off(messages.len() - count);
+        }
+        Ok(messages)
+    }
+
+    fn ensure_same_exact_chat_window(
+        app: &AXUIElement,
+        chat_display_name: &str,
+        expected: Option<&AXUIElement>,
+        stage: &str,
+    ) -> Result<()> {
+        let current = find_chat_window(app, chat_display_name)?.ok_or_else(|| {
+            anyhow!("the exact chat window for {chat_display_name:?} closed {stage}")
+        })?;
+        if expected.is_some_and(|window| *window != current) {
+            anyhow::bail!(
+                "the exact chat window instance for {chat_display_name:?} changed {stage}"
+            );
+        }
+        Ok(())
+    }
+
+    fn send_with_attested_field(
+        app: &AXUIElement,
+        pid: i32,
+        chat_display_name: &str,
+        message: &str,
+        field: AXUIElement,
+        expected_window: Option<&AXUIElement>,
+        mutation_started: &std::cell::Cell<bool>,
+    ) -> Result<()> {
+        // A duplicate exact-title window appearing after transcript attestation
+        // is ambiguous. Bound sends additionally require the same AXUIElement
+        // window instance through every composer read, write, and Return.
+        super::guarded_composer_send_once(
+            message,
+            || composer_text(&field),
+            |stage| ensure_same_exact_chat_window(app, chat_display_name, expected_window, stage),
+            || focus_composer(&field),
+            || mutation_started.set(true),
+            || field.set_value(CFString::new(message).as_CFType()).is_ok(),
+            || type_text_to_pid(pid, message),
+            || press_return(pid),
+        )
+    }
+
+    /// Send only after binding the already-open exact-title AX window to the
+    /// supplied numeric-chat-ID transcript tail. This path never opens a row.
+    /// Transcript attestation and composer lookup both use the same AX window
+    /// instance, which is then required to remain unique through every input
+    /// mutation and Return check.
+    pub fn send_bound_via_ax(
+        chat_display_name: &str,
+        chat_id: i64,
+        message: &str,
+        local_tail: &[String],
+    ) -> std::result::Result<(), super::BoundSendFailure> {
+        let mutation_started = std::cell::Cell::new(false);
+        let send = || -> Result<()> {
+            let pid = find_kakaotalk_pid()?;
+            ensure_ax_permission()?;
+            let app = AXUIElement::application(pid);
+            let window = find_chat_window(&app, chat_display_name)?.ok_or_else(|| {
+                anyhow!(
+                    "bound send for chat ID {chat_id} requires exactly one already-open KakaoTalk window titled {chat_display_name:?}"
+                )
+            })?;
+
+            let ax_texts = read_visible_messages(&window)
+                .iter()
+                .map(|item| super::normalize_binding_message(&item.text))
+                .filter(|item| !item.is_empty())
+                .collect::<Vec<_>>();
+            let local_texts = local_tail
+                .iter()
+                .map(|item| super::normalize_binding_message(item))
+                .filter(|item| !item.is_empty())
+                .collect::<Vec<_>>();
+            let matched = super::match_transcript_suffix(&ax_texts, &local_texts);
+            if !matched.is_strong() {
+                anyhow::bail!(
+                    "bound send transcript attestation failed for numeric chat ID {chat_id}: matched {} rows, {} distinct values, {} UTF-8 bytes",
+                    matched.matched_count,
+                    matched.matched_distinct,
+                    matched.matched_utf8_bytes
+                );
+            }
+
+            let field = find_input_field_in(&window).ok_or_else(|| {
+                anyhow!(
+                    "could not find the message input field in the attested chat {chat_display_name:?}"
+                )
+            })?;
+            send_with_attested_field(
+                &app,
+                pid,
+                chat_display_name,
+                message,
+                field,
+                Some(&window),
+                &mutation_started,
+            )
+        };
+        send().map_err(|error| super::BoundSendFailure::new(error, mutation_started.get()))
+    }
+
+    /// Prove that a bound Bujamentor send could safely begin without focusing
+    /// or mutating KakaoTalk. This repeats the exact-title and strong local-tail
+    /// binding used by `send_bound_via_ax`, requires a readable empty composer,
+    /// and rechecks the same unique AX window instance afterward.
+    pub fn preflight_bound_via_ax(
+        chat_display_name: &str,
+        chat_id: i64,
+        local_tail: &[String],
+    ) -> Result<()> {
+        let pid = find_kakaotalk_pid()?;
+        ensure_ax_permission()?;
+        let app = AXUIElement::application(pid);
+        let window = find_chat_window(&app, chat_display_name)?.ok_or_else(|| {
+            anyhow!(
+                "bound preflight for chat ID {chat_id} requires exactly one already-open KakaoTalk window titled {chat_display_name:?}"
+            )
+        })?;
+
+        let ax_texts = read_visible_messages(&window)
+            .iter()
+            .map(|item| super::normalize_binding_message(&item.text))
+            .filter(|item| !item.is_empty())
+            .collect::<Vec<_>>();
+        let local_texts = local_tail
+            .iter()
+            .map(|item| super::normalize_binding_message(item))
+            .filter(|item| !item.is_empty())
+            .collect::<Vec<_>>();
+        let matched = super::match_transcript_suffix(&ax_texts, &local_texts);
+        if !matched.is_strong() {
+            anyhow::bail!(
+                "bound preflight transcript attestation failed for numeric chat ID {chat_id}: matched {} rows, {} distinct values, {} UTF-8 bytes",
+                matched.matched_count,
+                matched.matched_distinct,
+                matched.matched_utf8_bytes
+            );
+        }
+
+        let field = find_input_field_in(&window).ok_or_else(|| {
+            anyhow!(
+                "could not find the message input field in the attested chat {chat_display_name:?}"
+            )
+        })?;
+        super::guarded_composer_preflight(
+            || composer_text(&field),
+            |stage| ensure_same_exact_chat_window(&app, chat_display_name, Some(&window), stage),
+        )
+    }
+
     /// Send `message` to the chat identified by `chat_display_name` via AX
-    /// automation. Performs bounded composer-state acceptance verification after
-    /// Return, but does not confirm delivery and never automatically retries it.
+    /// automation. Posts Return exactly once after bounded composer-state
+    /// verification, but does not confirm delivery and never retries it.
     ///
     /// `chat_display_name` should be a substring of the chat's title as shown
     /// in the chat list (same matching convention as kakaocli's `send`).
@@ -820,52 +1901,45 @@ mod imp {
         // Fast path for an already-open chat. Avoiding a full snapshot of the
         // main chat-list window cuts tens of seconds on large chat histories
         // and does not change the selected/folded state of that window.
-        let field = find_chat_window(&app, chat_display_name)
-            .and_then(|window| find_input_field_in(&window));
+        let field = match find_chat_window(&app, chat_display_name)? {
+            Some(window) => find_input_field_in(&window).ok_or_else(|| {
+                anyhow!(
+                    "could not find the message input field in the already-open chat {chat_display_name:?}"
+                )
+            })?,
+            None => {
+                if std::env::var("OPENKAKAO_BUJAMENTOR_WORKER").as_deref() == Ok("1") {
+                    anyhow::bail!(
+                        "Bujamentor requires exactly one already-open KakaoTalk window titled {chat_display_name:?}"
+                    );
+                }
+                open_chat_row(&app, chat_display_name)?;
+                press_return(pid)?;
 
-        let field = if let Some(field) = field {
-            field
-        } else {
-            open_chat_row(&app, chat_display_name)?;
-            press_return(pid)?;
-
-            let deadline = Instant::now() + OPEN_CHAT_TIMEOUT;
-            loop {
-                match find_input_field(&app, chat_display_name) {
-                    Ok(field) => break field,
-                    Err(e) => {
-                        if Instant::now() >= deadline {
-                            return Err(e.context("chat window did not open in time"));
+                let deadline = Instant::now() + OPEN_CHAT_TIMEOUT;
+                loop {
+                    match find_input_field(&app, chat_display_name) {
+                        Ok(field) => break field,
+                        Err(e) => {
+                            if Instant::now() >= deadline {
+                                return Err(e.context("chat window did not open in time"));
+                            }
+                            sleep(Duration::from_millis(150));
                         }
-                        sleep(Duration::from_millis(150));
                     }
                 }
             }
         };
-        focus_composer(&field)?;
-
-        if field.set_value(CFString::new(message).as_CFType()).is_err() {
-            type_text_to_pid(pid, message)?;
-        }
-        press_return(pid)?;
-        sleep(Duration::from_millis(150));
-
-        // A readable, unchanged composer means KakaoTalk accepted the text but
-        // ignored the first Return. Retry once only in that exact state; an
-        // unreadable value remains accepted-but-unconfirmed to avoid duplicates.
-        if composer_text(&field).as_deref() == Some(message) {
-            focus_composer(&field)?;
-            press_return(pid)?;
-            sleep(Duration::from_millis(150));
-
-            if composer_text(&field).as_deref() == Some(message) {
-                return Err(anyhow!(
-                    "KakaoTalk left the message in the composer after two Return attempts; no further retry was made"
-                ));
-            }
-        }
-
-        Ok(())
+        let mutation_started = std::cell::Cell::new(false);
+        send_with_attested_field(
+            &app,
+            pid,
+            chat_display_name,
+            message,
+            field,
+            None,
+            &mutation_started,
+        )
     }
 
     /// One chat-list row scraped from the main window, read-only (never opens
@@ -1021,15 +2095,29 @@ mod imp {
             // AX/CGEvent automation tools (also what kakaocli's AXHelpers uses).
             assert_eq!(RETURN_KEYCODE, 36);
         }
+
+        #[test]
+        fn malformed_ax_utf16_is_lossy_instead_of_panicking() {
+            let units = [0xd800_u16, 0xac00_u16];
+            let value = unsafe {
+                let raw = core_foundation::string::CFStringCreateWithCharacters(
+                    std::ptr::null(),
+                    units.as_ptr(),
+                    units.len() as isize,
+                );
+                CFString::wrap_under_create_rule(raw)
+            };
+            assert_eq!(cf_string_lossy(&value).as_deref(), Some("�가"));
+        }
     }
 } // mod imp
 
 #[cfg(target_os = "macos")]
 pub use imp::{
-    read_via_ax, scrape_chat_list, scrape_chat_list_for_service,
-    scrape_chat_list_for_service_isolated, send_via_ax, ChatListRow,
+    preflight_bound_via_ax, read_open_exact_via_ax, read_via_ax, scrape_chat_list,
+    scrape_chat_list_for_service, scrape_chat_list_for_service_isolated, send_bound_via_ax,
+    send_via_ax, ChatListRow,
 };
-#[cfg(target_os = "macos")]
 #[cfg(not(target_os = "macos"))]
 mod stub {
     use anyhow::{anyhow, Result};
@@ -1050,10 +2138,39 @@ mod stub {
         ))
     }
 
+    pub fn send_bound_via_ax(
+        _chat_display_name: &str,
+        _chat_id: i64,
+        _message: &str,
+        _local_tail: &[String],
+    ) -> std::result::Result<(), super::BoundSendFailure> {
+        Err(super::BoundSendFailure::new(
+            anyhow!("bound local-send (AX automation) is only supported on macOS"),
+            false,
+        ))
+    }
+
+    pub fn preflight_bound_via_ax(
+        _chat_display_name: &str,
+        _chat_id: i64,
+        _local_tail: &[String],
+    ) -> Result<()> {
+        Err(anyhow!(
+            "bound local-send preflight (AX automation) is only supported on macOS"
+        ))
+    }
+
     pub fn read_via_ax(_chat_display_name: &str, _count: usize) -> Result<Vec<AxMessage>> {
         Err(anyhow!(
             "ax-read (AX automation) is only supported on macOS"
         ))
+    }
+
+    pub fn read_open_exact_via_ax(
+        _chat_display_name: &str,
+        _count: usize,
+    ) -> Result<Vec<AxMessage>> {
+        Err(anyhow!("AX exact-open reads are only supported on macOS"))
     }
 
     /// Mirrors `imp::ChatListRow`. Never constructed off macOS (the fn below
@@ -1083,8 +2200,9 @@ mod stub {
 
 #[cfg(not(target_os = "macos"))]
 pub use stub::{
-    read_via_ax, scrape_chat_list, scrape_chat_list_for_service,
-    scrape_chat_list_for_service_isolated, send_via_ax, ChatListRow,
+    preflight_bound_via_ax, read_open_exact_via_ax, read_via_ax, scrape_chat_list,
+    scrape_chat_list_for_service, scrape_chat_list_for_service_isolated, send_bound_via_ax,
+    send_via_ax, ChatListRow,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
