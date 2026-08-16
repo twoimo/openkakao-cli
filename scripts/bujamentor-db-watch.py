@@ -63,6 +63,7 @@ ENROLLMENT_SCHEMA_VERSION = 4
 CURSOR_AUTHORITY_SCHEMA_VERSION = 1
 CURSOR_FRESH_KIND = "fresh_attested_tail"
 CURSOR_REPLAY_KIND = "stopped_clean_ack_replay"
+CURSOR_LEFTOVER_KIND = "fenced_leftover_ack_resume"
 MAX_INT64 = 2**63 - 1
 MEDIA_DIR_PREFIX = "bujamentor-db-media-"
 MEDIA_ACTIVE_MARKER = ".bujamentor-inflight"
@@ -82,7 +83,8 @@ CURSOR_TRACKED_ID_LIMIT = 500
 CURSOR_RETAINED_ID_LIMIT = CURSOR_TRACKED_ID_LIMIT - LOCAL_POLL_MAX_ROWS
 LOCAL_POLL_MIN_INTERVAL = 0.2
 LOCAL_POLL_MAX_INTERVAL = 60.0
-LOCAL_POLL_STALE_GRACE = 3.0
+LOCAL_POLL_STALE_GRACE = 30.0
+LOCAL_POLL_FIRST_ENVELOPE_TIMEOUT = 30.0
 # KakaoTalk can commit NTChatRoom.lastLogId just before the corresponding
 # NTChatMessage row becomes visible to a new read-only SQLite snapshot.  The
 # Rust poller correctly reports that snapshot as a gap and exits. Retry only
@@ -146,6 +148,7 @@ _POLL_STREAM: subprocess.Popen[str] | None = None
 _POLL_STREAM_CHAT_ID: int | None = None
 _POLL_STREAM_INTERVAL: float | None = None
 _POLL_STREAM_AFTER: int | None = None
+_POLL_STREAM_STARTED_AT: float | None = None
 
 
 class DbFence(RuntimeError):
@@ -634,12 +637,13 @@ def _fixed_fence_reason(exc: BaseException) -> str:
 
 
 def _stop_poll_stream() -> None:
-    global _POLL_STREAM, _POLL_STREAM_CHAT_ID, _POLL_STREAM_INTERVAL, _POLL_STREAM_AFTER
+    global _POLL_STREAM, _POLL_STREAM_CHAT_ID, _POLL_STREAM_INTERVAL, _POLL_STREAM_AFTER, _POLL_STREAM_STARTED_AT
     stream = _POLL_STREAM
     _POLL_STREAM = None
     _POLL_STREAM_CHAT_ID = None
     _POLL_STREAM_INTERVAL = None
     _POLL_STREAM_AFTER = None
+    _POLL_STREAM_STARTED_AT = None
     if stream is None or stream.poll() is not None:
         return
     try:
@@ -697,6 +701,7 @@ def _start_poll_stream(chat_id: int, interval: float, after_log_id: int) -> None
     _POLL_STREAM_CHAT_ID = chat_id
     _POLL_STREAM_INTERVAL = bounded_interval
     _POLL_STREAM_AFTER = after_log_id
+    _POLL_STREAM_STARTED_AT = time.monotonic()
 
 
 def _read_poll_envelope() -> object:
@@ -704,7 +709,15 @@ def _read_poll_envelope() -> object:
     interval = _POLL_STREAM_INTERVAL or LOCAL_POLL_MIN_INTERVAL
     if stream is None or stream.stdout is None:
         raise DbFence("local-poll stream unavailable")
-    timeout = max(1.0, interval * LOCAL_POLL_STALE_GRACE)
+    first_wait = (
+        _POLL_STREAM_STARTED_AT is not None
+        and time.monotonic() - _POLL_STREAM_STARTED_AT < LOCAL_POLL_FIRST_ENVELOPE_TIMEOUT
+    )
+    timeout = (
+        LOCAL_POLL_FIRST_ENVELOPE_TIMEOUT
+        if first_wait
+        else max(1.0, interval * LOCAL_POLL_STALE_GRACE)
+    )
     try:
         ready, _, _ = select.select([stream.stdout], [], [], timeout)
     except (OSError, ValueError) as exc:
@@ -1605,7 +1618,7 @@ def _cli_enrollment_target() -> dict | None:
             or cursor_authority.get("prior_source_epoch") is not None
         ):
             raise DbFence("enrollment fresh cursor authority invalid")
-    elif cursor_kind == CURSOR_REPLAY_KIND:
+    elif cursor_kind in {CURSOR_REPLAY_KIND, CURSOR_LEFTOVER_KIND}:
         prior_owner_id = cursor_authority.get("prior_owner_id")
         prior_source_epoch = cursor_authority.get("prior_source_epoch")
         if (
@@ -1660,7 +1673,7 @@ def _cli_enrollment_target() -> dict | None:
             or not re.fullmatch(r"[0-9a-f]{64}", transcript_sha256)
         ):
             raise DbFence("enrollment transcript identity invalid")
-    if cursor_kind == CURSOR_REPLAY_KIND and kind != "ax_transcript":
+    if cursor_kind in {CURSOR_REPLAY_KIND, CURSOR_LEFTOVER_KIND} and kind != "ax_transcript":
         raise DbFence("enrollment replay cursor requires transcript identity")
     reply_author_bindings = _validated_reply_author_bindings(target)
     return {
@@ -1746,6 +1759,8 @@ def _state(state: dict) -> dict:
         "recent_message_tail": [],
     }
     defaults.update(state)
+    leftover_cli_takeover = False
+    leftover_idle_candidate = False
     clean_idle_candidate = False
     clean_cli_takeover = False
     if cli_mode and state:
@@ -1757,6 +1772,16 @@ def _state(state: dict) -> dict:
             state.get("delivery_enabled"),
             state.get("fence"),
             state.get("fence_reason"),
+        )
+        leftover_idle_candidate = (
+            pending == []
+            and (
+                state.get("pending_gaps") in ([], ["reconcile_required"])
+            )
+            and candidate_phase == "idle"
+            and in_flight_candidate is None
+            and capability[0] == "fenced"
+            and capability[1] is False
         )
         clean_idle_candidate = (
             pending == []
@@ -1776,6 +1801,12 @@ def _state(state: dict) -> dict:
                 and state.get("source_epoch") != configured_epoch_value
             )
         )
+        leftover_cli_takeover = bool(
+            leftover_idle_candidate
+            and authority_changed
+            and current_owner
+            and configured_epoch_value is not None
+        )
         clean_cli_takeover = bool(
             clean_idle_candidate
             and capability == ("stopped_clean", False, "stopped_clean", "")
@@ -1783,7 +1814,7 @@ def _state(state: dict) -> dict:
             and current_owner
             and configured_epoch_value is not None
         )
-        if authority_changed and not clean_cli_takeover:
+        if authority_changed and not clean_cli_takeover and not leftover_cli_takeover:
             invalid_state = True
     if enrollment is not None:
         enrollment_id = enrollment["chat_id"]
@@ -1801,9 +1832,15 @@ def _state(state: dict) -> dict:
             not fresh_state
             and defaults.get("cursor_floor") != enrollment_floor
             and not clean_cli_takeover
+            and not leftover_cli_takeover
         ):
             invalid_state = True
         if fresh_state and cursor_authority.get("kind") != CURSOR_FRESH_KIND:
+            invalid_state = True
+        if leftover_cli_takeover and (
+            cursor_authority.get("kind") != CURSOR_LEFTOVER_KIND
+            or cursor_authority.get("cursor_floor") != state.get("acked_watermark")
+        ):
             invalid_state = True
         if clean_cli_takeover and (
             cursor_authority.get("kind") != CURSOR_REPLAY_KIND
@@ -1860,9 +1897,13 @@ def _state(state: dict) -> dict:
     observed_raw = read_ids("observed_log_ids")
     pending_raw = read_ids("pending_log_ids")
     pending_gaps_raw = defaults.get("pending_gaps")
-    if not isinstance(pending_gaps_raw, list) or pending_gaps_raw:
+    if leftover_cli_takeover:
+        defaults["pending_gaps"] = []
+    elif not isinstance(pending_gaps_raw, list) or pending_gaps_raw:
         invalid_state = True
-    defaults["pending_gaps"] = []
+        defaults["pending_gaps"] = []
+    else:
+        defaults["pending_gaps"] = []
     watermark_value = defaults["acked_watermark"]
     last_observed_value = defaults["last_observed_log_id"]
     if (
@@ -1989,9 +2030,30 @@ def _state(state: dict) -> dict:
     if sentinel_seen or invalid_state:
         # Never normalize an invalid/sentinel cursor to the newest observed
         # value: doing so would permanently skip unresolved rows. Preserve the
-        # valid sets for reconciliation and publish an explicit fence.
-        defaults["acked_watermark"] = 0
-        defaults["last_observed_log_id"] = 0
+        # valid leftover ACK/observed sets for reconciliation and publish an
+        # explicit fence. Do not mint replay authority.
+        leftover_acked = [
+            value for value in acked_values if 0 < value < MAX_INT64
+        ]
+        leftover_observed = [
+            value for value in observed_values if 0 < value < MAX_INT64
+        ]
+        leftover_watermark = max(
+            (value for value in (watermark, *leftover_acked) if 0 < value < MAX_INT64),
+            default=0,
+        )
+        leftover_observed_id = max(
+            (
+                value
+                for value in (last_observed, *leftover_observed)
+                if 0 < value < MAX_INT64
+            ),
+            default=leftover_watermark,
+        )
+        defaults["acked_log_ids"] = leftover_acked
+        defaults["observed_log_ids"] = leftover_observed
+        defaults["acked_watermark"] = leftover_watermark
+        defaults["last_observed_log_id"] = leftover_observed_id
         defaults["capability_state"] = "fenced"
         defaults["delivery_enabled"] = False
         defaults["pending_gaps"] = ["reconcile_required"]
@@ -2006,7 +2068,7 @@ def _state(state: dict) -> dict:
             value for value in (last_observed, max(observed_values, default=0))
             if 0 < value < MAX_INT64
         ) if last_observed > 0 or observed_values else 0
-        if clean_cli_takeover and enrollment is not None:
+        if (clean_cli_takeover or leftover_cli_takeover) and enrollment is not None:
             # Only a fully validated, idle v3 state may cross a foreground
             # owner/epoch boundary. The enrollment was written only after the
             # CLI acquired the owner lock and proved the previous supervisor
@@ -3776,7 +3838,10 @@ def main() -> int:
                     )
                     continue
                 state, _ = _poll_with_bounded_clean_retry(state, interval)
-                if state.get("capability_state") == "fenced":
+                if (
+                    state.get("capability_state") == "fenced"
+                    and state.get("fence_reason") != "poll_fence"
+                ):
                     return 1
             except (
                 OSError,

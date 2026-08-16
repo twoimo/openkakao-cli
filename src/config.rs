@@ -430,6 +430,25 @@ pub fn validate_bujamentor_startup(
             );
         }
     }
+    if config.bujamentor.reply_runner_kind.as_deref() == Some("gjc") {
+        if config.model.privacy_mode.as_deref() != Some("remote_explicit")
+            || !matches!(
+                config.model.provider.as_deref(),
+                Some("gjc") | Some("google-antigravity")
+            )
+        {
+            anyhow::bail!(
+                "GJC reply runner requires model.privacy_mode=remote_explicit and model.provider=gjc or google-antigravity"
+            );
+        }
+        if config.bujamentor.reply_model.as_deref()
+            != Some("google-antigravity/gemini-3.6-flash-tiered")
+        {
+            anyhow::bail!(
+                "GJC reply runner must explicitly attest reply_model=google-antigravity/gemini-3.6-flash-tiered"
+            );
+        }
+    }
     let self_nickname =
         bujamentor_self_nickname(config).context("Bujamentor self nickname is not configured")?;
     if self_nickname.len() > 128 || self_nickname.chars().any(|char| char.is_control()) {
@@ -607,6 +626,14 @@ mod tests {
         assert!(validate_bujamentor_startup(&config, &["room".into()]).is_err());
         config.bujamentor.reply_service_tier = Some("priority".into());
         config.model.provider = Some("gjc".into());
+        assert!(validate_bujamentor_startup(&config, &["room".into()]).is_err());
+        config.bujamentor.reply_runner_kind = Some("gjc".into());
+        config.bujamentor.reply_model =
+            Some("google-antigravity/gemini-3.6-flash-tiered".into());
+        config.bujamentor.reply_reasoning_effort = Some("medium".into());
+        config.bujamentor.reply_service_tier = Some("default".into());
+        assert!(validate_bujamentor_startup(&config, &["room".into()]).is_ok());
+        config.bujamentor.reply_model = Some("gpt-5.6-luna".into());
         assert!(validate_bujamentor_startup(&config, &["room".into()]).is_err());
     }
 

@@ -56,9 +56,11 @@ class SessionRuntimePackagerTests(unittest.TestCase):
             encoding="utf-8",
         )
         config.chmod(0o600)
-        python = Path(sys.executable).resolve(strict=True)
+        python = root / "python3.11"
+        python.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        python.chmod(0o700)
         state = root / "state"
-        return module, source, binary.resolve(), config.resolve(), python, state
+        return module, source, binary.resolve(), config.resolve(), python.resolve(), state
 
     def test_stages_private_immutable_multi_room_runtime_without_activation(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -148,10 +150,13 @@ class SessionRuntimePackagerTests(unittest.TestCase):
             config = root / "config.toml"
             config.write_text('[bujamentor]\nchats = ["id:42"]\n', encoding="utf-8")
             config.chmod(0o600)
+            python = root / "python3.11"
+            python.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            python.chmod(0o700)
             state = root / "state"
             result = module.stage_runtime(
                 binary=binary.resolve(),
-                python=Path(sys.executable).resolve(strict=True),
+                python=python.resolve(),
                 config=config.resolve(),
                 source_dir=(ROOT / "scripts").resolve(strict=True),
                 state_root=state.resolve(),
@@ -323,6 +328,23 @@ class SessionRuntimePackagerTests(unittest.TestCase):
             self.assertFalse(staged.is_symlink())
             self.assertEqual(staged.stat().st_nlink, 1)
             self.assertNotEqual(staged.stat().st_ino, (source / staged.name).stat().st_ino)
+            self.assertNotIn("/Cellar/python@", str(python))
+
+    def test_rejects_cellar_python_and_keeps_opt_keg_string(self):
+        module = load("session_packager_python_pin")
+        cellar = Path(
+            "/opt/homebrew/Cellar/python@3.11/3.11.15_4/Frameworks/Python.framework/Versions/3.11/bin/python3.11"
+        )
+        with self.assertRaises(module.PackagingError):
+            module._owned_source(cellar, executable=True, allow_homebrew_python_keg=True)
+        keg = Path("/opt/homebrew/opt/python@3.11/bin/python3.11")
+        if keg.exists():
+            pinned = module._owned_source(
+                keg, executable=True, allow_homebrew_python_keg=True
+            )
+            self.assertEqual(pinned, keg)
+            self.assertNotIn("/Cellar/python@", str(pinned))
+        self.assertTrue(module._is_homebrew_opt_python_keg(keg))
 
 
 if __name__ == "__main__":

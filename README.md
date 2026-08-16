@@ -248,7 +248,12 @@ supervisor는 exclusive owner lock을 잡아 Terminal 세션 watchdog과 수동 
 
 ```bash
 # 시작 전 대상·권한·DB 매핑만 확인 (프로세스/파일/전송 없음)
-openkakao-cli auto-reply --chat 'name:부자멘토멘티' --check --json
+openkakao-cli auto-reply --chat '부자멘토멘티' --check --json
+
+# 초보용: 방 이름만 넣고, 터미널에서 방향키로 LLM을 고른다.
+# 고른 LLM이 실제로 응답해야 워커가 시작된다.
+openkakao-cli auto-reply --chat '부자멘토멘티'
+openkakao-cli auto-reply --chat '부자멘토멘티' --model gemini-3.6-flash
 
 # 채팅방 ID 하나 지정
 openkakao-cli auto-reply --chat id:417780809780519

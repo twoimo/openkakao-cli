@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::io::{self, IsTerminal, Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Result;
@@ -304,6 +305,85 @@ pub fn confirm() -> Result<bool> {
     let mut input = String::new();
     io::stdin().read_line(&mut input)?;
     Ok(input.trim().eq_ignore_ascii_case("y"))
+}
+
+pub struct ArrowMenuItem {
+    pub label: String,
+    #[allow(dead_code)]
+    pub value: String,
+}
+
+pub fn select_with_arrows(title: &str, items: &[ArrowMenuItem], selected: usize) -> Result<usize> {
+    if items.is_empty() {
+        anyhow::bail!("no options available");
+    }
+    if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
+        anyhow::bail!("arrow-key selection requires an interactive terminal; pass --model");
+    }
+    let mut index = selected.min(items.len() - 1);
+    let stderr = io::stderr();
+    let mut out = stderr.lock();
+    loop {
+        write!(out, "\r\x1b[2K{title}\n")?;
+        for (offset, item) in items.iter().enumerate() {
+            if offset == index {
+                write!(out, "\r\x1b[2K> {}\n", item.label)?;
+            } else {
+                write!(out, "\r\x1b[2K  {}\n", item.label)?;
+            }
+        }
+        write!(out, "\r\x1b[2K↑/↓ then Enter")?;
+        out.flush()?;
+        let key = read_menu_key()?;
+        write!(out, "\r\x1b[{}A", items.len() + 2)?;
+        match key {
+            MenuKey::Up => {
+                index = if index == 0 { items.len() - 1 } else { index - 1 };
+            }
+            MenuKey::Down => {
+                index = (index + 1) % items.len();
+            }
+            MenuKey::Enter => {
+                for _ in 0..(items.len() + 2) {
+                    write!(out, "\r\x1b[2K\n")?;
+                }
+                write!(out, "\r\x1b[{}A", items.len() + 2)?;
+                out.flush()?;
+                return Ok(index);
+            }
+            MenuKey::Escape => anyhow::bail!("model selection cancelled"),
+        }
+    }
+}
+
+enum MenuKey {
+    Up,
+    Down,
+    Enter,
+    Escape,
+}
+
+fn read_menu_key() -> Result<MenuKey> {
+    let mut stdin = io::stdin();
+    let mut first = [0_u8; 1];
+    stdin.read_exact(&mut first)?;
+    match first[0] {
+        b'\n' | b'\r' => Ok(MenuKey::Enter),
+        0x1b => {
+            let mut rest = [0_u8; 2];
+            if stdin.read(&mut rest)? < 2 {
+                return Ok(MenuKey::Escape);
+            }
+            match rest {
+                [b'[', b'A'] => Ok(MenuKey::Up),
+                [b'[', b'B'] => Ok(MenuKey::Down),
+                _ => Ok(MenuKey::Escape),
+            }
+        }
+        b'k' | b'K' => Ok(MenuKey::Up),
+        b'j' | b'J' => Ok(MenuKey::Down),
+        _ => read_menu_key(),
+    }
 }
 
 pub fn require_permission(enabled: bool, purpose: &str, hint: &str) -> Result<()> {

@@ -172,6 +172,8 @@ STATUS_REASON_CODES = frozenset(
         "poll_fence",
         "preflight_failed",
         "privacy_attestation_invalid",
+        "python_interpreter_missing",
+        "reconciliation_required",
         "privacy_attestation_missing",
         "readiness_fenced",
         "ready",

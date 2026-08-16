@@ -10,6 +10,7 @@ import selectors
 import hashlib
 import email.utils
 import os
+import html
 import random
 import math
 import signal
@@ -51,6 +52,7 @@ ENROLLMENT_SCHEMA_VERSION = 4
 CURSOR_AUTHORITY_SCHEMA_VERSION = 1
 CURSOR_FRESH_KIND = "fresh_attested_tail"
 CURSOR_REPLAY_KIND = "stopped_clean_ack_replay"
+CURSOR_LEFTOVER_KIND = "fenced_leftover_ack_resume"
 MAX_RESPONSE_TIMING_SECONDS = 24 * 60 * 60
 MAX_REPLY_DELAY_SECONDS = MAX_RESPONSE_TIMING_SECONDS
 QUEUE_PARENT_MODE = 0o700
@@ -764,12 +766,17 @@ def _apply_recovered_terminal(
     expected_updated_at: float | None = None,
     cutoff: float | None = None,
 ) -> bool:
-    assignments = ["due_at = NULL", "updated_at = ?"]
+    assignments = ["updated_at = ?"]
     values: list[object] = [time.time()]
+    if "due_at" in fields:
+        assignments.append("due_at = ?")
+        values.append(fields["due_at"])
+    else:
+        assignments.append("due_at = NULL")
     for name, value in fields.items():
         if name not in {
             "status", "decision", "reason", "category", "reply",
-            "scheduled_delay_seconds", "error_class",
+            "scheduled_delay_seconds", "error_class", "due_at",
         }:
             raise ValueError("unsupported recovered terminal field")
         assignments.append(f"{name} = ?")
@@ -2025,6 +2032,8 @@ def recover_stale_jobs(
                     if terminal is not None
                     else None
                 )
+                if fields is None:
+                    fields = leftover_pre_send_unknown_skip_fields(connection, row)
                 if fields is not None and _apply_recovered_terminal(
                     connection,
                     event_id,
@@ -2032,7 +2041,8 @@ def recover_stale_jobs(
                     expected_status=DELIVERY_UNKNOWN,
                     expected_updated_at=updated_at,
                 ):
-                    healed_unknown.append((event_id, str(row["reply"] or "")))
+                    if fields.get("status") in {"sent", "skipped"}:
+                        healed_unknown.append((event_id, str(row["reply"] or "")))
             connection.commit()
             transaction_started = False
         except BaseException:
@@ -2368,11 +2378,91 @@ def _claimable_job_row(
     ).fetchone()
 
 
+PRE_SEND_USAGE_LIMIT_REASONS = frozenset(
+    {
+        "model_usage_limited",
+        "model_rate_limited",
+        "model_authentication_unavailable",
+        "model_temporarily_unavailable",
+    }
+)
+
+
+def leftover_unknown_has_ax_mutation(
+    connection: sqlite3.Connection, event_id: str
+) -> bool:
+    try:
+        row = connection.execute(
+            """
+            SELECT COUNT(*) FROM sqlite_master
+            WHERE type = 'table' AND name = 'pipeline_transitions'
+            """
+        ).fetchone()
+    except sqlite3.Error:
+        return True
+    if row is None or int(row[0] or 0) == 0:
+        return True
+    count = connection.execute(
+        """
+        SELECT COUNT(*) FROM pipeline_transitions
+        WHERE event_id = ?
+          AND (
+            (component = 'ax' AND code IN ('ax_mutation_authorized', 'local_db_confirmed'))
+            OR (component = 'pre_send' AND to_state IN ('ready', 'sending'))
+            OR from_state = 'sending'
+            OR to_state = 'sending'
+          )
+        """,
+        (event_id,),
+    ).fetchone()
+    return int(count[0] or 0) > 0
+
+
+def leftover_pre_send_unknown_skip_fields(
+    connection: sqlite3.Connection, row: sqlite3.Row
+) -> dict | None:
+    reason = str(row["reason"] or "")
+    if row["reply"] not in {None, ""}:
+        return None
+    if leftover_unknown_has_ax_mutation(connection, str(row["event_id"])):
+        return None
+    if reason in PRE_SEND_USAGE_LIMIT_REASONS:
+        return {
+            "status": "skipped",
+            "decision": "skip",
+            "reason": reason,
+            "category": "uncertain",
+            "reply": None,
+            "scheduled_delay_seconds": None,
+            "error_class": None,
+        }
+    if reason:
+        return None
+    return {
+        "status": "pending",
+        "decision": None,
+        "reason": None,
+        "category": None,
+        "reply": None,
+        "scheduled_delay_seconds": None,
+        "error_class": None,
+        "due_at": time.time(),
+    }
+
 def _queue_reconciliation_blockers(connection: sqlite3.Connection) -> int:
     row = connection.execute(
         """
         SELECT COUNT(*) FROM reply_jobs
         WHERE status IN ('delivery_unknown', 'reconcile_required', 'poison')
+          AND NOT (
+            status = 'delivery_unknown'
+            AND (reply IS NULL OR reply = '')
+            AND (
+              reason IS NULL
+              OR reason = ''
+              OR reason IN ('model_usage_limited', 'model_rate_limited', 'model_authentication_unavailable', 'model_temporarily_unavailable')
+            )
+          )
         """
     ).fetchone()
     if row is None or isinstance(row[0], bool):
@@ -4009,7 +4099,7 @@ def _enrolled_reply_author_bindings(target_chat_id: int) -> dict[str, int] | Non
             or cursor_authority.get("prior_source_epoch") is not None
         ):
             return None
-    elif cursor_kind == CURSOR_REPLAY_KIND:
+    elif cursor_kind in {CURSOR_REPLAY_KIND, CURSOR_LEFTOVER_KIND}:
         prior_owner_id = cursor_authority.get("prior_owner_id")
         prior_source_epoch = cursor_authority.get("prior_source_epoch")
         if (
@@ -4069,7 +4159,7 @@ def _enrolled_reply_author_bindings(target_chat_id: int) -> dict[str, int] | Non
             return None
     else:
         return None
-    if cursor_kind == CURSOR_REPLAY_KIND and identity.get("kind") != "ax_transcript":
+    if cursor_kind in {CURSOR_REPLAY_KIND, CURSOR_LEFTOVER_KIND} and identity.get("kind") != "ax_transcript":
         return None
     values = target.get("reply_author_bindings")
     if not isinstance(values, list) or not 0 < len(values) <= 64:
@@ -5567,7 +5657,7 @@ def sample_response_delay_for_analysis(
 
     A delayed mixture component is useful for ordinary social/information
     messages, but it makes a direct question likely to become stale whenever
-    another participant speaks first.  Keep the learned immediate component's
+    another participant speaks first. Keep the learned immediate component
     Gaussian variation and lower bound; only the component selection is
     constrained for questions and advice.
     """
@@ -6430,7 +6520,7 @@ def generate_reply(
             "--config",
             f'service_tier="{REPLY_SERVICE_TIER}"',
             "--config",
-            'web_search="disabled"',
+            f'web_search="{"cached" if require_web_search else "disabled"}"',
             "--config",
             "tools.view_image=false",
             "--config",
@@ -6472,6 +6562,8 @@ def generate_reply(
             "--system-prompt",
             system_prompt,
         ]
+        if REPLY_MODEL:
+            command.extend(["--model", REPLY_MODEL])
         for path in normalized_image_paths:
             command.append(f"@{path}")
         command.append(prompt_argument)
@@ -6587,11 +6679,24 @@ def generate_reply(
         stdout = stdout_bytes.decode("utf-8")
     except UnicodeDecodeError:
         return fail_model_call("invalid_output")
+    values_to_try = []
     for line in reversed(stdout.splitlines()):
         try:
-            value = json.loads(line)
+            values_to_try.append(json.loads(line))
         except json.JSONDecodeError:
             continue
+    cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", stdout.strip()).strip()
+    try:
+        values_to_try.append(json.loads(cleaned))
+    except json.JSONDecodeError:
+        match = re.search(r"\{[\s\S]*\}", stdout)
+        if match:
+            try:
+                values_to_try.append(json.loads(match.group(0)))
+            except json.JSONDecodeError:
+                pass
+
+    for value in values_to_try:
         if REPLY_RUNNER_KIND == "codex" and isinstance(value, dict):
             if value.get("type") == "item.completed":
                 item = value.get("item")
@@ -7538,17 +7643,21 @@ def analyze_event(event: dict) -> dict:
             result["category"] = "policy"
             return result
         if urls and os.environ.get("OPENKAKAO_ALLOW_LINK_FETCH") != "1":
-            result["reason"] = "link_fetch_not_opted_in"
-            result["category"] = "policy"
-            return result
-        previews = fetch_link_previews(message)
+            if event.get("proactive") is True:
+                previews = []
+            else:
+                result["reason"] = "link_fetch_not_opted_in"
+                result["category"] = "policy"
+                return result
+        else:
+            previews = fetch_link_previews(message)
         provenance["links_requested"] = len(urls)
         provenance["links_retrieved"] = sum(
             1
             for preview in previews
             if isinstance(preview, dict) and preview.get("complete") is True
         )
-        if urls and not links_fully_retrieved(message, previews):
+        if urls and event.get("proactive") is not True and not links_fully_retrieved(message, previews):
             result["reason"] = "link_unavailable"
             result["category"] = "uncertain"
             return result
@@ -7983,7 +8092,7 @@ def processing_job_has_no_send_attempt(
     connection: sqlite3.Connection | None,
     event_id: str,
 ) -> bool:
-    """Return true only before send_reply's durable ``sending`` transition."""
+    """Return true only before send_reply durable sending transition."""
     return reply_job_delivery_phase(connection, event_id) == "processing"
 
 
@@ -8129,17 +8238,23 @@ def process_job(
 
     if previous_status == "scheduled":
         try:
-            stale_backlog = event_exceeds_response_upper(
-                event,
-                event["response_window_upper_seconds"],
-            )
+            if event.get("proactive") is True:
+                stale_backlog = False
+            else:
+                stale_backlog = event_exceeds_response_upper(
+                    event,
+                    event["response_window_upper_seconds"],
+                )
         except (KeyError, RetrievalError):
             finish_delivery_unknown(event, event_id, connection)
             return
         if stale_backlog:
             finish_scheduled_stale_backlog(event, event_id, connection)
             return
-        advanced = conversation_advanced_past_event(event)
+        if event.get("proactive") is True:
+            advanced = False
+        else:
+            advanced = conversation_advanced_past_event(event)
         if advanced is None:
             finish_delivery_unknown(event, event_id, connection)
             return
@@ -8385,20 +8500,33 @@ def process_job(
         complete_event(event_id, reply)
         return
 
-    analysis_event = _coalesced_burst_event(event)
-    with _active_job_journal(connection, analysis_event):
-        analysis = (
-            analyze_media_unavailable_clarification(analysis_event)
-            if _media_unavailable_clarification_event(event)
-            else analyze_event(analysis_event)
-        )
-        if bool((analysis.get("provenance") or {}).get("model_invoked")):
-            _active_journal_checkpoint(
-                component="model",
-                from_state="processing",
-                to_state="processing",
-                code="model_result",
+    if event.get("proactive") is True:
+        reply = str(event.get("message") or "").strip()
+        if not reply:
+            finish_delivery_unknown(event, event_id, connection)
+            return
+        analysis = {
+            "decision": "reply",
+            "reason": "geeknews_rss",
+            "category": "proactive",
+            "reply": reply,
+            "provenance": {},
+        }
+    else:
+        analysis_event = _coalesced_burst_event(event)
+        with _active_job_journal(connection, analysis_event):
+            analysis = (
+                analyze_media_unavailable_clarification(analysis_event)
+                if _media_unavailable_clarification_event(event)
+                else analyze_event(analysis_event)
             )
+            if bool((analysis.get("provenance") or {}).get("model_invoked")):
+                _active_journal_checkpoint(
+                    component="model",
+                    from_state="processing",
+                    to_state="processing",
+                    code="model_result",
+                )
     if analysis["decision"] != "reply":
         try:
             model_due_at = _model_defer_due_at(event, analysis)
@@ -8538,6 +8666,549 @@ def _worker_sleep_seconds(now: float, next_recovery_at: float) -> float:
     return min(WORKER_POLL_SECONDS, until_recovery or WORKER_POLL_SECONDS)
 
 
+PROACTIVE_EVENT_PREFIX = "proactive"
+PROACTIVE_TOKEN_DENYLIST = {
+    "ㅋㅋ",
+    "ㅋㅋㅋ",
+    "ㅎㅎ",
+    "ㅇㅇ",
+    "ㄷㄷ",
+    "ㅁㅊ",
+    "zz",
+    "ㅠㅠ",
+    "ㅜㅜ",
+}
+GEEKNEWS_FEED_URL = "https://news.hada.io/rss/news"
+GEEKNEWS_TOPIC_RE = re.compile(r"^https://news\.hada\.io/topic\?id=([1-9][0-9]{0,9})\Z")
+GEEKNEWS_CURSOR_NAME = "geeknews-rss-cursor.json"
+GEEKNEWS_MAX_ITEMS = 3
+GEEKNEWS_MAX_SUMMARY_CHARS = 90
+GEEKNEWS_FEED_MAX_BYTES = 400_000
+GEEKNEWS_FEED_TIMEOUT_SECONDS = 8.0
+
+
+def _style_topic_candidates(common_tokens_json: str) -> list[str]:
+    try:
+        tokens = json.loads(common_tokens_json)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return []
+    if not isinstance(tokens, dict):
+        return []
+    ranked: list[tuple[int, str]] = []
+    for token, count in tokens.items():
+        if not isinstance(token, str):
+            continue
+        cleaned = token.strip()
+        if (
+            not cleaned
+            or cleaned in PROACTIVE_TOKEN_DENYLIST
+            or len(cleaned) < 2
+            or cleaned.isdigit()
+            or not any(ch.isalpha() or ("가" <= ch <= "힣") for ch in cleaned)
+        ):
+            continue
+        if isinstance(count, bool) or not isinstance(count, (int, float)):
+            continue
+        ranked.append((int(count), cleaned))
+    ranked.sort(reverse=True)
+    return [token for _, token in ranked[:8]]
+
+def _geeknews_cursor_path() -> Path:
+    return QUEUE.with_name(GEEKNEWS_CURSOR_NAME)
+
+
+def _load_geeknews_seen_ids() -> set[int]:
+    path = _geeknews_cursor_path()
+    payload = _read_fence_object(path)
+    if payload is None:
+        return set()
+    values = payload[0].get("seen_ids")
+    if not isinstance(values, list):
+        return set()
+    seen: set[int] = set()
+    for item in values[-200:]:
+        if isinstance(item, int) and not isinstance(item, bool) and item > 0:
+            seen.add(item)
+    return seen
+
+
+def _store_geeknews_seen_ids(seen_ids: set[int], newest_id: int) -> None:
+    path = _geeknews_cursor_path()
+    payload = {
+        "feed": GEEKNEWS_FEED_URL,
+        "newest_id": newest_id,
+        "seen_ids": sorted(seen_ids)[-200:],
+        "updated_at": int(time.time()),
+    }
+    raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    fd, temporary = tempfile.mkstemp(prefix="geeknews-cursor.", dir=path.parent)
+    try:
+        os.fchmod(fd, QUEUE_FILE_MODE)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(raw)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    except OSError:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+
+
+def _html_to_plain(value: str) -> str:
+    text = re.sub(r"(?is)<(script|style)\b[^>]*>.*?</\1>", " ", value)
+    text = re.sub(r"(?s)<[^>]+>", " ", text)
+    text = html.unescape(text)
+    return " ".join(text.split())
+
+
+def _parse_geeknews_entries(feed_xml: str) -> list[dict]:
+    items: list[dict] = []
+    for raw in re.findall(r"<entry>(.*?)</entry>", feed_xml, re.S):
+        title_match = re.search(
+            r"<title[^>]*>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</title>", raw, re.S
+        )
+        link_match = re.search(r"<link[^>]+href='([^']+)'", raw) or re.search(
+            r'<link[^>]+href="([^"]+)"', raw
+        )
+        content_match = re.search(
+            r"<content[^>]*>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</content>", raw, re.S
+        )
+        url = str(link_match.group(1) if link_match else "").strip()
+        topic = GEEKNEWS_TOPIC_RE.fullmatch(url)
+        title = _html_to_plain(title_match.group(1) if title_match else "")
+        summary = _html_to_plain(content_match.group(1) if content_match else "")
+        if topic is None or not title:
+            continue
+        if len(summary) > GEEKNEWS_MAX_SUMMARY_CHARS:
+            summary = summary[:GEEKNEWS_MAX_SUMMARY_CHARS].rstrip() + "…"
+        items.append(
+            {
+                "id": int(topic.group(1)),
+                "title": title,
+                "url": url,
+                "summary": summary,
+            }
+        )
+    return items
+
+
+def _fetch_geeknews_feed_xml(fetcher=None) -> str:
+    if fetcher is not None:
+        return str(fetcher() or "")
+    parsed = urllib.parse.urlparse(GEEKNEWS_FEED_URL)
+    deadline = time.monotonic() + GEEKNEWS_FEED_TIMEOUT_SECONDS
+    try:
+        connection, response = _open_pinned_link(
+            parsed,
+            "news.hada.io",
+            443,
+            _resolve_link_addresses("news.hada.io", 443, GEEKNEWS_FEED_TIMEOUT_SECONDS),
+            deadline,
+        )
+    except Exception:
+        return ""
+    try:
+        status = getattr(response, "status", None)
+        if not isinstance(status, int) or not 200 <= status < 300:
+            return ""
+        body = _read_link_body(response, deadline)
+    except (OSError, TimeoutError, ValueError):
+        return ""
+    finally:
+        connection.close()
+    if len(body) > GEEKNEWS_FEED_MAX_BYTES:
+        return ""
+    return body.decode("utf-8", "replace")
+
+
+def _next_geeknews_digest(*, fetcher=None) -> dict | None:
+    xml = _fetch_geeknews_feed_xml(fetcher)
+    items = _parse_geeknews_entries(xml)
+    if not items:
+        return None
+    seen = _load_geeknews_seen_ids()
+    fresh = [item for item in items if item["id"] not in seen]
+    if not fresh:
+        return None
+    chosen = fresh[:GEEKNEWS_MAX_ITEMS]
+    newest = max(item["id"] for item in items)
+    seen.update(item["id"] for item in chosen)
+    _store_geeknews_seen_ids(seen, newest)
+    lines = ["긱뉴스 새 글"]
+    for item in chosen:
+        block = f"- {item['title']}"
+        if item["summary"]:
+            block += f"\n{item['summary']}"
+        block += f"\n{item['url']}"
+        lines.append(block)
+    return {
+        "title": chosen[0]["title"],
+        "url": chosen[0]["url"],
+        "message": "\n\n".join(lines),
+        "ids": [item["id"] for item in chosen],
+    }
+
+def _proactive_search_hits(query: str) -> list[dict]:
+    """Ask the trusted reply runner for current public links. Never live-sends."""
+    if not runner_is_trusted(force_full=True) or not REPLY_RUNNER.exists():
+        return []
+    prompt = (
+        "Return only JSON array of up to 2 public news or trend links. "
+        f"Query: {query}. Each item: {{\"title\":\"...\",\"url\":\"https://...\"}}."
+    )
+    command = [
+        str(REPLY_RUNNER),
+        "-p",
+        "--no-session",
+        "--no-rules",
+        "--no-lsp",
+        "--no-title",
+        "--no-pty",
+        "--tools",
+        "web_search",
+        "--mode",
+        "text",
+        "--thinking",
+        REPLY_REASONING_EFFORT or "medium",
+    ]
+    if REPLY_MODEL:
+        command.extend(["--model", REPLY_MODEL])
+    try:
+        returncode, stdout_bytes, _ = _run_bounded_process(
+            command,
+            cwd=ROOT,
+            env={"HOME": str(Path.home()), "PATH": "/Users/twoimo/.bun/bin:/usr/bin:/bin:/opt/homebrew/bin"},
+            timeout=45.0,
+            stdout_cap=MAX_MODEL_OUTPUT_BYTES,
+            stderr_cap=MAX_MODEL_STDERR_BYTES,
+        )
+    except (OSError, subprocess.TimeoutExpired, _CaptureOverflow, _CaptureIOError):
+        return []
+    if returncode != 0:
+        return []
+    text = stdout_bytes.decode("utf-8", errors="replace")
+    start = text.find("[")
+    end = text.rfind("]")
+    if start < 0 or end <= start:
+        return []
+    try:
+        parsed = json.loads(text[start : end + 1])
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(parsed, list):
+        return []
+    hits = []
+    for item in parsed[:2]:
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("title") or "").strip()
+        url = str(item.get("url") or "").strip()
+        if title and url.startswith("https://"):
+            hits.append({"title": title, "url": url})
+    return hits
+
+
+def _load_proactive_vector_profiles() -> tuple[dict | None, dict | None]:
+    style_profile = None
+    response_time = None
+    try:
+        connection = _private_context_connection()
+    except (OSError, PermissionError, sqlite3.Error):
+        connection = None
+    try:
+        if connection is not None:
+            row = connection.execute(
+                """
+                SELECT common_tokens_json
+                FROM choi_yeonwoo_style_profile
+                WHERE chat = ? AND user_name = '최연우'
+                ORDER BY sample_count DESC
+                LIMIT 1
+                """,
+                (CHAT,),
+            ).fetchone()
+            if row is not None:
+                style_profile = {"common_tokens_json": row["common_tokens_json"]}
+            stats_row = connection.execute(
+                """
+                SELECT chat, source, user_name, sample_count, average_seconds,
+                       median_seconds, p90_seconds, min_seconds, max_seconds,
+                       max_window_seconds, stddev_seconds, distribution_json
+                FROM response_time_stats
+                WHERE chat = ? AND user_name = '최연우'
+                ORDER BY sample_count DESC
+                LIMIT 1
+                """,
+                (CHAT,),
+            ).fetchone()
+            if stats_row is not None:
+                try:
+                    distribution = json.loads(stats_row["distribution_json"])
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    distribution = None
+                response_time = {
+                    "chat": stats_row["chat"],
+                    "source": stats_row["source"],
+                    "user": stats_row["user_name"],
+                    "sample_count": stats_row["sample_count"],
+                    "average_seconds": stats_row["average_seconds"],
+                    "median_seconds": stats_row["median_seconds"],
+                    "p90_seconds": stats_row["p90_seconds"],
+                    "min_seconds": stats_row["min_seconds"],
+                    "max_seconds": stats_row["max_seconds"],
+                    "max_window_seconds": stats_row["max_window_seconds"],
+                    "stddev_seconds": stats_row["stddev_seconds"],
+                    "distribution": distribution,
+                }
+    except sqlite3.Error:
+        pass
+    finally:
+        if connection is not None:
+            connection.close()
+    return style_profile, response_time
+
+
+def _latest_inbound_silence_source() -> tuple[dict | None, bool]:
+    path = _fence_path(DB_WATCH_STATE_ENV, DB_WATCH_STATE_PATH)
+    first = _read_fence_object(path)
+    second = _read_fence_object(path)
+    if first is None or second is None:
+        return None, True
+    if first[1] != second[1] and first[0] != second[0]:
+        return None, True
+    state = first[0]
+    tail = state.get("recent_message_tail")
+    if not isinstance(tail, list):
+        return None, True
+    inbound = None
+    last_sent_at = None
+    for item in tail:
+        if not isinstance(item, dict):
+            return None, True
+        sent_at = item.get("sent_at")
+        if isinstance(sent_at, int) and not isinstance(sent_at, bool):
+            last_sent_at = sent_at
+        if item.get("is_self") is True:
+            continue
+        if item.get("reply_authorized") is not True:
+            continue
+        inbound = _silence_source_from_row(item, sent_at)
+    if inbound is None:
+        inbound = _latest_authorized_inbound_from_context(last_sent_at)
+    if inbound is None:
+        return None, False
+    inbound["room_last_sent_at"] = last_sent_at
+    inbound["inbound_silence_at"] = inbound.get("sent_at")
+    return inbound, False
+
+
+def _silence_source_from_row(item: dict, sent_at: object) -> dict | None:
+    author_id = item.get("author_id")
+    nickname = str(item.get("author_nickname") or item.get("sender_name") or "").strip()
+    log_id = item.get("log_id")
+    chat_id = item.get("chat_id")
+    if (
+        not isinstance(author_id, int)
+        or isinstance(author_id, bool)
+        or author_id <= 0
+        or not nickname
+        or not isinstance(log_id, int)
+        or isinstance(log_id, bool)
+        or log_id <= 0
+        or not isinstance(chat_id, int)
+        or isinstance(chat_id, bool)
+        or chat_id <= 0
+    ):
+        return None
+    event_id = f"db:{chat_id}:{log_id}"
+    return {
+        "event_id": event_id,
+        "canonical_event_id": event_id,
+        "chat_id": chat_id,
+        "chat_name": CHAT,
+        "log_id": log_id,
+        "author_id": author_id,
+        "author_nickname": nickname,
+        "is_self": False,
+        "reply_authorized": True,
+        "message": str(item.get("message") or ""),
+        "sent_at": (
+            sent_at
+            if isinstance(sent_at, int) and not isinstance(sent_at, bool)
+            else None
+        ),
+    }
+
+
+def _latest_authorized_inbound_from_context(room_last_sent_at: int | None) -> dict | None:
+    bindings = _enrolled_reply_author_bindings(_queue_expected_chat_id())
+    if not bindings:
+        return None
+    try:
+        connection = _private_context_connection()
+    except (OSError, PermissionError, sqlite3.Error):
+        return None
+    try:
+        names = tuple(bindings)
+        placeholders = ",".join("?" for _ in names)
+        row = connection.execute(
+            f"""
+            SELECT chat_id, log_id, sender_name, sent_at
+            FROM context_live_events
+            WHERE chat_id = ?
+              AND sender_name IN ({placeholders})
+            ORDER BY log_id DESC
+            LIMIT 1
+            """,
+            (_queue_expected_chat_id(), *names),
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+    finally:
+        connection.close()
+    if row is None:
+        return None
+    nickname = str(row["sender_name"])
+    author_id = bindings.get(nickname)
+    if author_id is None:
+        return None
+    source = _silence_source_from_row(
+        {
+            "author_id": author_id,
+            "author_nickname": nickname,
+            "log_id": row["log_id"],
+            "chat_id": row["chat_id"],
+            "message": "",
+        },
+        row["sent_at"],
+    )
+    if source is None:
+        return None
+    source["room_last_sent_at"] = room_last_sent_at
+    return source
+
+
+def _next_proactive_event_id(chat_id: int, inbound_log_id: int, now: float) -> str:
+    stamp = int(now)
+    if not 0 < stamp < MAX_INT64:
+        return ""
+    candidate = stamp
+    while candidate == inbound_log_id and candidate + 1 < MAX_INT64:
+        candidate += 1
+    if not 0 < candidate < MAX_INT64:
+        return ""
+    return f"db:{chat_id}:{candidate}"
+
+
+def maybe_enqueue_proactive_topic(
+    connection: sqlite3.Connection,
+    *,
+    now: float,
+    response_time: dict | None,
+    style_profile: dict | None,
+    last_observed_sent_at: int | None,
+    conversation_advanced: bool,
+    source_event: dict | None = None,
+    enqueue=enqueue_event,
+    search=None,
+) -> dict | None:
+    if conversation_advanced:
+        return None
+    if not isinstance(source_event, dict):
+        return None
+    inbound_sent_at = source_event.get("inbound_silence_at")
+    if not isinstance(inbound_sent_at, int) or isinstance(inbound_sent_at, bool):
+        inbound_sent_at = source_event.get("sent_at")
+    if not isinstance(inbound_sent_at, int) or isinstance(inbound_sent_at, bool):
+        return None
+    if now - float(inbound_sent_at) < 1:
+        return None
+    try:
+        timing = sample_response_delay(response_time, component_name="delayed")
+        silence_needed = min(float(timing["delay_seconds"]), 180.0)
+        window_upper = max(float(timing.get("response_window_upper_seconds") or 180.0), 180.0)
+    except RetrievalError:
+        silence_needed = 180.0
+        window_upper = 180.0
+    if now - float(inbound_sent_at) < silence_needed:
+        return None
+    existing = connection.execute(
+        """
+        SELECT 1 FROM reply_jobs
+        WHERE json_extract(event_json, '$.proactive') = 1
+          AND status IN ('pending', 'scheduled', 'processing', 'sending')
+        LIMIT 1
+        """
+    ).fetchone()
+    if existing is not None:
+        return None
+    digest = None
+    if search is not None:
+        hits = list(search("긱뉴스") or [])
+        if hits:
+            title = str(hits[0].get("title") or "").strip()
+            url = str(hits[0].get("url") or "").strip()
+            if title and url.startswith("https://"):
+                digest = {
+                    "title": title,
+                    "url": url,
+                    "message": f"{title}\n{url}",
+                    "ids": [],
+                }
+    if digest is None:
+        digest = _next_geeknews_digest()
+    if not isinstance(digest, dict):
+        return None
+    title = str(digest.get("title") or "").strip()
+    url = str(digest.get("url") or "").strip()
+    message = str(digest.get("message") or "").strip()
+    if not title or not url.startswith("https://") or not message:
+        return None
+    chat_id = source_event.get("chat_id")
+    inbound_log_id = source_event.get("log_id")
+    if (
+        not isinstance(chat_id, int)
+        or isinstance(chat_id, bool)
+        or chat_id <= 0
+        or not isinstance(inbound_log_id, int)
+        or isinstance(inbound_log_id, bool)
+        or inbound_log_id <= 0
+    ):
+        return None
+    event_id = _next_proactive_event_id(chat_id, inbound_log_id, now)
+    if not event_id:
+        return None
+    event = dict(source_event)
+    event["event_id"] = event_id
+    event["canonical_event_id"] = event_id
+    event["log_id"] = int(event_id.rsplit(":", 1)[-1])
+    event["sent_at"] = int(now)
+    event["urls"] = [url]
+    event["owner_id"] = os.environ.get(SUPERVISOR_OWNER_ENV, "").strip()
+    event["source_epoch"] = _fence_env_int(os.environ.get(DB_SOURCE_EPOCH_ENV, ""))
+    event["envelope_version"] = 1
+    event["event_type"] = "local_db_message"
+    event["method"] = "local_db"
+    event["direction"] = "incoming"
+    event["source"] = "database"
+    event["proactive"] = True
+    event["proactive_query"] = "geeknews-rss"
+    event["proactive_token"] = "긱뉴스"
+    event["proactive_source_log_id"] = inbound_log_id
+    event["proactive_ids"] = list(digest.get("ids") or [])
+    event["response_window_upper_seconds"] = window_upper
+    event["message"] = message
+    if not enqueue(event):
+        return None
+    return {
+        "event_id": event_id,
+        "query": "geeknews-rss",
+        "delay_seconds": silence_needed,
+    }
+
+
 def worker_main() -> int:
     global _WORKER_HEALTH
     connection: sqlite3.Connection | None = None
@@ -8601,6 +9272,27 @@ def worker_main() -> int:
                 )
                 if claimed is None:
                     health.phase("idle")
+                    try:
+                        source, advanced = _latest_inbound_silence_source()
+                        style_profile, response_time = _load_proactive_vector_profiles()
+                        sent_at = None
+                        if isinstance(source, dict):
+                            raw_sent = source.get("inbound_silence_at")
+                            if not isinstance(raw_sent, int) or isinstance(raw_sent, bool):
+                                raw_sent = source.get("sent_at")
+                            if isinstance(raw_sent, int) and not isinstance(raw_sent, bool):
+                                sent_at = raw_sent
+                        maybe_enqueue_proactive_topic(
+                            connection,
+                            now=now,
+                            response_time=response_time,
+                            style_profile=style_profile,
+                            last_observed_sent_at=sent_at,
+                            conversation_advanced=advanced,
+                            source_event=source,
+                        )
+                    except (OSError, PermissionError, sqlite3.Error, RetrievalError, TypeError, ValueError):
+                        pass
                     time.sleep(_worker_sleep_seconds(time.time(), next_recovery_at))
                     continue
                 job, previous_status = claimed

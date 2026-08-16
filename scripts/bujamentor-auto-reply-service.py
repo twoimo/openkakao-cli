@@ -60,19 +60,51 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+DURABLE_PREFLIGHT_FENCE_MARKERS = (
+    "requires reconciliation before restart",
+    "has enrollment authority but no clean v3 DB state",
+    "stopped_unclean",
+)
+
+
+def _durable_preflight_fence_reason(detail: str) -> str | None:
+    if "python_interpreter_missing" in detail:
+        return "python_interpreter_missing"
+    if any(marker in detail for marker in DURABLE_PREFLIGHT_FENCE_MARKERS):
+        return "reconciliation_required"
+    return None
+
+
+def _is_homebrew_opt_python_keg(path: Path) -> bool:
+    return str(path) in {
+        "/opt/homebrew/opt/python@3.11/bin/python3.11",
+        "/opt/homebrew/opt/python@3.12/bin/python3.12",
+        "/opt/homebrew/opt/python@3.13/bin/python3.13",
+    }
+
+
 def _owned_file(path: Path, *, executable: bool = False) -> Path:
-    if not path.is_absolute() or path.is_symlink():
+    if not path.is_absolute():
         raise SystemExit(f"unsafe file path: {path}")
-    resolved = path.resolve(strict=True)
+    if path.is_symlink() and not _is_homebrew_opt_python_keg(path):
+        raise SystemExit(f"unsafe file path: {path}")
+    if "/Cellar/python@" in str(path):
+        raise SystemExit(f"python_interpreter_missing: Cellar version path is forbidden: {path}")
+    try:
+        resolved = path.resolve(strict=True)
+    except OSError as exc:
+        if _is_homebrew_opt_python_keg(path):
+            raise SystemExit(f"python_interpreter_missing: {path}") from exc
+        raise SystemExit(f"unsafe file path: {path}") from exc
     metadata = resolved.stat()
     if (
         not stat.S_ISREG(metadata.st_mode)
-        or metadata.st_uid != os.geteuid()
+        or (not path.is_symlink() and metadata.st_uid != os.geteuid())
         or stat.S_IMODE(metadata.st_mode) & 0o022
         or (executable and not stat.S_IMODE(metadata.st_mode) & stat.S_IXUSR)
     ):
         raise SystemExit(f"unsafe file ownership or mode: {resolved}")
-    return resolved
+    return path if _is_homebrew_opt_python_keg(path) else resolved
 
 
 def _private_state_root(path: Path) -> Path:
@@ -478,6 +510,17 @@ def _perform_preflight(
         raise SystemExit("auto-reply preflight diagnostics exceeded the bound")
     if result.returncode != 0:
         sys.stderr.buffer.write(result.stderr[-MAX_OUTPUT_BYTES:])
+        combined = "\n".join(
+            (
+                result.stdout[-MAX_OUTPUT_BYTES:].decode("utf-8", "replace"),
+                result.stderr[-MAX_OUTPUT_BYTES:].decode("utf-8", "replace"),
+            )
+        )
+        fence = _durable_preflight_fence_reason(combined)
+        if fence:
+            raise SystemExit(
+                f"{fence}: {combined.strip() or 'auto-reply preflight failed'}"
+            )
         raise SystemExit("auto-reply preflight failed")
     payload = _check_payload(result.stdout)
     if chat_selectors and len(payload["targets"]) != len(chat_selectors):
@@ -1080,9 +1123,20 @@ def run_session(
                     state_root,
                 )
             except (Exception, SystemExit) as exc:
+                detail = str(exc)
+                fence = _durable_preflight_fence_reason(detail)
+                if fence == "reconciliation_required":
+                    shutdown_reason = fence
+                    print(f"session watchdog: {fence}: {exc}", file=sys.stderr, flush=True)
+                    publish("fenced", reason=fence)
+                    while not stop_event.is_set():
+                        if wait(SESSION_HEARTBEAT_SECONDS):
+                            continue
+                        publish("fenced", reason=fence)
+                    break
                 consecutive_failures += 1
                 delay, circuit_open = _session_retry_delay(consecutive_failures)
-                reason = "preflight_failed"
+                reason = fence or "preflight_failed"
                 print(f"session watchdog: {reason}: {exc}", file=sys.stderr, flush=True)
                 publish(
                     "circuit_open" if circuit_open else "backoff",

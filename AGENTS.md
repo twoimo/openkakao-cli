@@ -48,7 +48,9 @@ Automatic replies use the separate AX/database-authoritative safety gates, not
 `allow_loco_write`. Always run a read-only preflight first:
 
 ```bash
-openkakao-cli auto-reply --chat 'name:부자멘토멘티' --check --json
+openkakao-cli auto-reply --chat '부자멘토멘티' --check --json
+openkakao-cli auto-reply --chat '부자멘토멘티' --model gemini-3.6-flash
+# Interactive terminals omit --model and pick the LLM with arrow keys.
 openkakao-cli auto-reply --chat 'name:부자멘토멘티' --chat id:123456789
 # For an unnamed local group-room row, attest the already-open exact AX window:
 openkakao-cli auto-reply --chat 'bind:417780809780519:부자멘토멘티' --check --json

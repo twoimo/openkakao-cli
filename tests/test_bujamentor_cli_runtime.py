@@ -4561,6 +4561,34 @@ print(json.dumps({
                 ):
                     module._verified_hook_command()
 
+    def test_supervisor_db_ready_uses_current_environment(self):
+        supervisor = self._load_supervisor_module("bujamentor_supervisor_db_ready_env_test")
+        captured = {}
+
+        def fake_run(command, **kwargs):
+            captured["command"] = command
+            captured["env"] = kwargs.get("env")
+            captured["cwd"] = kwargs.get("cwd")
+
+            class Result:
+                returncode = 0
+
+            return Result()
+
+        previous = os.environ.get("OPENKAKAO_BINARY")
+        os.environ["OPENKAKAO_BINARY"] = "/tmp/openkakao-cli-probe"
+        supervisor.BINARY = Path("/tmp/openkakao-cli-probe")
+        try:
+            with mock.patch.object(supervisor.subprocess, "run", side_effect=fake_run):
+                self.assertTrue(supervisor.db_ready())
+            self.assertEqual(captured["command"][:1], [str(supervisor.BINARY)])
+            self.assertIsNotNone(captured["env"])
+        finally:
+            if previous is None:
+                os.environ.pop("OPENKAKAO_BINARY", None)
+            else:
+                os.environ["OPENKAKAO_BINARY"] = previous
+
     def test_supervisor_uses_one_attested_config_buffer(self):
         spec = importlib.util.spec_from_file_location(
             "bujamentor_supervisor_attestation_test",
@@ -5448,9 +5476,126 @@ print(json.dumps({
                 self.assertEqual(dirty["source_epoch"], 7)
                 self.assertEqual(dirty["fence_reason"], "reconcile_required")
                 self.assertEqual(dirty["pending_gaps"], ["reconcile_required"])
+                self.assertEqual(dirty["acked_watermark"], 123)
+                self.assertEqual(dirty["last_observed_log_id"], 199)
+                self.assertEqual(dirty["acked_log_ids"], [123])
+                self.assertEqual(dirty["observed_log_ids"], [123, 199])
+                self.assertNotEqual(dirty.get("fence"), "stopped_clean")
                 drifted = db_watch._state({**fresh, "schema_version": 2})
                 self.assertEqual(drifted["schema_version"], 3)
                 self.assertEqual(drifted["fence_reason"], "reconcile_required")
+            finally:
+                for key, value in previous.items():
+                    if value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value
+
+    def test_leftover_ack_resume_adopts_new_owner_from_fenced_reconcile_gap(self):
+        previous = {
+            key: os.environ.get(key)
+            for key in (
+                "OPENKAKAO_AUTO_REPLY_CLI",
+                "OPENKAKAO_TARGET_CHAT_ID",
+                "OPENKAKAO_TARGET_CHAT_NAME",
+                "OPENKAKAO_SUPERVISOR_OWNER",
+                "OPENKAKAO_DB_SOURCE_EPOCH",
+                "OPENKAKAO_DB_WATCH_STATE",
+                "OPENKAKAO_ENROLLMENT_PATH",
+                "OPENKAKAO_ENROLLMENT_SHA256",
+            )
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            room_root = Path(temporary) / "rooms" / "42"
+            room_root.mkdir(parents=True)
+            enrollment_path = Path(temporary) / "enrollment.json"
+            enrollment = {
+                "schema_version": 4,
+                "targets": [
+                    {
+                        "chat_id": 42,
+                        "chat_name": "enrolled-room",
+                        "last_log_id": 123,
+                        "room_state_root": str(room_root),
+                        "cursor_authority": {
+                            "schema_version": 1,
+                            "kind": "fenced_leftover_ack_resume",
+                            "cursor_floor": 123,
+                            "attested_db_last_log_id": 250,
+                            "prior_owner_id": "stale-owner",
+                            "prior_source_epoch": 7,
+                        },
+                        "identity": {
+                            "schema_version": 1,
+                            "kind": "ax_transcript",
+                            "local_name": "",
+                            "ax_name": "enrolled-room",
+                            "matched_log_ids": [248, 249, 250],
+                            "matched_count": 3,
+                            "matched_utf8_bytes": 40,
+                            "transcript_sha256": "a" * 64,
+                            "attested_db_last_log_id": 250,
+                        },
+                        "reply_author_bindings": [
+                            {"nickname": "member", "author_id": 700}
+                        ],
+                    }
+                ],
+            }
+            raw = json.dumps(enrollment, sort_keys=True).encode("utf-8")
+            enrollment_path.write_bytes(raw)
+            os.environ.update(
+                {
+                    "OPENKAKAO_AUTO_REPLY_CLI": "1",
+                    "OPENKAKAO_TARGET_CHAT_ID": "42",
+                    "OPENKAKAO_TARGET_CHAT_NAME": "enrolled-room",
+                    "OPENKAKAO_SUPERVISOR_OWNER": "new-owner",
+                    "OPENKAKAO_DB_SOURCE_EPOCH": "9",
+                    "OPENKAKAO_DB_WATCH_STATE": str(room_root / "db-watch-state.json"),
+                    "OPENKAKAO_ENROLLMENT_PATH": str(enrollment_path),
+                    "OPENKAKAO_ENROLLMENT_SHA256": hashlib.sha256(raw).hexdigest(),
+                }
+            )
+            module = self._load_db_watch_module("bujamentor_leftover_ack_resume_test")
+            module.STATE = room_root / "db-watch-state.json"
+            module.CHAT = "enrolled-room"
+            try:
+                enrollment_target = {
+                    "chat_id": 42,
+                    "chat_name": "enrolled-room",
+                    "floor": 123,
+                    "cursor_authority": enrollment["targets"][0]["cursor_authority"],
+                    "identity": enrollment["targets"][0]["identity"],
+                    "reply_author_bindings": enrollment["targets"][0]["reply_author_bindings"],
+                }
+                with mock.patch.object(module, "_cli_enrollment_target", return_value=enrollment_target):
+                    adopted = module._state(
+                        {
+                            "schema_version": 3,
+                            "target_chat_id": 42,
+                            "target_chat_name": "enrolled-room",
+                            "owner_id": "other-owner",
+                            "source_epoch": 8,
+                            "cursor_floor": 123,
+                            "acked_watermark": 123,
+                            "last_observed_log_id": 123,
+                            "acked_log_ids": [123],
+                            "observed_log_ids": [123],
+                            "pending_log_ids": [],
+                            "pending_gaps": ["reconcile_required"],
+                            "candidate_phase": "idle",
+                            "in_flight_candidate": None,
+                            "capability_state": "fenced",
+                            "delivery_enabled": False,
+                            "fence": "reconcile_required",
+                            "fence_reason": "reconcile_required",
+                        }
+                    )
+                self.assertEqual(adopted["owner_id"], "new-owner")
+                self.assertEqual(adopted["source_epoch"], 9)
+                self.assertEqual(adopted["acked_watermark"], 123)
+                self.assertEqual(adopted["capability_state"], "starting")
+                self.assertEqual(adopted["pending_gaps"], [])
             finally:
                 for key, value in previous.items():
                     if value is None:
@@ -10940,6 +11085,345 @@ print(json.dumps({"stdin_eof": value == b""}), flush=True)
             self.assertEqual(calls, [(state, {"_require_ready": False})])
         finally:
             db_watch.save_state = original_save_state
+
+    def test_proactive_topic_uses_vector_tokens_and_skips_when_conversation_advanced(self):
+        os.environ["OPENKAKAO_TARGET_CHAT_ID"] = "42"
+        module = self._load_auto_reply_module("bujamentor_proactive_topic_test")
+        stats = self._timing_stats(module)
+        connection = sqlite3.connect(":memory:")
+        connection.execute(
+            "CREATE TABLE reply_jobs(event_id TEXT, event_json TEXT, status TEXT)"
+        )
+        queued = []
+
+        def enqueue(event):
+            queued.append(event)
+            return True
+
+        def search(query):
+            self.assertIn("긱뉴스", query)
+            return [{"title": "세금 일정 업데이트", "url": "https://example.test/tax"}]
+
+        style = {"common_tokens_json": json.dumps({"세금": 40, "ㅋㅋ": 99, "ㅇㅇ": 80}, ensure_ascii=False)}
+        now = 1_000_000.0
+        source = {
+            "event_id": "db:42:99",
+            "canonical_event_id": "db:42:99",
+            "chat_id": 42,
+            "chat_name": "부자멘토멘티",
+            "log_id": 99,
+            "author_id": 7,
+            "author_nickname": "문승현",
+            "is_self": False,
+            "reply_authorized": True,
+            "message": "요즘 세금 어때",
+            "sent_at": int(now) - 10_000,
+        }
+        skipped = module.maybe_enqueue_proactive_topic(
+            connection,
+            now=now,
+            response_time=stats,
+            style_profile=style,
+            last_observed_sent_at=int(now) - 10,
+            conversation_advanced=True,
+            source_event=source,
+            enqueue=enqueue,
+            search=search,
+        )
+        self.assertIsNone(skipped)
+        self.assertEqual(queued, [])
+        too_soon_source = dict(source)
+        too_soon_source["sent_at"] = int(now) - 10
+        too_soon_source["inbound_silence_at"] = int(now) - 10
+        too_soon = module.maybe_enqueue_proactive_topic(
+            connection,
+            now=now,
+            response_time=stats,
+            style_profile=style,
+            last_observed_sent_at=int(now) - 10,
+            conversation_advanced=False,
+            source_event=too_soon_source,
+            enqueue=enqueue,
+            search=search,
+        )
+        self.assertIsNone(too_soon)
+        missing_source = module.maybe_enqueue_proactive_topic(
+            connection,
+            now=now,
+            response_time=stats,
+            style_profile=style,
+            last_observed_sent_at=int(now) - 10_000,
+            conversation_advanced=False,
+            source_event=None,
+            enqueue=enqueue,
+            search=search,
+        )
+        self.assertIsNone(missing_source)
+        enqueued = module.maybe_enqueue_proactive_topic(
+            connection,
+            now=now,
+            response_time=stats,
+            style_profile=style,
+            last_observed_sent_at=int(now) - 10_000,
+            conversation_advanced=False,
+            source_event=source,
+            enqueue=enqueue,
+            search=search,
+        )
+        self.assertIsNotNone(enqueued)
+        self.assertEqual(queued[0]["proactive"], True)
+        self.assertEqual(queued[0]["proactive_token"], "긱뉴스")
+        self.assertEqual(queued[0]["proactive_query"], "geeknews-rss")
+        self.assertNotEqual(queued[0]["event_id"], "db:42:99")
+        self.assertTrue(str(queued[0]["event_id"]).startswith("db:42:"))
+        self.assertEqual(queued[0]["author_id"], 7)
+        self.assertEqual(queued[0]["author_nickname"], "문승현")
+        self.assertEqual(queued[0]["urls"], ["https://example.test/tax"])
+        self.assertEqual(queued[0]["proactive_source_log_id"], 99)
+        connection.execute(
+            "INSERT INTO reply_jobs VALUES (?, ?, ?)",
+            (queued[0]["event_id"], json.dumps(queued[0], ensure_ascii=False), "pending"),
+        )
+        again = module.maybe_enqueue_proactive_topic(
+            connection,
+            now=now + 20_000,
+            response_time=stats,
+            style_profile=style,
+            last_observed_sent_at=int(now) - 20_000,
+            conversation_advanced=False,
+            source_event=source,
+            enqueue=enqueue,
+            search=search,
+        )
+        self.assertIsNone(again)
+        self.assertEqual(len(queued), 1)
+
+    def test_silence_source_uses_last_authorized_inbound_after_self_tail(self):
+        module = self._load_auto_reply_module("bujamentor_silence_self_tail_test")
+        module.CHAT = "부자멘토멘티"
+        with tempfile.TemporaryDirectory() as temporary:
+            state_path = Path(temporary) / "db-watch-state.json"
+            payload = {
+                "recent_message_tail": [
+                    {
+                        "chat_id": 42,
+                        "log_id": 99,
+                        "author_id": 7,
+                        "author_nickname": "문승현",
+                        "is_self": False,
+                        "reply_authorized": True,
+                        "message": "요즘 세금 어때",
+                        "sent_at": 100,
+                    },
+                    {
+                        "chat_id": 42,
+                        "log_id": 120,
+                        "author_id": 1,
+                        "author_nickname": "최연우",
+                        "is_self": True,
+                        "reply_authorized": False,
+                        "message": "/hand-off",
+                        "sent_at": 200,
+                    },
+                ]
+            }
+            state_path.write_text(json.dumps(payload), encoding="utf-8")
+            previous = os.environ.get("OPENKAKAO_DB_WATCH_STATE")
+            os.environ["OPENKAKAO_DB_WATCH_STATE"] = str(state_path)
+            try:
+                source, advanced = module._latest_inbound_silence_source()
+            finally:
+                if previous is None:
+                    os.environ.pop("OPENKAKAO_DB_WATCH_STATE", None)
+                else:
+                    os.environ["OPENKAKAO_DB_WATCH_STATE"] = previous
+        self.assertFalse(advanced)
+        self.assertEqual(source["event_id"], "db:42:99")
+        self.assertEqual(source["author_nickname"], "문승현")
+        self.assertEqual(source["room_last_sent_at"], 200)
+
+    def test_silence_source_falls_back_to_context_authorized_inbound(self):
+        module = self._load_auto_reply_module("bujamentor_silence_context_fallback_test")
+        module.CHAT = "부자멘토멘티"
+        with tempfile.TemporaryDirectory() as temporary:
+            state_path = Path(temporary) / "db-watch-state.json"
+            payload = {
+                "recent_message_tail": [
+                    {
+                        "chat_id": 42,
+                        "log_id": 120,
+                        "author_id": 1,
+                        "author_nickname": "최연우",
+                        "is_self": True,
+                        "reply_authorized": False,
+                        "message": "/hand-off",
+                        "sent_at": 200,
+                    }
+                ]
+            }
+            state_path.write_text(json.dumps(payload), encoding="utf-8")
+            previous = os.environ.get("OPENKAKAO_DB_WATCH_STATE")
+            os.environ["OPENKAKAO_DB_WATCH_STATE"] = str(state_path)
+            try:
+                with mock.patch.object(
+                    module,
+                    "_latest_authorized_inbound_from_context",
+                    return_value={
+                        "event_id": "db:42:99",
+                        "canonical_event_id": "db:42:99",
+                        "chat_id": 42,
+                        "chat_name": "부자멘토멘티",
+                        "log_id": 99,
+                        "author_id": 7,
+                        "author_nickname": "문승현",
+                        "is_self": False,
+                        "reply_authorized": True,
+                        "message": "요즘 세금 어때",
+                        "sent_at": 100,
+                    },
+                ):
+                    source, advanced = module._latest_inbound_silence_source()
+            finally:
+                if previous is None:
+                    os.environ.pop("OPENKAKAO_DB_WATCH_STATE", None)
+                else:
+                    os.environ["OPENKAKAO_DB_WATCH_STATE"] = previous
+        self.assertFalse(advanced)
+        self.assertEqual(source["event_id"], "db:42:99")
+        self.assertEqual(source["author_nickname"], "문승현")
+        self.assertEqual(source["room_last_sent_at"], 200)
+
+    def test_empty_tail_uses_context_inbound_as_silence_not_advanced(self):
+        module = self._load_auto_reply_module("bujamentor_empty_tail_silence_test")
+        module.CHAT = "부자멘토멘티"
+        with tempfile.TemporaryDirectory() as temporary:
+            state_path = Path(temporary) / "db-watch-state.json"
+            state_path.write_text(json.dumps({"recent_message_tail": []}), encoding="utf-8")
+            previous = os.environ.get("OPENKAKAO_DB_WATCH_STATE")
+            os.environ["OPENKAKAO_DB_WATCH_STATE"] = str(state_path)
+            try:
+                with mock.patch.object(
+                    module,
+                    "_latest_authorized_inbound_from_context",
+                    return_value={
+                        "event_id": "db:42:99",
+                        "author_id": 7,
+                        "author_nickname": "문승현",
+                        "sent_at": 100,
+                        "log_id": 99,
+                        "chat_id": 42,
+                    },
+                ):
+                    source, advanced = module._latest_inbound_silence_source()
+            finally:
+                if previous is None:
+                    os.environ.pop("OPENKAKAO_DB_WATCH_STATE", None)
+                else:
+                    os.environ["OPENKAKAO_DB_WATCH_STATE"] = previous
+        self.assertFalse(advanced)
+        self.assertEqual(source["event_id"], "db:42:99")
+        self.assertEqual(source["inbound_silence_at"], 100)
+
+    def test_geeknews_digest_posts_unseen_feed_items_once(self):
+        module = self._load_auto_reply_module("bujamentor_geeknews_digest_test")
+        with tempfile.TemporaryDirectory() as temporary:
+            module.QUEUE = Path(temporary) / "reply-queue.sqlite3"
+            feed = """
+            <feed>
+              <entry>
+                <title><![CDATA[새 글 A]]></title>
+                <link rel='alternate' href='https://news.hada.io/topic?id=10' />
+                <content type='html'><![CDATA[<p>첫번째 요약입니다</p>]]></content>
+              </entry>
+              <entry>
+                <title><![CDATA[새 글 B]]></title>
+                <link rel='alternate' href='https://news.hada.io/topic?id=11' />
+                <content type='html'><![CDATA[<p>두번째 요약입니다</p>]]></content>
+              </entry>
+            </feed>
+            """
+            first = module._next_geeknews_digest(fetcher=lambda: feed)
+            second = module._next_geeknews_digest(fetcher=lambda: feed)
+        self.assertIsNotNone(first)
+        self.assertEqual(first["ids"], [10, 11])
+        self.assertIn("새 글 A", first["message"])
+        self.assertIn("https://news.hada.io/topic?id=10", first["message"])
+        self.assertIsNone(second)
+
+    def test_pre_send_usage_limit_unknown_heals_to_skip_without_retransmit(self):
+        module = self._load_auto_reply_module("bujamentor_usage_limit_leftover_heal")
+        previous = os.environ.get("OPENKAKAO_TARGET_CHAT_ID")
+        os.environ["OPENKAKAO_TARGET_CHAT_ID"] = "42"
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            module.QUEUE = root / "42" / "reply-queue.sqlite3"
+            queue = self._worker_queue_connection(module)
+            try:
+                queue.execute(
+                    """
+                    INSERT INTO reply_jobs(
+                        event_id,event_json,status,due_at,decision,reason,category,
+                        reply,scheduled_delay_seconds,error_class,created_at,updated_at
+                    ) VALUES(
+                        'db:42:9', '{"chat_id":42,"log_id":9}', 'delivery_unknown',
+                        NULL, NULL, 'model_usage_limited', 'uncertain', NULL, NULL,
+                        'reconcile_required', 1.0, 1.0
+                    )
+                    """
+                )
+                queue.commit()
+                self.assertEqual(module._queue_reconciliation_blockers(queue), 0)
+                self.assertFalse(module.leftover_unknown_has_ax_mutation(queue, "db:42:9"))
+                with mock.patch.object(module, "complete_event") as complete:
+                    module.recover_stale_jobs(queue)
+                row = queue.execute(
+                    "SELECT status,decision,reason,reply FROM reply_jobs WHERE event_id='db:42:9'"
+                ).fetchone()
+                self.assertEqual(tuple(row), ("skipped", "skip", "model_usage_limited", None))
+                complete.assert_called_once_with("db:42:9", "")
+            finally:
+                queue.close()
+                if previous is None:
+                    os.environ.pop("OPENKAKAO_TARGET_CHAT_ID", None)
+                else:
+                    os.environ["OPENKAKAO_TARGET_CHAT_ID"] = previous
+    def test_pre_send_blank_unknown_reopens_pending_without_retransmit(self):
+        module = self._load_auto_reply_module("bujamentor_blank_unknown_leftover_heal")
+        previous = os.environ.get("OPENKAKAO_TARGET_CHAT_ID")
+        os.environ["OPENKAKAO_TARGET_CHAT_ID"] = "42"
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            module.QUEUE = root / "42" / "reply-queue.sqlite3"
+            queue = self._worker_queue_connection(module)
+            try:
+                queue.execute(
+                    """
+                    INSERT INTO reply_jobs(
+                        event_id,event_json,status,due_at,decision,reason,category,
+                        reply,scheduled_delay_seconds,error_class,created_at,updated_at
+                    ) VALUES(
+                        'db:42:11', '{"chat_id":42,"log_id":11}', 'delivery_unknown',
+                        NULL, NULL, NULL, NULL, NULL, NULL,
+                        'reconcile_required', 1.0, 1.0
+                    )
+                    """
+                )
+                queue.commit()
+                self.assertEqual(module._queue_reconciliation_blockers(queue), 0)
+                self.assertFalse(module.leftover_unknown_has_ax_mutation(queue, "db:42:11"))
+                with mock.patch.object(module, "complete_event") as complete:
+                    module.recover_stale_jobs(queue)
+                row = queue.execute(
+                    "SELECT status,decision,reason,reply FROM reply_jobs WHERE event_id='db:42:11'"
+                ).fetchone()
+                self.assertEqual(tuple(row), ("pending", None, None, None))
+                complete.assert_not_called()
+            finally:
+                queue.close()
+                if previous is None:
+                    os.environ.pop("OPENKAKAO_TARGET_CHAT_ID", None)
+                else:
+                    os.environ["OPENKAKAO_TARGET_CHAT_ID"] = previous
 
 if __name__ == "__main__":
     unittest.main()

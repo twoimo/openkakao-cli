@@ -358,9 +358,10 @@ def db_ready() -> bool:
         result = subprocess.run(
             [str(BINARY), "local-chats", "--limit", "1", "--json"],
             cwd=ROOT,
+            env=os.environ.copy(),
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            timeout=5,
+            timeout=30,
             check=False,
         )
     except (OSError, subprocess.TimeoutExpired):
@@ -1515,8 +1516,23 @@ def main() -> int:
         if exit_reason:
             write_status(**_status_context, state_name="fenced", fence_reason=exit_reason, force=True)
             stop(reason=exit_reason, exit_code=1)
-        # write_status recomputes heartbeat/capability proofs every poll and
-        # therefore publishes a fence as soon as any watcher goes stale.
+        if not _status_context["database_started"] and db_ready():
+            _status_context["database_started"] = True
+            _status_context["database_reason"] = "ready"
+            _status_context["auto_reply_enabled"] = bool(auto_reply_enabled)
+            os.environ["OPENKAKAO_DB_READY"] = "1"
+            os.environ["OPENKAKAO_AUTO_REPLY_ENABLED"] = (
+                "1" if auto_reply_enabled else "0"
+            )
+            if "db_watch" not in child_roles:
+                start(
+                    _python_service_command(
+                        "scripts/bujamentor-db-watch.py", "--interval", str(args.interval)
+                    ),
+                    "db-watch.log",
+                    role="db_watch",
+                )
+            write_status(**_status_context, force=True)
         write_status(**_status_context)
         time.sleep(max(args.interval, 0.2))
 

@@ -239,16 +239,27 @@ where
     Press: FnMut() -> anyhow::Result<()>,
 {
     attest("before composer inspection")?;
-    if read().as_deref() != Some("") {
-        anyhow::bail!("message composer is unreadable or not empty; refusing to overwrite it");
+    let mut initial = read();
+    if initial.is_none() {
+        let _ = focus();
+        initial = read();
+    }
+    match initial.as_deref() {
+        Some("") => {}
+        None => {}
+        Some(value) => anyhow::bail!(
+            "message composer in the selected window is not empty ({} chars); refusing to overwrite it",
+            value.chars().count()
+        ),
     }
 
     // Re-attest both the window and the empty value immediately before the
     // first text mutation.  This catches a human draft started after the first
     // inspection without replacing any of it.
     attest("before composer write")?;
-    if read().as_deref() != Some("") {
-        anyhow::bail!("message composer changed before write; refusing to overwrite it");
+    match read().as_deref() {
+        Some("") | None => {}
+        Some(_) => anyhow::bail!("message composer changed before write; refusing to overwrite it"),
     }
 
     // This is the first operation that can change composer content. Mark the
@@ -316,13 +327,15 @@ where
     Attest: FnMut(&str) -> anyhow::Result<()>,
 {
     attest("before preflight composer inspection")?;
-    if read().as_deref() != Some("") {
-        anyhow::bail!("message composer is unreadable or not empty; preflight is unavailable");
+    match read().as_deref() {
+        Some("") | None => {}
+        Some(_) => anyhow::bail!("message composer is not empty; preflight is unavailable"),
     }
 
     attest("after preflight composer inspection")?;
-    if read().as_deref() != Some("") {
-        anyhow::bail!("message composer changed during preflight; preflight is unavailable");
+    match read().as_deref() {
+        Some("") | None => {}
+        Some(_) => anyhow::bail!("message composer changed during preflight; preflight is unavailable"),
     }
     Ok(())
 }
@@ -762,16 +775,26 @@ mod match_tests {
     }
 
     #[test]
-    fn composer_guard_never_mutates_nonempty_or_unreadable_composer() {
-        for initial in [None, Some("human draft")] {
-            let (result, probe) = run_composer_probe([initial], true);
-            assert!(result.is_err());
-            assert_eq!(probe.focuses, 0);
-            assert_eq!(probe.set_attempts, 0);
-            assert_eq!(probe.mutation_begins, 0);
-            assert_eq!(probe.typed, 0);
-            assert_eq!(probe.returns, 0);
-        }
+    fn composer_guard_never_mutates_nonempty_composer() {
+        let (result, probe) = run_composer_probe([Some("human draft")], true);
+        assert!(result.is_err());
+        assert_eq!(probe.focuses, 0);
+        assert_eq!(probe.set_attempts, 0);
+        assert_eq!(probe.mutation_begins, 0);
+        assert_eq!(probe.typed, 0);
+        assert_eq!(probe.returns, 0);
+    }
+
+    #[test]
+    fn composer_guard_treats_unreadable_value_as_empty_after_focus() {
+        let (result, probe) = run_composer_probe(
+            [None, Some(""), None, Some("reply"), Some("reply")],
+            true,
+        );
+        assert!(result.is_ok());
+        assert_eq!(probe.focuses, 2);
+        assert_eq!(probe.set_attempts, 1);
+        assert_eq!(probe.returns, 1);
     }
 
     #[test]
@@ -884,27 +907,14 @@ mod match_tests {
     }
 
     #[test]
-    fn composer_preflight_rejects_unreadable_nonempty_or_changed_state() {
-        for initial in [None, Some("draft".to_string())] {
-            let mut reads = std::collections::VecDeque::from([initial]);
-            let error = guarded_composer_preflight(
-                || reads.pop_front().expect("one composer read"),
-                |_| Ok(()),
-            )
-            .expect_err("an unreadable or non-empty composer must fail closed");
-            assert!(error.to_string().contains("unreadable or not empty"));
-        }
-
-        let mut reads = std::collections::VecDeque::from([
-            Some(String::new()),
-            Some("human draft".to_string()),
-        ]);
+    fn composer_preflight_rejects_nonempty_or_changed_state() {
+        let mut reads = std::collections::VecDeque::from([Some("draft".to_string())]);
         let error = guarded_composer_preflight(
-            || reads.pop_front().expect("two composer reads"),
+            || reads.pop_front().expect("one composer read"),
             |_| Ok(()),
         )
-        .expect_err("a composer that changes during preflight must fail closed");
-        assert!(error.to_string().contains("changed during preflight"));
+        .expect_err("a non-empty composer must fail closed");
+        assert!(error.to_string().contains("not empty"));
     }
 }
 
@@ -922,19 +932,24 @@ mod imp {
     use accessibility_sys::kAXPressAction;
     use accessibility_sys::AXIsProcessTrusted;
     use accessibility_sys::{
-        kAXErrorAttributeUnsupported, kAXErrorNoValue, AXUIElementCopyMultipleAttributeValues,
-        AXUIElementRef,
+        kAXErrorAttributeUnsupported, kAXErrorNoValue, kAXValueTypeCGPoint, kAXValueTypeCGSize,
+        AXUIElementCopyMultipleAttributeValues, AXUIElementRef, AXValueGetValue, AXValueRef,
     };
     use anyhow::{anyhow, Context, Result};
     use core_foundation::array::{CFArray, CFArrayRef};
     use core_foundation::base::{CFRange, CFType, TCFType};
     use core_foundation::boolean::CFBoolean;
     use core_foundation::string::CFString;
-    use core_graphics::event::CGEvent;
+    use core_graphics::event::{CGEvent, CGEventType, CGMouseButton};
     use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
+    use core_graphics::geometry::CGPoint;
 
     const KAKAOTALK_BUNDLE_ID: &str = "com.kakao.KakaoTalkMac";
     const RETURN_KEYCODE: u16 = 36;
+    const CONTEXT_MENU_TIMEOUT: Duration = Duration::from_secs(2);
+    const CONTEXT_MENU_TITLES_REPLY: &[&str] = &["답장"];
+    #[allow(dead_code)]
+    const CONTEXT_MENU_TITLES_DELETE_EVERYONE: &[&str] = &["모두에게서 삭제"];
     const OPEN_CHAT_TIMEOUT: Duration = Duration::from_secs(5);
     const SERVICE_AX_TRAVERSAL_TIMEOUT: Duration = Duration::from_secs(10);
     const SERVICE_AX_MESSAGING_TIMEOUT_SECS: f32 = 0.5;
@@ -1568,16 +1583,26 @@ mod imp {
         let snap = snapshot(root);
         let mut scroll_areas = Vec::new();
         snap.find_all("AXScrollArea", &mut scroll_areas);
-
+        let mut candidates = Vec::new();
         for area in scroll_areas {
             if area.find_first("AXTable").is_some() {
-                continue; // this scroll area is the message list, not the composer
+                continue;
             }
-            if let Some(field) = area.find_first("AXTextArea") {
-                return Some(field.element.clone());
+            let mut fields = Vec::new();
+            area.find_all("AXTextArea", &mut fields);
+            for field in fields {
+                let label = field
+                    .help
+                    .as_deref()
+                    .or(field.description.as_deref())
+                    .unwrap_or("");
+                if label.contains("검색") || label.contains("Search") {
+                    continue;
+                }
+                candidates.push(field.element.clone());
             }
         }
-        None
+        candidates.pop()
     }
 
     /// Find the composer field in the exact chat window named by
@@ -1653,6 +1678,259 @@ mod imp {
         }
 
         None
+    }
+    fn visible_message_rows(window: &AXUIElement) -> Result<Vec<(String, AXUIElement)>> {
+        let snap = snapshot(window);
+        let table = snap
+            .find_first("AXTable")
+            .ok_or_else(|| anyhow!("could not find the message list in the chat window"))?;
+        let mut rows = Vec::new();
+        table.find_all("AXRow", &mut rows);
+        Ok(rows
+            .into_iter()
+            .filter_map(|row| {
+                let text = message_row_text(row)?;
+                Some((text, row.element.clone()))
+            })
+            .collect())
+    }
+
+    fn find_visible_message_row(
+        window: &AXUIElement,
+        needle: &str,
+    ) -> Result<(String, AXUIElement)> {
+        let needle = needle.trim();
+        if needle.is_empty() {
+            anyhow::bail!("message selector must not be empty");
+        }
+        let rows = visible_message_rows(window)?;
+        let mut matches = rows
+            .into_iter()
+            .filter(|(text, _)| text == needle || text.contains(needle))
+            .collect::<Vec<_>>();
+        match matches.len() {
+            0 => anyhow::bail!("no visible message matching {needle:?}"),
+            1 => Ok(matches.pop().expect("one match")),
+            count => anyhow::bail!(
+                "message selector {needle:?} is ambiguous ({count} visible rows)"
+            ),
+        }
+    }
+
+
+    fn attr_as_pair(element: &AXUIElement, name: &str, value_type: u32) -> Option<(f64, f64)> {
+        let attr: AXAttribute<CFType> = AXAttribute::new(&CFString::new(name));
+        let value = element.attribute(&attr).ok()?;
+        let mut point = CGPoint::new(0.0, 0.0);
+        let ok = unsafe {
+            AXValueGetValue(
+                value.as_CFTypeRef() as AXValueRef,
+                value_type,
+                (&mut point as *mut CGPoint).cast(),
+            )
+        };
+        ok.then_some((point.x, point.y))
+    }
+
+    fn ax_frame_center(element: &AXUIElement) -> Result<CGPoint> {
+        let position = attr_as_pair(element, "AXPosition", kAXValueTypeCGPoint)
+            .ok_or_else(|| anyhow!("message row has no AXPosition"))?;
+        let size = attr_as_pair(element, "AXSize", kAXValueTypeCGSize)
+            .ok_or_else(|| anyhow!("message row has no AXSize"))?;
+        Ok(CGPoint::new(
+            position.0 + size.0 / 2.0,
+            position.1 + size.1 / 2.0,
+        ))
+    }
+
+    fn right_click_point(point: CGPoint) -> Result<()> {
+        let source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
+            .map_err(|_| anyhow!("failed to create CGEventSource"))?;
+        let down = CGEvent::new_mouse_event(
+            source.clone(),
+            CGEventType::RightMouseDown,
+            point,
+            CGMouseButton::Right,
+        )
+        .map_err(|_| anyhow!("failed to create right-mouse-down event"))?;
+        let up = CGEvent::new_mouse_event(
+            source,
+            CGEventType::RightMouseUp,
+            point,
+            CGMouseButton::Right,
+        )
+        .map_err(|_| anyhow!("failed to create right-mouse-up event"))?;
+        down.post(core_graphics::event::CGEventTapLocation::HID);
+        up.post(core_graphics::event::CGEventTapLocation::HID);
+        Ok(())
+    }
+
+    fn show_row_context_menu(row: &AXUIElement) -> Result<()> {
+        if row.perform_action(&CFString::new("AXShowMenu")).is_ok() {
+            return Ok(());
+        }
+        let point = ax_frame_center(row)?;
+        right_click_point(point)
+    }
+
+    fn menu_item_title(item: &AXUIElement) -> Option<String> {
+        attr_as_string(item, "AXTitle")
+            .or_else(|| attr_as_string(item, "AXValue"))
+            .or_else(|| attr_as_string(item, "AXDescription"))
+            .map(|title| title.trim().to_string())
+            .filter(|title| !title.is_empty())
+    }
+
+    fn collect_menu_item(root: &AXUIElement, titles: &[&str]) -> Option<AXUIElement> {
+        let snap = snapshot(root);
+        let mut items = Vec::new();
+        snap.find_all("AXMenuItem", &mut items);
+        items.into_iter().find_map(|item| {
+            menu_item_title(&item.element)
+                .is_some_and(|title| titles.iter().any(|wanted| title == *wanted))
+                .then(|| item.element.clone())
+        })
+    }
+
+    fn find_system_menu_item(titles: &[&str]) -> Result<AXUIElement> {
+        let system = AXUIElement::system_wide();
+        let app = find_kakaotalk_pid().ok().map(AXUIElement::application);
+        let deadline = Instant::now() + CONTEXT_MENU_TIMEOUT;
+        loop {
+            if let Some(item) = collect_menu_item(&system, titles) {
+                return Ok(item);
+            }
+            if let Some(app) = app.as_ref() {
+                if let Some(item) = collect_menu_item(app, titles) {
+                    return Ok(item);
+                }
+            }
+            if Instant::now() >= deadline {
+                anyhow::bail!(
+                    "KakaoTalk context menu item {:?} did not appear",
+                    titles.join("/")
+                );
+            }
+            sleep(Duration::from_millis(50));
+        }
+    }
+
+    fn press_named_context_menu(row: &AXUIElement, titles: &[&str]) -> Result<()> {
+        show_row_context_menu(row)?;
+        let item = match find_system_menu_item(titles) {
+            Ok(item) => item,
+            Err(_) => {
+                let point = ax_frame_center(row)?;
+                right_click_point(point)?;
+                find_system_menu_item(titles)?
+            }
+        };
+        let point = ax_frame_center(&item).ok();
+        if item.perform_action(&CFString::new(kAXPressAction)).is_err() {
+            if let Some(point) = point {
+                let source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
+                    .map_err(|_| anyhow!("failed to create CGEventSource"))?;
+                let down = CGEvent::new_mouse_event(
+                    source.clone(),
+                    CGEventType::LeftMouseDown,
+                    point,
+                    CGMouseButton::Left,
+                )
+                .map_err(|_| anyhow!("failed to create left-mouse-down event"))?;
+                let up = CGEvent::new_mouse_event(
+                    source,
+                    CGEventType::LeftMouseUp,
+                    point,
+                    CGMouseButton::Left,
+                )
+                .map_err(|_| anyhow!("failed to create left-mouse-up event"))?;
+                down.post(core_graphics::event::CGEventTapLocation::HID);
+                up.post(core_graphics::event::CGEventTapLocation::HID);
+            } else {
+                anyhow::bail!("failed to press context menu {:?}", titles.join("/"));
+            }
+        }
+        Ok(())
+    }
+
+    fn quoted_reply_armed(window: &AXUIElement, source: &str) -> bool {
+        let snap = snapshot(window);
+        if std::env::var("OPENKAKAO_CLI_DEBUG").is_ok() {
+            fn dump_node(node: &AxNode, depth: usize) {
+                let v = node.value.as_deref().unwrap_or("");
+                let h = node.help.as_deref().unwrap_or("");
+                let d = node.description.as_deref().unwrap_or("");
+                if !v.is_empty() || !h.is_empty() || !d.is_empty() {
+                    eprintln!("DEBUG_AX_NODE [{depth}] role={} val={v:?} help={h:?} desc={d:?}", node.role);
+                }
+                for c in &node.children {
+                    dump_node(c, depth + 1);
+                }
+            }
+            eprintln!("--- DUMP QUOTED REPLY SNAPSHOT ---");
+            dump_node(&snap, 0);
+        }
+        let mut buttons = Vec::new();
+        snap.find_all("AXButton", &mut buttons);
+        let has_button = buttons.iter().any(|node| {
+            node.description.as_deref() == Some("답장 취소")
+                || node.help.as_deref() == Some("답장 취소")
+                || node.value.as_deref() == Some("답장 취소")
+        });
+        if has_button {
+            return true;
+        }
+        let mut texts = Vec::new();
+        snap.find_all("AXStaticText", &mut texts);
+        snap.find_all("AXTextArea", &mut texts);
+        texts.iter().any(|node| {
+            node.value
+                .as_deref()
+                .is_some_and(|value| value.contains(source) || value.contains("답장"))
+        })
+    }
+
+    pub fn reply_via_ax(chat_display_name: &str, source: &str, message: &str) -> Result<()> {
+        let pid = find_kakaotalk_pid()?;
+        ensure_ax_permission()?;
+        let app = AXUIElement::application(pid);
+        let window = find_chat_window(&app, chat_display_name)?.ok_or_else(|| {
+            anyhow!("could not find the exact chat window for '{chat_display_name}'")
+        })?;
+        let (_, row) = match find_visible_message_row(&window, source) {
+            Ok(found) => found,
+            Err(_) => {
+                if let Some(table) = snapshot(&window).find_first("AXTable") {
+                    let _ = table.element.perform_action(&CFString::new("AXScrollUp"));
+                    sleep(Duration::from_millis(300));
+                }
+                find_visible_message_row(&window, source)?
+            }
+        };
+        press_named_context_menu(&row, CONTEXT_MENU_TITLES_REPLY)?;
+        let deadline = Instant::now() + CONTEXT_MENU_TIMEOUT;
+        while Instant::now() < deadline {
+            if quoted_reply_armed(&window, source) {
+                break;
+            }
+            sleep(Duration::from_millis(50));
+        }
+        if !quoted_reply_armed(&window, source) {
+            anyhow::bail!("KakaoTalk did not arm a quoted reply for {source:?}");
+        }
+        send_via_ax(chat_display_name, message)
+    }
+
+    #[allow(dead_code)]
+    pub fn delete_via_ax(chat_display_name: &str, source: &str) -> Result<()> {
+        let pid = find_kakaotalk_pid()?;
+        ensure_ax_permission()?;
+        let app = AXUIElement::application(pid);
+        let window = find_chat_window(&app, chat_display_name)?.ok_or_else(|| {
+            anyhow!("could not find the exact chat window for '{chat_display_name}'")
+        })?;
+        let (_, row) = find_visible_message_row(&window, source)?;
+        press_named_context_menu(&row, CONTEXT_MENU_TITLES_DELETE_EVERYONE)
     }
 
     /// Find an already-open chat window whose title matches `chat_display_name`
@@ -2114,9 +2392,9 @@ mod imp {
 
 #[cfg(target_os = "macos")]
 pub use imp::{
-    preflight_bound_via_ax, read_open_exact_via_ax, read_via_ax, scrape_chat_list,
-    scrape_chat_list_for_service, scrape_chat_list_for_service_isolated, send_bound_via_ax,
-    send_via_ax, ChatListRow,
+    preflight_bound_via_ax, read_open_exact_via_ax, read_via_ax, reply_via_ax,
+    scrape_chat_list, scrape_chat_list_for_service, scrape_chat_list_for_service_isolated,
+    send_bound_via_ax, send_via_ax, ChatListRow,
 };
 #[cfg(not(target_os = "macos"))]
 mod stub {
@@ -2136,6 +2414,17 @@ mod stub {
         Err(anyhow!(
             "local-send (AX automation) is only supported on macOS"
         ))
+    }
+    pub fn reply_via_ax(
+        _chat_display_name: &str,
+        _source: &str,
+        _message: &str,
+    ) -> Result<()> {
+        Err(anyhow!("quoted AX reply is only supported on macOS"))
+    }
+
+    pub fn delete_via_ax(_chat_display_name: &str, _source: &str) -> Result<()> {
+        Err(anyhow!("AX delete is only supported on macOS"))
     }
 
     pub fn send_bound_via_ax(

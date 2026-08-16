@@ -55,29 +55,53 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _is_homebrew_opt_python_keg(path: Path) -> bool:
+    return str(path) in {
+        "/opt/homebrew/opt/python@3.11/bin/python3.11",
+        "/opt/homebrew/opt/python@3.12/bin/python3.12",
+        "/opt/homebrew/opt/python@3.13/bin/python3.13",
+    }
+
+
+def _is_homebrew_cellar_python_version(path: Path) -> bool:
+    return "/Cellar/python@" in str(path)
+
+
 def _owned_source(
     path: Path,
     *,
     executable: bool = False,
     maximum_bytes: int = MAX_ASSET_BYTES,
+    allow_homebrew_python_keg: bool = False,
 ) -> Path:
-    if not path.is_absolute() or path.is_symlink():
+    if not path.is_absolute():
         raise PackagingError(f"source path must be absolute and non-symlink: {path}")
+    if _is_homebrew_cellar_python_version(path):
+        raise PackagingError(f"python interpreter must not be a Homebrew Cellar version path: {path}")
+    if path.is_symlink():
+        if not allow_homebrew_python_keg or not _is_homebrew_opt_python_keg(path):
+            raise PackagingError(f"source path must be absolute and non-symlink: {path}")
     try:
         metadata = path.lstat()
     except OSError as exc:
         raise PackagingError(f"source is unavailable: {path}") from exc
     mode = stat.S_IMODE(metadata.st_mode)
     if (
-        not stat.S_ISREG(metadata.st_mode)
-        or metadata.st_uid != os.geteuid()
-        or metadata.st_nlink != 1
+        (not path.is_symlink() and not stat.S_ISREG(metadata.st_mode))
+        or (path.is_symlink() and not path.exists())
+        or (not path.is_symlink() and metadata.st_uid != os.geteuid())
+        or (not path.is_symlink() and metadata.st_nlink != 1)
         or mode & 0o022
-        or metadata.st_size <= 0
-        or metadata.st_size > maximum_bytes
-        or (executable and not mode & stat.S_IXUSR)
+        or (not path.is_symlink() and metadata.st_size <= 0)
+        or (not path.is_symlink() and metadata.st_size > maximum_bytes)
+        or (executable and not path.is_symlink() and not mode & stat.S_IXUSR)
     ):
         raise PackagingError(f"source ownership, mode, or size is unsafe: {path}")
+    if allow_homebrew_python_keg and _is_homebrew_opt_python_keg(path):
+        target = path.resolve(strict=True)
+        if not target.is_file():
+            raise PackagingError(f"python interpreter target is unavailable: {path}")
+        return path
     resolved = path.resolve(strict=True)
     if resolved != path:
         raise PackagingError(f"source path is not canonical: {path}")
@@ -279,7 +303,7 @@ def stage_runtime(
     if not source_dir.is_dir():
         raise PackagingError("runtime source directory is unsafe")
     binary = _owned_source(binary, executable=True)
-    python = _owned_source(python, executable=True)
+    python = _owned_source(python, executable=True, allow_homebrew_python_keg=True)
     config = _owned_source(config, maximum_bytes=MAX_CONFIG_BYTES)
     validated_config_sha256 = _config_selectors(config, selectors)
 
@@ -560,9 +584,9 @@ def main() -> int:
     )
     try:
         result = stage_runtime(
-            binary=args.bin.expanduser().resolve(strict=True),
-            python=args.python.expanduser().resolve(strict=True),
-            config=args.config.expanduser().resolve(strict=True),
+            binary=args.bin.expanduser().absolute(),
+            python=args.python.expanduser().absolute(),
+            config=args.config.expanduser().absolute(),
             source_dir=args.source_dir.expanduser().resolve(strict=True),
             state_root=state_root,
             runtime_parent=runtime_parent,

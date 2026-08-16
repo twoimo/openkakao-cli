@@ -489,6 +489,17 @@ exit 64
             self.assertNotIn("private-a", captured["argv"])
             self.assertNotIn("private-b", captured["argv"])
 
+    def test_owned_file_keeps_homebrew_keg_python_string(self):
+        module = load_entry("bujamentor_owned_file_keg_test")
+        keg = Path("/opt/homebrew/opt/python@3.11/bin/python3.11")
+        cellar = Path(
+            "/opt/homebrew/Cellar/python@3.11/3.11.15_4/Frameworks/Python.framework/Versions/3.11/bin/python3.11"
+        )
+        with self.assertRaisesRegex(SystemExit, "python_interpreter_missing"):
+            module._owned_file(cellar, executable=True)
+        if keg.exists():
+            self.assertEqual(module._owned_file(keg, executable=True), keg)
+            self.assertNotIn("/Cellar/python@", str(module._owned_file(keg, executable=True)))
     def test_selector_declaration_is_bounded_canonical_and_duplicate_free(self):
         module = load_entry("bujamentor_multi_selector_bounds_test")
         self.assertEqual(
@@ -953,6 +964,119 @@ exit 64
                 circuit[0]["consecutive_failures"],
                 module.SESSION_CIRCUIT_FAILURE_LIMIT,
             )
+            self.assertNotEqual(circuit[0]["reason"], "python_interpreter_missing")
+
+    def test_session_vanished_python_publishes_typed_interpreter_miss(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = self._fixture(Path(temporary))
+            module = fixture["module"]
+            state = module._private_state_root(fixture["state"])
+            waits = []
+            statuses = []
+
+            class StopEvent:
+                stopped = False
+
+                def is_set(self):
+                    return self.stopped
+
+                def set(self):
+                    self.stopped = True
+
+            event = StopEvent()
+
+            def missing_python(*_args):
+                raise SystemExit(
+                    "python_interpreter_missing: Bujamentor python_interpreter is unavailable"
+                )
+
+            def forbidden_popen(*_args, **_kwargs):
+                self.fail("a child was spawned after a vanished interpreter")
+
+            def fake_wait(seconds):
+                waits.append(seconds)
+                if len(waits) == module.SESSION_CIRCUIT_FAILURE_LIMIT:
+                    event.set()
+                    return True
+                return False
+
+            with contextlib.redirect_stderr(io.StringIO()):
+                result = module.run_session(
+                    fixture["python"],
+                    fixture["entry"],
+                    fixture["binary"],
+                    fixture["config"],
+                    "bind:42:room",
+                    state,
+                    popen_factory=forbidden_popen,
+                    preflight=missing_python,
+                    stop_event=event,
+                    wait=fake_wait,
+                    status_writer=lambda _path, value: statuses.append(dict(value)),
+                    install_signal_handlers=False,
+                )
+
+            self.assertEqual(result, 0)
+            circuit = [status for status in statuses if status["state"] == "circuit_open"]
+            self.assertEqual(len(circuit), 1)
+            self.assertEqual(circuit[0]["reason"], "python_interpreter_missing")
+
+    def test_session_reconciliation_fence_does_not_retry_or_spawn(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = self._fixture(Path(temporary))
+            module = fixture["module"]
+            state = module._private_state_root(fixture["state"])
+            waits = []
+            statuses = []
+
+            class StopEvent:
+                stopped = False
+
+                def is_set(self):
+                    return self.stopped
+
+                def set(self):
+                    self.stopped = True
+
+            event = StopEvent()
+
+            def unclean_leftover(*_args):
+                raise SystemExit(
+                    "reconciliation_required: Bujamentor room leftover requires reconciliation before restart"
+                )
+
+            def forbidden_popen(*_args, **_kwargs):
+                self.fail("a child was spawned after a durable leftover fence")
+
+            def wait_then_stop(seconds):
+                waits.append(seconds)
+                event.set()
+                return True
+
+            with contextlib.redirect_stderr(io.StringIO()):
+                result = module.run_session(
+                    fixture["python"],
+                    fixture["entry"],
+                    fixture["binary"],
+                    fixture["config"],
+                    "bind:42:room",
+                    state,
+                    popen_factory=forbidden_popen,
+                    preflight=unclean_leftover,
+                    stop_event=event,
+                    wait=wait_then_stop,
+                    status_writer=lambda _path, value: statuses.append(dict(value)),
+                    install_signal_handlers=False,
+                )
+
+            self.assertEqual(result, 0)
+            self.assertEqual(waits, [module.SESSION_HEARTBEAT_SECONDS])
+            fenced = [status for status in statuses if status["state"] == "fenced"]
+            self.assertGreaterEqual(len(fenced), 1)
+            self.assertEqual(fenced[0]["reason"], "reconciliation_required")
+            self.assertFalse(any(status["state"] == "circuit_open" for status in statuses))
+            self.assertEqual(statuses[-1]["state"], "stopped")
+            self.assertEqual(statuses[-1]["reason"], "reconciliation_required")
 
     def test_session_signal_requests_owned_child_termination_and_zero_exit(self):
         with tempfile.TemporaryDirectory() as temporary:

@@ -17,7 +17,7 @@ mod state;
 mod util;
 
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, IsTerminal, Read, Write};
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 #[cfg(unix)]
@@ -939,6 +939,10 @@ enum Commands {
         yes: bool,
         #[arg(long, help = "Preview the action without executing")]
         dry_run: bool,
+        /// Quote an already-visible message via the KakaoTalk context menu
+        /// (AXShowMenu + AXPress on "답장"), then send.
+        #[arg(long = "reply-to")]
+        reply_to: Option<String>,
         #[arg(long, hide = true, conflicts_with = "dry_run")]
         preflight: bool,
     },
@@ -998,6 +1002,11 @@ enum Commands {
         reply_author: Vec<String>,
         #[arg(long, default_value_t = 1.0)]
         interval: f64,
+        /// Optional reply-model override. Interactive terminals can omit this
+        /// and pick from the arrow-key menu. Non-interactive runs must pass
+        /// --model or already have a working configured model.
+        #[arg(long = "model")]
+        model: Option<String>,
     },
     /// Run diagnostic checks on KakaoTalk installation and connectivity
     Doctor {
@@ -1037,6 +1046,7 @@ const BUJAMENTOR_ENROLLMENT_SCHEMA_VERSION: i64 = 4;
 const BUJAMENTOR_CURSOR_AUTHORITY_SCHEMA_VERSION: i64 = 1;
 const BUJAMENTOR_CURSOR_FRESH_KIND: &str = "fresh_attested_tail";
 const BUJAMENTOR_CURSOR_REPLAY_KIND: &str = "stopped_clean_ack_replay";
+const BUJAMENTOR_CURSOR_LEFTOVER_KIND: &str = "fenced_leftover_ack_resume";
 const AUTO_REPLY_GUARDIAN_LIVENESS_ENV: &str = "OPENKAKAO_SESSION_GUARDIAN_LIVENESS_FD";
 
 extern "C" fn handle_auto_reply_signal(_: i32) {
@@ -1149,15 +1159,52 @@ fn auto_reply_selector_values(
     config: &config::OpenKakaoConfig,
     cli_values: Vec<String>,
 ) -> Result<Vec<String>> {
-    if !cli_values.is_empty() {
-        return Ok(cli_values);
+    let configured = config.bujamentor.chats.clone();
+    let values = if cli_values.is_empty() {
+        configured
+    } else {
+        expand_plain_chat_names_with_configured_bindings(cli_values, &configured)
+    };
+    if values.is_empty() {
+        anyhow::bail!(
+            "no chat selected; pass --chat 부자멘토멘티 or configure [bujamentor].chats"
+        );
     }
-    if !config.bujamentor.chats.is_empty() {
-        return Ok(config.bujamentor.chats.clone());
-    }
-    anyhow::bail!(
-        "no chat selected; pass --chat id:<id>/name:<name> or configure [bujamentor].chats; legacy target_chat_id is not used by CLI activation"
-    )
+    Ok(values)
+}
+
+fn expand_plain_chat_names_with_configured_bindings(
+    cli_values: Vec<String>,
+    configured: &[String],
+) -> Vec<String> {
+    let bindings = configured
+        .iter()
+        .filter_map(|value| {
+            let selector = value.trim();
+            let binding = selector.strip_prefix("bind:")?;
+            let (_id, name) = binding.split_once(':')?;
+            let name = name.trim();
+            if name.is_empty() {
+                None
+            } else {
+                Some((name.to_owned(), selector.to_owned()))
+            }
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    cli_values
+        .into_iter()
+        .map(|value| {
+            let trimmed = value.trim();
+            if trimmed.starts_with("id:")
+                || trimmed.starts_with("name:")
+                || trimmed.starts_with("bind:")
+                || trimmed.bytes().all(|byte| byte.is_ascii_digit())
+            {
+                return value;
+            }
+            bindings.get(trimmed).cloned().unwrap_or(value)
+        })
+        .collect()
 }
 
 fn resolve_bujamentor_supervisor(binary: &Path) -> Result<(PathBuf, PathBuf)> {
@@ -1235,13 +1282,38 @@ fn validate_bujamentor_executable(
     if value.is_empty() || value.chars().any(|ch| ch.is_control()) {
         anyhow::bail!("{label} must be a non-empty executable path");
     }
-    let path = Path::new(value);
-    if !path.is_absolute() {
+    let configured = Path::new(value);
+    if !configured.is_absolute() {
         anyhow::bail!("{label} must be an absolute path");
     }
-    let resolved = fs::canonicalize(path)
-        .with_context(|| format!("{label} does not resolve to a readable executable"))?;
-    let metadata = fs::symlink_metadata(&resolved)?;
+    if default_name == "python3" && is_homebrew_cellar_version_path(configured) {
+        anyhow::bail!("{label} must not be a Homebrew Cellar version path");
+    }
+    let configured_metadata = fs::symlink_metadata(configured).with_context(|| {
+        if default_name == "python3" {
+            format!("python_interpreter_missing: {label} is unavailable")
+        } else {
+            format!("{label} does not resolve to a readable executable")
+        }
+    })?;
+    if configured.is_symlink() {
+        if default_name != "python3" {
+            anyhow::bail!("{label} must not be a symlink");
+        }
+        if !is_homebrew_opt_python_keg_path(configured) {
+            anyhow::bail!("{label} symlink must be a Homebrew opt python keg path");
+        }
+    } else if !configured_metadata.is_file() {
+        anyhow::bail!("{label} is not a regular file");
+    }
+    let target = fs::canonicalize(configured).with_context(|| {
+        if default_name == "python3" {
+            format!("python_interpreter_missing: {label} target is unavailable")
+        } else {
+            format!("{label} does not resolve to a readable executable")
+        }
+    })?;
+    let metadata = fs::symlink_metadata(&target)?;
     if !metadata.is_file() {
         anyhow::bail!("{label} is not a regular file");
     }
@@ -1253,7 +1325,7 @@ fn validate_bujamentor_executable(
         }
     }
     if default_name == "python3" && probe_python_version {
-        let output = Command::new(&resolved)
+        let output = Command::new(&target)
             .args([
                 "-I",
                 "-B",
@@ -1271,7 +1343,27 @@ fn validate_bujamentor_executable(
             anyhow::bail!("{label} must be CPython 3.11, 3.12, or 3.13");
         }
     }
-    Ok(resolved.to_string_lossy().into_owned())
+    if default_name == "python3" {
+        Ok(configured.to_string_lossy().into_owned())
+    } else {
+        Ok(target.to_string_lossy().into_owned())
+    }
+}
+
+fn is_homebrew_opt_python_keg_path(path: &Path) -> bool {
+    path.to_str().is_some_and(|value| {
+        matches!(
+            value,
+            "/opt/homebrew/opt/python@3.11/bin/python3.11"
+                | "/opt/homebrew/opt/python@3.12/bin/python3.12"
+                | "/opt/homebrew/opt/python@3.13/bin/python3.13"
+        )
+    })
+}
+
+fn is_homebrew_cellar_version_path(path: &Path) -> bool {
+    path.to_str()
+        .is_some_and(|value| value.contains("/Cellar/python@"))
 }
 
 #[derive(Debug, Clone)]
@@ -1283,6 +1375,158 @@ struct BujamentorRunner {
     service_tier: String,
     sha256: String,
     codex_home: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutoReplyLlmChoice {
+    GjcGemini36Flash,
+    CodexGpt56Luna,
+}
+
+impl AutoReplyLlmChoice {
+    fn all() -> [Self; 2] {
+        [Self::GjcGemini36Flash, Self::CodexGpt56Luna]
+    }
+
+    fn from_model(model: &str) -> Option<Self> {
+        match model.trim() {
+            "google-antigravity/gemini-3.6-flash-tiered" | "gjc" | "gemini" | "gemini-3.6-flash" => {
+                Some(Self::GjcGemini36Flash)
+            }
+            "gpt-5.6-luna" | "codex" | "luna" => Some(Self::CodexGpt56Luna),
+            _ => None,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::GjcGemini36Flash => "Gajae-Code Gemini 3.6 Flash (tiered)",
+            Self::CodexGpt56Luna => "Codex GPT-5.6 Luna",
+        }
+    }
+
+    fn model(self) -> &'static str {
+        match self {
+            Self::GjcGemini36Flash => "google-antigravity/gemini-3.6-flash-tiered",
+            Self::CodexGpt56Luna => "gpt-5.6-luna",
+        }
+    }
+
+    fn apply(self, config: &mut config::OpenKakaoConfig) {
+        match self {
+            Self::GjcGemini36Flash => {
+                config.model.privacy_mode = Some("remote_explicit".into());
+                config.model.allow_egress = true;
+                config.model.provider = Some("google-antigravity".into());
+                config.model.retention = Some("provider-policy".into());
+                config.bujamentor.reply_runner_kind = Some("gjc".into());
+                config.bujamentor.reply_model = Some(self.model().into());
+                config.bujamentor.reply_reasoning_effort = Some("medium".into());
+                config.bujamentor.reply_service_tier = Some("default".into());
+                if config.bujamentor.reply_runner.is_none() {
+                    if let Some(home) = dirs::home_dir() {
+                        let wrapper = home.join(".local/lib/openkakao/gjc.js");
+                        if wrapper.is_file() {
+                            config.bujamentor.reply_runner =
+                                Some(wrapper.to_string_lossy().into_owned());
+                        }
+                    }
+                }
+            }
+            Self::CodexGpt56Luna => {
+                config.model.privacy_mode = Some("remote_explicit".into());
+                config.model.allow_egress = true;
+                config.model.provider = Some("openai-codex".into());
+                config.model.retention = Some("provider-policy".into());
+                config.bujamentor.reply_runner_kind = Some("codex".into());
+                config.bujamentor.reply_model = Some(self.model().into());
+                config.bujamentor.reply_reasoning_effort = Some("max".into());
+                config.bujamentor.reply_service_tier = Some("priority".into());
+            }
+        }
+    }
+}
+
+fn select_auto_reply_llm(
+    config: &mut config::OpenKakaoConfig,
+    requested: Option<&str>,
+    json_output: bool,
+) -> Result<AutoReplyLlmChoice> {
+    if let Some(requested) = requested {
+        return AutoReplyLlmChoice::from_model(requested).with_context(|| {
+            format!("unknown reply model {requested:?}; use gemini-3.6-flash or gpt-5.6-luna")
+        });
+    }
+    if json_output || !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
+        let configured = config.bujamentor.reply_model.as_deref().unwrap_or("");
+        return AutoReplyLlmChoice::from_model(configured).with_context(|| {
+            "no working reply model selected; pass --model or run interactively to pick one"
+        });
+    }
+    let items = AutoReplyLlmChoice::all()
+        .into_iter()
+        .map(|choice| crate::util::ArrowMenuItem {
+            label: choice.label().to_owned(),
+            value: choice.model().to_owned(),
+        })
+        .collect::<Vec<_>>();
+    let selected = config
+        .bujamentor
+        .reply_model
+        .as_deref()
+        .and_then(AutoReplyLlmChoice::from_model)
+        .and_then(|current| AutoReplyLlmChoice::all().iter().position(|item| *item == current))
+        .unwrap_or(0);
+    let index = crate::util::select_with_arrows("Select the reply LLM", &items, selected)?;
+    Ok(AutoReplyLlmChoice::all()[index])
+}
+
+fn probe_auto_reply_llm(config: &config::OpenKakaoConfig, choice: AutoReplyLlmChoice) -> Result<()> {
+    let runner = validate_bujamentor_runner(config)?;
+    let output = match choice {
+        AutoReplyLlmChoice::GjcGemini36Flash => Command::new(&runner.path)
+            .args([
+                "-p",
+                "--no-session",
+                "--no-rules",
+                "--no-lsp",
+                "--no-title",
+                "--no-tools",
+                "--mode",
+                "text",
+                "--model",
+                choice.model(),
+                "Reply with exactly OK",
+            ])
+            .stdin(Stdio::null())
+            .output()
+            .context("probe Gajae-Code reply model")?,
+        AutoReplyLlmChoice::CodexGpt56Luna => Command::new(&runner.path)
+            .arg("--version")
+            .stdin(Stdio::null())
+            .output()
+            .context("probe Codex reply model")?,
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    match choice {
+        AutoReplyLlmChoice::GjcGemini36Flash => {
+            if !output.status.success() || !stdout.contains("OK") {
+                anyhow::bail!(
+                    "selected LLM {} did not respond; stdout={} stderr={}",
+                    choice.label(),
+                    stdout.trim(),
+                    stderr.trim()
+                );
+            }
+        }
+        AutoReplyLlmChoice::CodexGpt56Luna => {
+            if !output.status.success() || !stdout.trim().starts_with("codex-cli ") {
+                anyhow::bail!("selected LLM {} is not working", choice.label());
+            }
+        }
+    }
+    Ok(())
 }
 
 fn sha256_file(path: &Path) -> Result<String> {
@@ -1313,8 +1557,9 @@ fn validate_bujamentor_codex_auth(path: &Path, uid: u32) -> Result<()> {
         || metadata.uid() != uid
         || metadata.nlink() != 1
         || metadata.mode() & 0o077 != 0
+        || metadata.len() == 0
     {
-        anyhow::bail!("Bujamentor Codex auth must be a private user-owned regular file");
+        anyhow::bail!("Bujamentor Codex auth must be a private non-empty user-owned regular file");
     }
     Ok(())
 }
@@ -1378,10 +1623,16 @@ fn validate_bujamentor_runner(config: &config::OpenKakaoConfig) -> Result<Bujame
         .bujamentor
         .reply_model
         .as_deref()
-        .unwrap_or(if kind == "codex" { "gpt-5.6-luna" } else { "" })
+        .unwrap_or(if kind == "codex" {
+            "gpt-5.6-luna"
+        } else if kind == "gjc" {
+            "google-antigravity/gemini-3.6-flash-tiered"
+        } else {
+            ""
+        })
         .trim()
         .to_owned();
-    if kind == "codex"
+    if matches!(kind, "codex" | "gjc")
         && (model.is_empty()
             || model.len() > 128
             || !model
@@ -1394,7 +1645,7 @@ fn validate_bujamentor_runner(config: &config::OpenKakaoConfig) -> Result<Bujame
         .bujamentor
         .reply_reasoning_effort
         .as_deref()
-        .unwrap_or(if kind == "codex" { "max" } else { "low" })
+        .unwrap_or(if kind == "codex" { "max" } else { "medium" })
         .trim()
         .to_owned();
     if kind == "codex"
@@ -2796,6 +3047,165 @@ fn validate_stopped_clean_queue(queue_path: &Path, expected_chat_id: i64) -> Res
     Ok(())
 }
 
+fn leftover_queue_has_unknown_send(queue_path: &Path, expected_chat_id: i64) -> Result<()> {
+    if !queue_path.exists() {
+        return Ok(());
+    }
+    validate_private_regular_file(queue_path, 64 * 1024 * 1024)?;
+    let connection = rusqlite::Connection::open_with_flags(
+        queue_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| format!("open leftover queue {}", queue_path.display()))?;
+    connection.execute_batch("PRAGMA query_only = ON; PRAGMA busy_timeout = 5000;")?;
+    for table in ["reply_jobs", "reply_job_tombstones"] {
+        let exists: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [table],
+            |row| row.get(0),
+        )?;
+        if exists == 0 {
+            continue;
+        }
+        let sql = format!(
+            "SELECT COUNT(*) FROM {table} WHERE status IN ('sending', 'reconcile_required', 'poison')"
+        );
+        let unknown: i64 = connection.query_row(&sql, [], |row| row.get(0))?;
+        if unknown != 0 {
+            anyhow::bail!(
+                "Bujamentor leftover queue for {expected_chat_id} has unknown or in-flight sends"
+            );
+        }
+        if table == "reply_jobs" {
+            let has_journal: i64 = connection.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'pipeline_transitions'",
+                [],
+                |row| row.get(0),
+            )?;
+            if has_journal == 0 {
+                let leftover_unknown: i64 = connection.query_row(
+                    "SELECT COUNT(*) FROM reply_jobs WHERE status = 'delivery_unknown'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                if leftover_unknown != 0 {
+                    anyhow::bail!(
+                        "Bujamentor leftover queue for {expected_chat_id} has unknown or in-flight sends"
+                    );
+                }
+            } else {
+                let ax_unknown: i64 = connection.query_row(
+                    "SELECT COUNT(*) FROM reply_jobs j
+                     WHERE j.status = 'delivery_unknown'
+                       AND (
+                         (j.reply IS NOT NULL AND length(j.reply) > 0)
+                         OR (
+                           j.reason IS NOT NULL
+                           AND length(j.reason) > 0
+                           AND j.reason NOT IN (
+                            'model_usage_limited',
+                            'model_rate_limited',
+                            'model_authentication_unavailable',
+                            'model_temporarily_unavailable',
+                            'pre_send_unproven'
+                           )
+                         )
+                         OR EXISTS (
+                            SELECT 1 FROM pipeline_transitions t
+                            WHERE t.event_id = j.event_id
+                              AND (
+                                (t.component = 'ax' AND t.code IN ('ax_mutation_authorized', 'local_db_confirmed'))
+                                OR (t.component = 'pre_send' AND t.to_state IN ('ready', 'sending'))
+                                OR t.from_state = 'sending'
+                                OR t.to_state = 'sending'
+                              )
+                         )
+                       )",
+                    [],
+                    |row| row.get(0),
+                )?;
+                if ax_unknown != 0 {
+                    anyhow::bail!(
+                        "Bujamentor leftover queue for {expected_chat_id} has unknown or in-flight sends"
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn leftover_supervisor_is_live(room_root: &Path, target: &local_db::LocalChat) -> Result<bool> {
+    let status_path = room_root.join("supervisor-status.json");
+    validate_private_regular_file(&status_path, BUJAMENTOR_READINESS_MAX_BYTES)?;
+    let status = read_bounded_json_file(&status_path)?;
+    let state = status
+        .get("state")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    Ok(status.get("schema_version") == Some(&serde_json::Value::from(1))
+        && status.get("mode")
+            == Some(&serde_json::Value::String(
+                "database_authoritative".to_string(),
+            ))
+        && status.get("target_chat_id") == Some(&serde_json::Value::from(target.chat_id))
+        && status.get("target_chat_name")
+            == Some(&serde_json::Value::String(target.chat_name.clone()))
+        && matches!(state, "running" | "starting" | "stopping")
+        && status.get("all_children_exited") != Some(&serde_json::Value::Bool(true)))
+}
+
+fn leftover_supervisor_is_terminal(
+    room_root: &Path,
+    target: &local_db::LocalChat,
+    state: &serde_json::Value,
+) -> Result<()> {
+    let status_path = room_root.join("supervisor-status.json");
+    validate_private_regular_file(&status_path, BUJAMENTOR_READINESS_MAX_BYTES)?;
+    let status = read_bounded_json_file(&status_path)?;
+    let _owner = state
+        .get("owner_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .context("Bujamentor leftover owner is invalid")?;
+    let _epoch = state
+        .get("source_epoch")
+        .and_then(serde_json::Value::as_i64)
+        .filter(|value| (1..MAX_INT64).contains(value))
+        .context("Bujamentor leftover epoch is invalid")?;
+    let child_states = status
+        .get("child_states")
+        .and_then(serde_json::Value::as_object)
+        .context("Bujamentor leftover child states are missing")?;
+    if status.get("schema_version") != Some(&serde_json::Value::from(1))
+        || status.get("mode")
+            != Some(&serde_json::Value::String(
+                "database_authoritative".to_string(),
+            ))
+        || status.get("state") != Some(&serde_json::Value::String("stopped".to_string()))
+        || status.get("shutdown_state")
+            != Some(&serde_json::Value::String("stopped_unclean".to_string()))
+        || status.get("all_children_exited") != Some(&serde_json::Value::Bool(true))
+        || status
+            .get("owner")
+            .and_then(serde_json::Value::as_str)
+            .is_none_or(str::is_empty)
+        || status
+            .get("source_epoch")
+            .and_then(serde_json::Value::as_i64)
+            .is_none_or(|value| !(1..MAX_INT64).contains(&value))
+        || status.get("target_chat_id") != Some(&serde_json::Value::from(target.chat_id))
+        || status.get("target_chat_name")
+            != Some(&serde_json::Value::String(target.chat_name.clone()))
+        || ["ax_watch", "db_watch", "reply_worker"].iter().any(|role| {
+            child_states.get(*role) != Some(&serde_json::Value::String("exited".to_string()))
+        })
+    {
+        anyhow::bail!("Bujamentor leftover supervisor proof is invalid");
+    }
+    leftover_queue_has_unknown_send(&room_root.join("reply-queue.sqlite3"), target.chat_id)
+}
+
 fn validate_stopped_clean_supervisor(
     room_root: &Path,
     target: &local_db::LocalChat,
@@ -2914,6 +3324,119 @@ fn enrollment_cursor_authority_for_target(
             && state.get("delivery_enabled") == Some(&serde_json::Value::Bool(false))
             && state.get("fence") == Some(&serde_json::Value::String("stopped_clean".to_string()))
             && state.get("fence_reason") == Some(&serde_json::Value::String(String::new()));
+        let leftover_fenced_state = state.get("schema_version")
+            == Some(&serde_json::Value::from(3))
+            && state.get("target_chat_id") == Some(&serde_json::Value::from(target.chat_id))
+            && state.get("target_chat_name")
+                == Some(&serde_json::Value::String(target.chat_name.clone()))
+            && state.get("capability_state") == Some(&serde_json::Value::String("fenced".to_string()))
+            && state.get("delivery_enabled") == Some(&serde_json::Value::Bool(false))
+            && state.get("candidate_phase") == Some(&serde_json::Value::String("idle".to_string()))
+            && state.get("in_flight_candidate") == Some(&serde_json::Value::Null)
+            && state
+                .get("owner_id")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|value| !value.is_empty())
+            && state
+                .get("source_epoch")
+                .and_then(serde_json::Value::as_i64)
+                .is_some_and(|value| (1..MAX_INT64).contains(&value))
+            && cursor_floor <= acked_watermark
+            && acked_watermark == acked.iter().next_back().copied().unwrap_or(0)
+            && last_observed == observed.iter().next_back().copied().unwrap_or(0)
+            && acked.is_subset(&observed)
+            && acked_watermark > 0
+            && acked_watermark <= freshly_attested_watermark;
+        let leftover_ready_idle = state.get("schema_version")
+            == Some(&serde_json::Value::from(3))
+            && state.get("target_chat_id") == Some(&serde_json::Value::from(target.chat_id))
+            && state.get("target_chat_name")
+                == Some(&serde_json::Value::String(target.chat_name.clone()))
+            && state.get("capability_state") == Some(&serde_json::Value::String("ready".to_string()))
+            && state.get("delivery_enabled") == Some(&serde_json::Value::Bool(true))
+            && state.get("fence") == Some(&serde_json::Value::String("ready".to_string()))
+            && state.get("candidate_phase") == Some(&serde_json::Value::String("idle".to_string()))
+            && state.get("in_flight_candidate") == Some(&serde_json::Value::Null)
+            && is_empty_json_array(state.get("pending_log_ids"))
+            && is_empty_json_array(state.get("pending_gaps"))
+            && state
+                .get("owner_id")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|value| !value.is_empty())
+            && state
+                .get("source_epoch")
+                .and_then(serde_json::Value::as_i64)
+                .is_some_and(|value| (1..MAX_INT64).contains(&value))
+            && cursor_floor <= acked_watermark
+            && acked_watermark == acked.iter().next_back().copied().unwrap_or(0)
+            && last_observed == observed.iter().next_back().copied().unwrap_or(0)
+            && acked.is_subset(&observed)
+            && acked_watermark > 0
+            && acked_watermark <= freshly_attested_watermark;
+        let live_supervisor = leftover_supervisor_is_live(&room_root, target).unwrap_or(false);
+        if live_supervisor
+            && state.get("schema_version") == Some(&serde_json::Value::from(3))
+            && state.get("target_chat_id") == Some(&serde_json::Value::from(target.chat_id))
+            && state.get("target_chat_name")
+                == Some(&serde_json::Value::String(target.chat_name.clone()))
+            && state
+                .get("owner_id")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|value| !value.is_empty())
+            && state
+                .get("source_epoch")
+                .and_then(serde_json::Value::as_i64)
+                .is_some_and(|value| (1..MAX_INT64).contains(&value))
+            && acked_watermark > 0
+            && acked_watermark <= freshly_attested_watermark
+        {
+            leftover_queue_has_unknown_send(&room_root.join("reply-queue.sqlite3"), target.chat_id)?;
+            validate_private_regular_file(&state_path, 256 * 1024)?;
+            return Ok(AutoReplyCursorAuthority {
+                kind: BUJAMENTOR_CURSOR_LEFTOVER_KIND,
+                cursor_floor: acked_watermark,
+                attested_db_last_log_id: freshly_attested_watermark,
+                prior_owner_id: state
+                    .get("owner_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+                prior_source_epoch: state
+                    .get("source_epoch")
+                    .and_then(serde_json::Value::as_i64),
+            });
+        }
+        if leftover_ready_idle {
+            leftover_queue_has_unknown_send(&room_root.join("reply-queue.sqlite3"), target.chat_id)?;
+            validate_private_regular_file(&state_path, 256 * 1024)?;
+            return Ok(AutoReplyCursorAuthority {
+                kind: BUJAMENTOR_CURSOR_LEFTOVER_KIND,
+                cursor_floor: acked_watermark,
+                attested_db_last_log_id: freshly_attested_watermark,
+                prior_owner_id: state
+                    .get("owner_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+                prior_source_epoch: state
+                    .get("source_epoch")
+                    .and_then(serde_json::Value::as_i64),
+            });
+        }
+        if leftover_fenced_state && !stopped_clean_state {
+            leftover_supervisor_is_terminal(&room_root, target, &state)?;
+            validate_private_regular_file(&state_path, 256 * 1024)?;
+            return Ok(AutoReplyCursorAuthority {
+                kind: BUJAMENTOR_CURSOR_LEFTOVER_KIND,
+                cursor_floor: acked_watermark,
+                attested_db_last_log_id: freshly_attested_watermark,
+                prior_owner_id: state
+                    .get("owner_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+                prior_source_epoch: state
+                    .get("source_epoch")
+                    .and_then(serde_json::Value::as_i64),
+            });
+        }
         if state.get("schema_version") != Some(&serde_json::Value::from(3))
             || state.get("target_chat_id") != Some(&serde_json::Value::from(target.chat_id))
             || state.get("target_chat_name")
@@ -3068,7 +3591,10 @@ fn write_auto_reply_enrollment(
         .iter()
         .zip(cursor_authorities.iter())
         .any(|(target, authority)| {
-            authority.kind == BUJAMENTOR_CURSOR_REPLAY_KIND
+            matches!(
+                authority.kind,
+                BUJAMENTOR_CURSOR_REPLAY_KIND | BUJAMENTOR_CURSOR_LEFTOVER_KIND
+            )
                 && binding_evidence
                     .iter()
                     .all(|binding| binding.chat_id != target.chat_id)
@@ -3624,9 +4150,28 @@ fn run_auto_reply(
     self_nickname_override: Option<String>,
     reply_author_overrides: Vec<String>,
     interval: f64,
+    requested_model: Option<String>,
     json_output: bool,
 ) -> Result<()> {
     let mut effective_config = config.clone();
+    let choice = select_auto_reply_llm(
+        &mut effective_config,
+        requested_model.as_deref(),
+        json_output,
+    )?;
+    choice.apply(&mut effective_config);
+    if let Err(error) = probe_auto_reply_llm(&effective_config, choice) {
+        emit_auto_reply_preflight(
+            json_output,
+            check,
+            &[],
+            &auto_reply_state_root(&effective_config).unwrap_or_else(|_| PathBuf::from(".")),
+            false,
+            Some(&error.to_string()),
+            false,
+        );
+        return Err(error);
+    }
     let reply_author_override_active = !reply_author_overrides.is_empty();
     if self_nickname_override.is_some() {
         effective_config.bujamentor.self_nickname = self_nickname_override;
@@ -4189,7 +4734,7 @@ fn cli_enrollment_cursor_authority(
                 anyhow::bail!("CLI fresh cursor authority invalid");
             }
         }
-        BUJAMENTOR_CURSOR_REPLAY_KIND => {
+        BUJAMENTOR_CURSOR_REPLAY_KIND | BUJAMENTOR_CURSOR_LEFTOVER_KIND => {
             if cursor_floor > attested_tail
                 || prior_owner
                     .and_then(serde_json::Value::as_str)
@@ -4358,8 +4903,12 @@ fn validate_cli_enrollment_authority(
         }
         _ => anyhow::bail!("CLI enrollment identity kind invalid"),
     }
-    if cursor_kind == BUJAMENTOR_CURSOR_REPLAY_KIND && kind != "ax_transcript" {
-        anyhow::bail!("CLI replay cursor requires transcript identity");
+    if matches!(
+        cursor_kind,
+        BUJAMENTOR_CURSOR_REPLAY_KIND | BUJAMENTOR_CURSOR_LEFTOVER_KIND
+    ) && kind != "ax_transcript"
+    {
+        anyhow::bail!("CLI leftover or replay cursor requires transcript identity");
     }
     cli_enrollment_reply_author_bindings(enrolled)?;
     Ok(())
@@ -5877,6 +6426,7 @@ fn main() -> Result<()> {
             message,
             yes,
             dry_run,
+            reply_to,
             preflight,
         } => {
             let msg = format_outgoing_message(&message, no_prefix);
@@ -6069,6 +6619,7 @@ fn main() -> Result<()> {
                 preflight,
                 json,
                 bound_chat,
+                reply_to,
             })?
         }
         Commands::AxRead { chat_name, count } => {
@@ -6121,6 +6672,7 @@ fn main() -> Result<()> {
             self_nickname,
             reply_author,
             interval,
+            model,
         } => run_auto_reply(
             &config,
             chat,
@@ -6128,6 +6680,7 @@ fn main() -> Result<()> {
             self_nickname,
             reply_author,
             interval,
+            model,
             json,
         )?,
         Commands::WatchCache { interval } => commands::auth::cmd_watch_cache(interval)?,
@@ -6230,6 +6783,9 @@ mod tests {
         fs::hard_link(&source, &hardlinked).expect("create hardlink fixture");
         assert!(validate_bujamentor_codex_auth(&source, uid).is_err());
         assert!(validate_bujamentor_codex_auth(&hardlinked, uid).is_err());
+        fs::remove_file(&hardlinked).expect("remove hardlink");
+        fs::write(&source, b"").expect("empty the auth fixture");
+        assert!(validate_bujamentor_codex_auth(&source, uid).is_err());
     }
 
     fn local_source_fence(
@@ -7437,6 +7993,62 @@ mod tests {
             Commands::LocalChats { limit } => assert_eq!(limit, 10),
             other => panic!("expected local-chats, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn auto_reply_command_accepts_plain_chat_name() {
+        let cli = Cli::try_parse_from([
+            "openkakao-cli",
+            "auto-reply",
+            "--chat",
+            "부자멘토멘티",
+            "--model",
+            "gemini-3.6-flash",
+        ])
+        .expect("plain chat names should parse");
+        match cli.command {
+            Commands::AutoReply { chat, model, .. } => {
+                assert_eq!(chat, vec!["부자멘토멘티"]);
+                assert_eq!(model.as_deref(), Some("gemini-3.6-flash"));
+            }
+            other => panic!("expected auto-reply, got {other:?}"),
+        }
+        let selectors = local_db::parse_chat_selectors(&["부자멘토멘티".into()])
+            .expect("plain names become name selectors");
+        assert!(matches!(
+            selectors.as_slice(),
+            [local_db::ChatSelector::Name(name)] if name == "부자멘토멘티"
+        ));
+    }
+
+    #[test]
+    fn auto_reply_llm_aliases_map_to_attested_models() {
+        assert_eq!(
+            AutoReplyLlmChoice::from_model("gemini-3.6-flash")
+                .expect("gemini alias")
+                .model(),
+            "google-antigravity/gemini-3.6-flash-tiered"
+        );
+        assert_eq!(
+            AutoReplyLlmChoice::from_model("gpt-5.6-luna")
+                .expect("luna alias")
+                .model(),
+            "gpt-5.6-luna"
+        );
+    }
+
+    #[test]
+    fn beginner_plain_name_uses_configured_bind_selector() {
+        let expanded = expand_plain_chat_names_with_configured_bindings(
+            vec!["부자멘토멘티".into()],
+            &["bind:417780809780519:부자멘토멘티".into()],
+        );
+        assert_eq!(expanded, vec!["bind:417780809780519:부자멘토멘티"]);
+        let untouched = expand_plain_chat_names_with_configured_bindings(
+            vec!["name:다른방".into()],
+            &["bind:417780809780519:부자멘토멘티".into()],
+        );
+        assert_eq!(untouched, vec!["name:다른방"]);
     }
 
     #[test]
@@ -8768,16 +9380,41 @@ connection.close()
         fs::set_permissions(&status_path, fs::Permissions::from_mode(0o600)).unwrap();
         assert!(enrollment_floor_for_target(root.path(), &target, 140).is_err());
 
-        fs::write(&status_path, serde_json::to_vec(&stopped_status).unwrap()).unwrap();
+        let mut leftover_status = stopped_status.clone();
+        leftover_status["shutdown_state"] = serde_json::json!("stopped_unclean");
+        leftover_status["fence_reason"] = serde_json::json!("db_watch_exited");
+        leftover_status["readiness"] = serde_json::json!("fenced");
+        leftover_status["all_children_exited"] = serde_json::json!(true);
+        leftover_status["child_states"] = serde_json::json!({
+            "ax_watch": "exited",
+            "db_watch": "exited",
+            "reply_worker": "exited",
+        });
+        fs::write(&status_path, serde_json::to_vec(&leftover_status).unwrap()).unwrap();
         let mut raw_poll_fence = stopped_state;
         raw_poll_fence["capability_state"] = serde_json::json!("fenced");
         raw_poll_fence["fence"] = serde_json::json!("db_unavailable");
         raw_poll_fence["fence_reason"] = serde_json::json!("poll_fence");
+        raw_poll_fence["delivery_enabled"] = serde_json::json!(false);
         fs::write(&state_path, serde_json::to_vec(&raw_poll_fence).unwrap()).unwrap();
         #[cfg(unix)]
         for path in [&state_path, &status_path] {
             fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
         }
+        assert_eq!(
+            enrollment_cursor_authority_for_target(root.path(), &target, 140)
+                .expect("terminal leftover ACK resume must be accepted")
+                .kind,
+            BUJAMENTOR_CURSOR_LEFTOVER_KIND
+        );
+        let leftover = read_bounded_json_file(&state_path).expect("leftover state remains");
+        assert_eq!(leftover["acked_watermark"], 130);
+        assert_eq!(leftover["last_observed_log_id"], 130);
+        assert_ne!(leftover["fence"], "stopped_clean");
+        leftover_status["all_children_exited"] = serde_json::json!(false);
+        fs::write(&status_path, serde_json::to_vec(&leftover_status).unwrap()).unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&status_path, fs::Permissions::from_mode(0o600)).unwrap();
         assert!(enrollment_floor_for_target(root.path(), &target, 140).is_err());
     }
 
@@ -8993,16 +9630,49 @@ connection.close()
         .expect("write fake interpreter");
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o700))
             .expect("set executable permissions");
-        let canonical_executable = fs::canonicalize(&executable).expect("canonical executable");
+        let configured = executable.to_str().expect("executable path");
         let resolved = validate_bujamentor_executable(
-            Some(executable.to_str().expect("executable path")),
+            Some(configured),
             "test python",
             "python3",
             false,
         )
         .expect("static validation should not execute the interpreter");
-        assert_eq!(resolved, canonical_executable.to_string_lossy());
+        assert_eq!(resolved, configured);
         assert!(!marker.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn python_interpreter_rejects_cellar_version_path_and_keeps_keg_string() {
+        let cellar = Path::new(
+            "/opt/homebrew/Cellar/python@3.11/3.11.15_4/Frameworks/Python.framework/Versions/3.11/bin/python3.11",
+        );
+        let error = validate_bujamentor_executable(
+            Some(cellar.to_str().expect("cellar path")),
+            "Bujamentor python_interpreter",
+            "python3",
+            false,
+        )
+        .expect_err("Cellar version paths must be rejected");
+        assert!(error.to_string().contains("must not be a Homebrew Cellar version path"));
+        assert!(is_homebrew_cellar_version_path(cellar));
+        assert!(is_homebrew_opt_python_keg_path(Path::new(
+            "/opt/homebrew/opt/python@3.11/bin/python3.11"
+        )));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_auth_rejects_empty_credential_file() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let root = tempfile::tempdir().expect("temporary Codex home");
+        let empty = root.path().join("auth.json");
+        fs::write(&empty, b"").expect("write empty auth");
+        fs::set_permissions(&empty, fs::Permissions::from_mode(0o600)).expect("chmod auth");
+        let uid = fs::symlink_metadata(&empty).expect("auth metadata").uid();
+        assert!(validate_bujamentor_codex_auth(&empty, uid).is_err());
     }
 
     #[cfg(unix)]
@@ -9260,12 +9930,14 @@ connection.close()
                 message,
                 yes,
                 dry_run,
+                reply_to,
                 preflight,
             } => {
                 assert_eq!(chat_name, "나와의 채팅");
                 assert_eq!(message, "hi");
                 assert!(yes);
                 assert!(!dry_run);
+                assert!(reply_to.is_none());
                 assert!(!preflight);
             }
             other => panic!("expected local-send, got {other:?}"),

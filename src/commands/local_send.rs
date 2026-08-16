@@ -34,6 +34,8 @@ pub struct LocalSendOptions {
     /// the worker identity and database-authoritative binding have passed.
     pub preflight: bool,
     pub json: bool,
+    /// Visible message text to quote via the KakaoTalk context-menu 답장 item.
+    pub reply_to: Option<String>,
     /// Present only for the database-authoritative Bujamentor worker. The AX
     /// layer must bind this numeric chat ID's current local transcript to the
     /// exact open window before it may touch the composer.
@@ -239,6 +241,7 @@ pub fn cmd_local_send(opts: LocalSendOptions) -> Result<()> {
         preflight,
         json,
         ref bound_chat,
+        ref reply_to,
     } = opts;
     let message = normalize_outgoing_message(message);
     validate_outbound_message(&message)?;
@@ -257,7 +260,8 @@ pub fn cmd_local_send(opts: LocalSendOptions) -> Result<()> {
 
     if dry_run {
         eprintln!(
-            "[dry-run] Would AX-send to chat \"{}\": \"{}\"",
+            "[dry-run] Would AX-{} to chat \"{}\": \"{}\"",
+            if reply_to.is_some() { "quote-reply" } else { "send" },
             chat_name,
             truncate(&message, 80)
         );
@@ -316,6 +320,9 @@ pub fn cmd_local_send(opts: LocalSendOptions) -> Result<()> {
             }
         }
         confirm_worker_local_delivery(bound.chat_id, bound.expected_source_log_id, &message)
+    } else if let Some(source) = reply_to {
+        ax_send::reply_via_ax(chat_name, source, &message)?;
+        None
     } else {
         ax_send::send_via_ax(chat_name, &message)?;
         None
@@ -450,6 +457,7 @@ mod tests {
                 expected_source_log_id: SOURCE_LOG_ID,
                 local_tail: vec!["source".to_string()],
             }),
+            reply_to: None,
         };
 
         assert!(cmd_local_send(options("ㅎㅎㅎ", true)).is_err());
