@@ -1,6 +1,7 @@
 mod auth;
 mod auth_flow;
 mod ax_send;
+mod bujamentor_host;
 mod commands;
 mod config;
 mod credentials;
@@ -642,8 +643,16 @@ enum Commands {
         #[arg(long, help = "Preview the action without executing")]
         dry_run: bool,
     },
-    /// Mark messages as read up to a specific message via LOCO protocol
-    MarkRead { chat_id: i64, log_id: i64 },
+    /// Mark messages as read up to a specific message via LOCO protocol.
+    /// Currently research-available; requires allow_loco_write like other writes.
+    MarkRead {
+        chat_id: i64,
+        log_id: i64,
+        #[arg(long, short = 'y', help = "Skip confirmation prompt")]
+        yes: bool,
+        #[arg(long, help = "Preview the action without executing")]
+        dry_run: bool,
+    },
     /// Add a reaction to a message via LOCO ACTION
     React {
         chat_id: i64,
@@ -888,6 +897,17 @@ enum Commands {
         #[arg(long)]
         chat: Option<String>,
     },
+    /// Show Choi Yeonwoo's learned reply register toward one recipient
+    ContextRecipientStyle {
+        #[arg(long)]
+        chat: String,
+        #[arg(long)]
+        recipient: String,
+        #[arg(long)]
+        source: Option<String>,
+        #[arg(long)]
+        db: Option<String>,
+    },
     /// Show Choi Yeonwoo's response-time statistics from the local vector database
     ContextResponseTime {
         #[arg(long)]
@@ -945,6 +965,16 @@ enum Commands {
         reply_to: Option<String>,
         #[arg(long, hide = true, conflicts_with = "dry_run")]
         preflight: bool,
+    },
+    /// Delete a visible message via AX context menu (모두에게서 삭제). No LOCO.
+    LocalDelete {
+        chat_name: String,
+        /// Visible message text or unique substring already shown in the chat window.
+        source: String,
+        #[arg(long, short = 'y', help = "Skip confirmation prompt")]
+        yes: bool,
+        #[arg(long, help = "Preview the action without executing")]
+        dry_run: bool,
     },
     /// Read recent messages via AX automation (no server contact, no local
     /// DB access — scrapes the open KakaoTalk chat window directly)
@@ -1028,11 +1058,13 @@ fn is_local_only_command(command: &Commands) -> bool {
             | Commands::ContextSearch { .. }
             | Commands::ContextReplyBundle { .. }
             | Commands::ContextStyleSearch { .. }
+            | Commands::ContextRecipientStyle { .. }
             | Commands::ContextReplySearch { .. }
             | Commands::ContextReplyRecord { .. }
             | Commands::ContextReplyUpdate { .. }
             | Commands::AxServiceScrapeOnce
             | Commands::LocalSend { .. }
+            | Commands::LocalDelete { .. }
             | Commands::AxRead { .. }
             | Commands::AxWatch { .. }
             | Commands::AutoReply { .. }
@@ -2283,37 +2315,8 @@ fn is_empty_json_array(value: Option<&serde_json::Value>) -> bool {
         .is_some_and(Vec::is_empty)
 }
 
-#[cfg(unix)]
 fn validate_private_regular_file(path: &Path, max_bytes: u64) -> Result<()> {
-    use std::os::unix::fs::MetadataExt;
-    let metadata = fs::symlink_metadata(path)
-        .with_context(|| format!("inspect private Bujamentor state {}", path.display()))?;
-    let uid = unsafe { libc::geteuid() };
-    if !metadata.file_type().is_file()
-        || metadata.file_type().is_symlink()
-        || metadata.uid() != uid
-        || metadata.nlink() != 1
-        || metadata.mode() & 0o777 != 0o600
-        || metadata.len() == 0
-        || metadata.len() > max_bytes
-    {
-        anyhow::bail!("unsafe Bujamentor state file: {}", path.display());
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn validate_private_regular_file(path: &Path, max_bytes: u64) -> Result<()> {
-    let metadata = fs::symlink_metadata(path)
-        .with_context(|| format!("inspect Bujamentor state {}", path.display()))?;
-    if !metadata.file_type().is_file()
-        || metadata.file_type().is_symlink()
-        || metadata.len() == 0
-        || metadata.len() > max_bytes
-    {
-        anyhow::bail!("unsafe Bujamentor state file: {}", path.display());
-    }
-    Ok(())
+    bujamentor_host::validate_private_regular_file(path, max_bytes)
 }
 
 const BUJAMENTOR_QUEUE_LEGACY_USER_VERSION: i64 = 0;
@@ -2982,12 +2985,16 @@ fn validate_stopped_clean_queue(queue_path: &Path, expected_chat_id: i64) -> Res
                 anyhow::bail!("Bujamentor stopped-clean queue event identity mismatches");
             }
         }
+        let event_log_id = event.get("log_id").and_then(serde_json::Value::as_i64);
+        let proactive = event.get("proactive") == Some(&serde_json::Value::Bool(true));
         if event
             .get("chat_id")
             .is_some_and(|value| value.as_i64() != Some(expected_chat_id))
-            || event
-                .get("log_id")
-                .is_some_and(|value| value.as_i64() != Some(log_id))
+            || if proactive {
+                event_log_id.is_some_and(|value| !(1..MAX_INT64).contains(&value))
+            } else {
+                event_log_id.is_some_and(|value| value != log_id)
+            }
         {
             anyhow::bail!("Bujamentor stopped-clean queue JSON identity mismatches");
         }
@@ -3048,91 +3055,7 @@ fn validate_stopped_clean_queue(queue_path: &Path, expected_chat_id: i64) -> Res
 }
 
 fn leftover_queue_has_unknown_send(queue_path: &Path, expected_chat_id: i64) -> Result<()> {
-    if !queue_path.exists() {
-        return Ok(());
-    }
-    validate_private_regular_file(queue_path, 64 * 1024 * 1024)?;
-    let connection = rusqlite::Connection::open_with_flags(
-        queue_path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .with_context(|| format!("open leftover queue {}", queue_path.display()))?;
-    connection.execute_batch("PRAGMA query_only = ON; PRAGMA busy_timeout = 5000;")?;
-    for table in ["reply_jobs", "reply_job_tombstones"] {
-        let exists: i64 = connection.query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
-            [table],
-            |row| row.get(0),
-        )?;
-        if exists == 0 {
-            continue;
-        }
-        let sql = format!(
-            "SELECT COUNT(*) FROM {table} WHERE status IN ('sending', 'reconcile_required', 'poison')"
-        );
-        let unknown: i64 = connection.query_row(&sql, [], |row| row.get(0))?;
-        if unknown != 0 {
-            anyhow::bail!(
-                "Bujamentor leftover queue for {expected_chat_id} has unknown or in-flight sends"
-            );
-        }
-        if table == "reply_jobs" {
-            let has_journal: i64 = connection.query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'pipeline_transitions'",
-                [],
-                |row| row.get(0),
-            )?;
-            if has_journal == 0 {
-                let leftover_unknown: i64 = connection.query_row(
-                    "SELECT COUNT(*) FROM reply_jobs WHERE status = 'delivery_unknown'",
-                    [],
-                    |row| row.get(0),
-                )?;
-                if leftover_unknown != 0 {
-                    anyhow::bail!(
-                        "Bujamentor leftover queue for {expected_chat_id} has unknown or in-flight sends"
-                    );
-                }
-            } else {
-                let ax_unknown: i64 = connection.query_row(
-                    "SELECT COUNT(*) FROM reply_jobs j
-                     WHERE j.status = 'delivery_unknown'
-                       AND (
-                         (j.reply IS NOT NULL AND length(j.reply) > 0)
-                         OR (
-                           j.reason IS NOT NULL
-                           AND length(j.reason) > 0
-                           AND j.reason NOT IN (
-                            'model_usage_limited',
-                            'model_rate_limited',
-                            'model_authentication_unavailable',
-                            'model_temporarily_unavailable',
-                            'pre_send_unproven'
-                           )
-                         )
-                         OR EXISTS (
-                            SELECT 1 FROM pipeline_transitions t
-                            WHERE t.event_id = j.event_id
-                              AND (
-                                (t.component = 'ax' AND t.code IN ('ax_mutation_authorized', 'local_db_confirmed'))
-                                OR (t.component = 'pre_send' AND t.to_state IN ('ready', 'sending'))
-                                OR t.from_state = 'sending'
-                                OR t.to_state = 'sending'
-                              )
-                         )
-                       )",
-                    [],
-                    |row| row.get(0),
-                )?;
-                if ax_unknown != 0 {
-                    anyhow::bail!(
-                        "Bujamentor leftover queue for {expected_chat_id} has unknown or in-flight sends"
-                    );
-                }
-            }
-        }
-    }
-    Ok(())
+    bujamentor_host::leftover_queue_has_unknown_send(queue_path, expected_chat_id)
 }
 
 fn leftover_supervisor_is_live(room_root: &Path, target: &local_db::LocalChat) -> Result<bool> {
@@ -5284,13 +5207,7 @@ fn require_bujamentor_worker_preflight(preflight: bool, worker_identity: bool) -
 }
 
 #[cfg(unix)]
-fn acquire_worker_setup_lock_nonblocking(lock: &fs::File, purpose: &str) -> Result<()> {
-    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        return Err(std::io::Error::last_os_error())
-            .with_context(|| format!("failed to acquire {purpose}"));
-    }
-    Ok(())
-}
+use bujamentor_host::acquire_worker_setup_lock;
 
 fn finish_worker_bound_local_send_setup<T>(
     setup: Result<T>,
@@ -5627,12 +5544,30 @@ fn main() -> Result<()> {
                 })?
             }
         }
-        Commands::MarkRead { chat_id, log_id } => {
-            commands::send::cmd_mark_read(commands::send::MarkReadOptions {
-                chat_id,
-                log_id,
-                json,
-            })?
+        Commands::MarkRead {
+            chat_id,
+            log_id,
+            yes: _,
+            dry_run,
+        } => {
+            if dry_run {
+                eprintln!(
+                    "[dry-run] Would mark chat {} read up to {}",
+                    chat_id, log_id
+                );
+                if json {
+                    util::output_json(&serde_json::json!({
+                        "dry_run": true, "action": "mark-read", "chat_id": chat_id, "log_id": log_id,
+                    }))?;
+                }
+            } else {
+                require_loco_write(&config)?;
+                commands::send::cmd_mark_read(commands::send::MarkReadOptions {
+                    chat_id,
+                    log_id,
+                    json,
+                })?
+            }
         }
         Commands::React {
             chat_id,
@@ -6289,6 +6224,44 @@ fn main() -> Result<()> {
                 );
             }
         }
+        Commands::ContextRecipientStyle {
+            chat,
+            recipient,
+            source,
+            db,
+        } => {
+            let db_path = db
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(openkakao_cli::context::default_db_path);
+            let profile = openkakao_cli::context::recipient_style_profile(
+                &db_path,
+                &chat,
+                &recipient,
+                source.as_deref(),
+            )?;
+            if json {
+                match openkakao_cli::context::recipient_style_profile_json(
+                    &db_path,
+                    &chat,
+                    &recipient,
+                    source.as_deref(),
+                )? {
+                    Some(payload) => println!("{payload}"),
+                    None => println!("null"),
+                }
+            } else if let Some(profile) = profile {
+                println!(
+                    "{} -> {}: {} direct samples (fallback={}, avg {:.1} chars)",
+                    profile.profile.user,
+                    profile.recipient,
+                    profile.direct_sample_count,
+                    profile.used_fallback,
+                    profile.profile.average_character_length
+                );
+            } else {
+                println!("No recipient style profile for '{}' in '{}'.", recipient, chat);
+            }
+        }
         Commands::ContextResponseTime {
             chat,
             user,
@@ -6453,7 +6426,15 @@ fn main() -> Result<()> {
                         .write(true)
                         .open(lock_path)?;
                     #[cfg(unix)]
-                    acquire_worker_setup_lock_nonblocking(&lock, "owner-generation lock")?;
+                    acquire_worker_setup_lock(
+                        &lock,
+                        "owner-generation lock",
+                        if preflight {
+                            std::time::Duration::from_millis(0)
+                        } else {
+                            std::time::Duration::from_millis(400)
+                        },
+                    )?;
                     Some(lock)
                 } else {
                     None
@@ -6469,7 +6450,15 @@ fn main() -> Result<()> {
                             .write(true)
                             .open(lock_path)?;
                         #[cfg(unix)]
-                        acquire_worker_setup_lock_nonblocking(&lock, "AX send lock")?;
+                        acquire_worker_setup_lock(
+                            &lock,
+                            "AX send lock",
+                            if preflight {
+                                std::time::Duration::from_millis(0)
+                            } else {
+                                std::time::Duration::from_millis(400)
+                            },
+                        )?;
                         Some(lock)
                     } else {
                         None
@@ -6518,6 +6507,9 @@ fn main() -> Result<()> {
                                         && !value.chars().any(char::is_control)
                                 })
                                 .context("worker scheduled source author nickname invalid")?;
+                        let proactive_send = std::env::var("OPENKAKAO_PROACTIVE_SEND")
+                            .ok()
+                            .is_some_and(|value| value == "1");
                         require_persisted_bujamentor_readiness(
                             Some(expected_owner.as_str()),
                             Some(expected_epoch),
@@ -6530,6 +6522,7 @@ fn main() -> Result<()> {
                             expected_last_observed,
                             expected_author_id,
                             expected_author_nickname,
+                            proactive_send,
                         ));
                     }
                     require_ax_send(&config)?;
@@ -6539,6 +6532,7 @@ fn main() -> Result<()> {
                         expected_last_observed,
                         expected_author_id,
                         expected_author_nickname,
+                        proactive_send,
                     )) = worker_target
                     {
                         // Fetch the authoritative local tail only after both
@@ -6559,13 +6553,23 @@ fn main() -> Result<()> {
                             .iter()
                             .find(|message| message.log_id == expected_last_observed)
                             .context("scheduled reply source row is unavailable")?;
-                        if source_message.is_self
+                        if proactive_send {
+                            if !source_message.is_self
+                                && (source_message.author_id != expected_author_id
+                                    || source_message.sender_name.trim()
+                                        != expected_author_nickname)
+                            {
+                                anyhow::bail!(
+                                    "scheduled reply source author identity drifted; re-enrollment is required"
+                                );
+                            }
+                        } else if source_message.is_self
                             || source_message.author_id != expected_author_id
                             || source_message.sender_name.trim() != expected_author_nickname
                         {
                             anyhow::bail!(
-                            "scheduled reply source author identity drifted; re-enrollment is required"
-                        );
+                                "scheduled reply source author identity drifted; re-enrollment is required"
+                            );
                         }
                         let enrollment_path = std::env::var_os("OPENKAKAO_ENROLLMENT_PATH")
                             .filter(|value| !value.is_empty())
@@ -6621,6 +6625,16 @@ fn main() -> Result<()> {
                 bound_chat,
                 reply_to,
             })?
+        }
+        Commands::LocalDelete {
+            chat_name,
+            source,
+            yes,
+            dry_run,
+        } => {
+            require_ax_send(&config)?;
+            require_allowed_send_chat(&config, &chat_name)?;
+            commands::local_send::cmd_local_delete(&chat_name, &source, yes, dry_run, json)?
         }
         Commands::AxRead { chat_name, count } => {
             commands::ax_read::cmd_ax_read(commands::ax_read::AxReadOptions {
@@ -6760,6 +6774,8 @@ mod tests {
     };
     use crate::loco_helpers::should_retry_loco_probe_error;
     use crate::util::{require_permission, validate_outbound_message};
+    #[cfg(unix)]
+    use crate::bujamentor_host::acquire_worker_setup_lock_nonblocking;
 
     #[cfg(unix)]
     #[test]
@@ -6990,6 +7006,20 @@ mod tests {
         let error =
             require_expected_local_source_tail(42, watcher_last_observed, &source_db_advanced)
                 .expect_err("a newer source row must fence the scheduled reply");
+        assert!(error
+            .to_string()
+            .contains("conversation advanced beyond scheduled reply source"));
+    }
+
+    #[test]
+    fn proactive_local_source_fence_accepts_exact_self_tail() {
+        let tail = 3908781794201088001i64;
+        let current = local_source_fence(42, tail, tail, &[]);
+        require_expected_local_source_tail(42, tail, &current)
+            .expect("a quiet self tail remains an exact empty after-cursor");
+        let advanced = local_source_fence(42, tail, tail + 1, &[tail + 1]);
+        let error = require_expected_local_source_tail(42, tail, &advanced)
+            .expect_err("a newer tail after a quiet self row still fences send");
         assert!(error
             .to_string()
             .contains("conversation advanced beyond scheduled reply source"));
@@ -7884,9 +7914,16 @@ mod tests {
         let cli = Cli::try_parse_from(["openkakao-cli", "mark-read", "123", "456"])
             .expect("mark-read should parse");
         match cli.command {
-            Commands::MarkRead { chat_id, log_id } => {
+            Commands::MarkRead {
+                chat_id,
+                log_id,
+                yes,
+                dry_run,
+            } => {
                 assert_eq!(chat_id, 123);
                 assert_eq!(log_id, 456);
+                assert!(!yes);
+                assert!(!dry_run);
             }
             other => panic!("expected mark-read, got {other:?}"),
         }
@@ -10077,6 +10114,15 @@ connection.close()
         let local_send = Cli::try_parse_from(["openkakao-cli", "local-send", "나와의 채팅", "hi"])
             .expect("local-send should parse");
         assert!(is_local_only_command(&local_send.command));
+        let local_delete = Cli::try_parse_from([
+            "openkakao-cli",
+            "local-delete",
+            "나와의 채팅",
+            "draft",
+            "-y",
+        ])
+        .expect("local-delete should parse");
+        assert!(is_local_only_command(&local_delete.command));
         let bundle = Cli::try_parse_from([
             "openkakao-cli",
             "context-reply-bundle",

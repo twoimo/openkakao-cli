@@ -10,8 +10,15 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-const VECTOR_DIM: usize = 128;
-const STYLE_USER: &str = "최연우";
+mod common;
+mod index;
+mod live;
+mod reply_bundle;
+pub use common::{CONTEXT_REPLY_BUNDLE_MAX_EXCLUDED_LOG_IDS, STYLE_POLICY_VERSION};
+use common::{
+    CONTEXT_RETRIEVAL_MIGRATION_REQUIRED, RETRIEVAL_INDEX_SCHEMA_VERSION, STYLE_USER, VECTOR_DIM,
+};
+
 const MAX_RESPONSE_DELAY_SECONDS: i64 = 24 * 60 * 60;
 const RESPONSE_TIME_DISTRIBUTION_SCHEMA_VERSION: u32 = 2;
 const RESPONSE_TIME_DISTRIBUTION_POLICY_VERSION: &str = "empirical-log1p-three-means-p90-v1";
@@ -21,21 +28,16 @@ const RESPONSE_TIME_DISTRIBUTION_COMPONENTS: usize = 3;
 const RESPONSE_TIME_DISTRIBUTION_MIN_SAMPLES: usize = 32;
 const RESPONSE_TIME_DISTRIBUTION_MIN_COMPONENT_SAMPLES: usize = 8;
 const MIN_SCHEDULED_RESPONSE_DELAY_SECONDS: f64 = 5.0;
-pub const STYLE_POLICY_VERSION: &str = "ordinary-conversation-v3";
 const CONTEXT_REPLY_BUNDLE_SCHEMA_VERSION: u32 = 2;
 const RECIPIENT_CONTEXT_REPLY_BUNDLE_SCHEMA_VERSION: u32 = 3;
 const CONTEXT_REPLY_BUNDLE_CONTEXT_LIMIT: usize = 8;
 const CONTEXT_REPLY_BUNDLE_STYLE_LIMIT: usize = 12;
 const CONTEXT_REPLY_BUNDLE_DECISION_LIMIT: usize = 6;
-pub const CONTEXT_REPLY_BUNDLE_MAX_EXCLUDED_LOG_IDS: usize = 6;
 const CONTEXT_REPLY_BUNDLE_MAX_JSON_BYTES: usize = 64 * 1024;
 const CONTEXT_KEYWORD_CANDIDATE_CAP: usize = 256;
 const CONTEXT_VECTOR_CANDIDATE_CAP: usize = 256;
 const STYLE_VECTOR_CANDIDATE_CAP: usize = 256;
 const REPLY_DECISION_CANDIDATE_CAP: usize = 128;
-const RETRIEVAL_INDEX_SCHEMA_VERSION: &str = "2";
-const CONTEXT_RETRIEVAL_MIGRATION_REQUIRED: &str =
-    "context retrieval index migration required; run context-index";
 const MAX_REPLY_EVIDENCE_IDS: usize = 64;
 const MAX_REPLY_EVIDENCE_ID_BYTES: usize = 256;
 const MAX_CONTEXT_RETRIEVAL_SCORE: f32 = 2.0;
@@ -2245,6 +2247,21 @@ fn recipient_style_profile_with_connection(
         used_fallback: true,
         profile,
     }))
+}
+
+pub fn recipient_style_profile_json(
+    db_path: &Path,
+    chat: &str,
+    recipient: &str,
+    source: Option<&str>,
+) -> Result<Option<String>> {
+    match recipient_style_profile(db_path, chat, recipient, source)? {
+        Some(mut profile) => {
+            profile.profile.source = stable_provenance_id(&profile.profile.source);
+            Ok(Some(serde_json::to_string(&profile)?))
+        }
+        None => Ok(None),
+    }
 }
 
 pub fn style_profile_json(

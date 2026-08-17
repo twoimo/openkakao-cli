@@ -63,6 +63,7 @@ All known working LOCO implementations (loco-wrapper, node-kakao, KiwiTalk) use 
 | AES mode | CFB-128, 16-byte IV | **GCM, 12-byte nonce** | **GCM (FIXED)** |
 | Secure frame | `[size(4)][iv(16)][ciphertext]` | `[size(4)][nonce(12)+ciphertext+tag]` | **New format (FIXED)** |
 
+Remaining LOCO-token work below is **research**, not a product roadmap. The documented send path is AX `local-send`.
 ### Remaining Options to Obtain LOCO Token
 
 1. **mitmproxy**: Intercept KakaoTalk's live `login.json` response to extract the access_token. Requires: `brew install mitmproxy`, HTTPS cert trust, proxy config.

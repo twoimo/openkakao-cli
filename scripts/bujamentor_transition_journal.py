@@ -516,8 +516,12 @@ def validate_queue_room_binding(
             if (
                 isinstance(log_id, bool)
                 or not isinstance(log_id, int)
-                or log_id != expected_log_id
+                or not 0 < log_id < MAX_INT64
             ):
+                raise sqlite3.DatabaseError(
+                    "reply queue event log identity mismatch"
+                )
+            if event.get("proactive") is not True and log_id != expected_log_id:
                 raise sqlite3.DatabaseError(
                     "reply queue event log identity mismatch"
                 )

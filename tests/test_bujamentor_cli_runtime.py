@@ -17,6 +17,7 @@ import time
 import unittest
 import zlib
 from contextlib import contextmanager
+from datetime import datetime
 from pathlib import Path
 from unittest import mock
 
@@ -546,22 +547,43 @@ class BujamentorCliRuntimeTests(unittest.TestCase):
             module.RESPONSE_TIME_DISTRIBUTION_POLICY_VERSION,
         )
 
-        class DelayedRng:
+        class ShortRng:
             @staticmethod
             def random():
-                return 0.9
+                return 0.6
 
             @staticmethod
             def gauss(_mean, _spread):
-                return 220.2
+                return 40.0
 
         social = module.sample_response_delay_for_analysis(
             stats,
             {"category": "social", "reason": "useful_reply"},
-            rng=DelayedRng(),
+            rng=ShortRng(),
         )
-        self.assertEqual(social["component"], "delayed")
-        self.assertEqual(social["delay_seconds"], 220.2)
+        self.assertEqual(social["component"], "short")
+        self.assertEqual(social["delay_seconds"], 20.0)
+        self.assertEqual(
+            social["scheduled_delay_cap_seconds"],
+            module.SCHEDULED_REPLY_DELAY_CAP_SECONDS,
+        )
+
+        class WideShortRng:
+            @staticmethod
+            def random():
+                return 0.6
+
+            @staticmethod
+            def gauss(_mean, _spread):
+                return 140.0
+
+        capped = module.sample_response_delay_for_analysis(
+            stats,
+            {"category": "social", "reason": "story_reaction"},
+            rng=WideShortRng(),
+        )
+        self.assertEqual(capped["component"], "short")
+        self.assertEqual(capped["delay_seconds"], 20.0)
 
     def test_response_time_mixture_schema_rejects_tampering(self):
         module = self._load_auto_reply_module("bujamentor_timing_schema_test")
@@ -7336,7 +7358,7 @@ print(json.dumps({
                 connection.execute(
                     """
                     UPDATE reply_jobs
-                    SET status = 'scheduled', due_at = ?, reply = 'answer'
+                    SET status = 'scheduled', due_at = ?, reply = NULL
                     WHERE event_id = ?
                     """,
                     (time.time() - 1.0, event["event_id"]),
@@ -7378,6 +7400,85 @@ print(json.dumps({
                     ),
                     ("skipped", "stale_backlog", "policy"),
                 )
+            finally:
+                connection.close()
+
+    def test_formed_scheduled_reply_retries_after_human_window(self):
+        module = self._load_auto_reply_module("bujamentor_formed_reply_grace_test")
+        now = int(time.time())
+        event = self._burst_event(module, 446, "old scheduled", now - 61)
+        event["recent_messages"] = [self._recent_row(event)]
+        prepared = module._prepare_burst_event(event)
+        prepared["response_window_upper_seconds"] = 60.0
+        with tempfile.TemporaryDirectory() as temporary:
+            module.QUEUE = Path(temporary) / "reply-queue.sqlite3"
+            self.assertTrue(module.enqueue_event(prepared))
+            connection = self._worker_queue_connection(module)
+            try:
+                connection.execute(
+                    """
+                    UPDATE reply_jobs
+                    SET status = 'scheduled', due_at = ?, decision = 'reply',
+                        reason = 'social_continuation', category = 'social',
+                        reply = '아 그래도 아는 사람들이었네 ㅋㅋㅋ'
+                    WHERE event_id = ?
+                    """,
+                    (time.time() - 1.0, event["event_id"]),
+                )
+                connection.commit()
+                job, previous = module.claim_job(time.time(), connection)
+                with (
+                    mock.patch.object(
+                        module,
+                        "db_authoritative_event_allowed",
+                        return_value=True,
+                    ),
+                    mock.patch.object(
+                        module,
+                        "privacy_attestation_current",
+                        return_value=True,
+                    ),
+                    mock.patch.object(
+                        module,
+                        "numeric_author_identity_status",
+                        return_value="allowed",
+                    ),
+                    mock.patch.object(
+                        module,
+                        "conversation_advanced_past_event",
+                        return_value=False,
+                    ),
+                    mock.patch.object(
+                        module,
+                        "pre_ax_delivery_probe",
+                        return_value={
+                            "result": "ready",
+                            "retryable": False,
+                            "token": ("owner",),
+                        },
+                    ),
+                    mock.patch.object(module, "send_reply", return_value=False) as sender,
+                    mock.patch.object(
+                        module,
+                        "reply_job_delivery_phase",
+                        return_value="processing",
+                    ),
+                    mock.patch.object(module, "complete_event") as complete,
+                ):
+                    module.process_job(job, previous, connection)
+                sender.assert_called_once()
+                complete.assert_not_called()
+                row = connection.execute(
+                    """
+                    SELECT status, reason, error_class, reply
+                    FROM reply_jobs WHERE event_id = ?
+                    """,
+                    (event["event_id"],),
+                ).fetchone()
+                self.assertEqual(row["status"], "scheduled")
+                self.assertEqual(row["error_class"], "pre_send_unavailable")
+                self.assertEqual(row["reply"], "아 그래도 아는 사람들이었네 ㅋㅋㅋ")
+                self.assertNotEqual(row["reason"], "stale_backlog")
             finally:
                 connection.close()
 
@@ -11086,6 +11187,44 @@ print(json.dumps({"stdin_eof": value == b""}), flush=True)
         finally:
             db_watch.save_state = original_save_state
 
+    def test_heartbeat_save_skips_generation_lock(self):
+        spec = importlib.util.spec_from_file_location(
+            "bujamentor_db_heartbeat_save_test",
+            SCRIPTS / "bujamentor-db-watch.py",
+        )
+        db_watch = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        spec.loader.exec_module(db_watch)
+        calls = []
+        original = db_watch._generation_lock
+
+        @contextmanager
+        def boom():
+            calls.append("generation")
+            raise AssertionError("heartbeat save must not take the generation lock")
+            yield
+
+        db_watch._generation_lock = boom
+        db_watch.STATE = Path(tempfile.mkdtemp()) / "db-watch-state.json"
+        db_watch.STATE.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            self.assertTrue(
+                db_watch.save_state(
+                    {
+                        "target_chat_id": 42,
+                        "owner_id": "",
+                        "source_epoch": 0,
+                        "capability_state": "ready",
+                        "delivery_enabled": True,
+                    },
+                    _require_ready=False,
+                )
+            )
+            self.assertEqual(calls, [])
+            self.assertTrue(db_watch.STATE.is_file())
+        finally:
+            db_watch._generation_lock = original
+
     def test_proactive_topic_uses_vector_tokens_and_skips_when_conversation_advanced(self):
         os.environ["OPENKAKAO_TARGET_CHAT_ID"] = "42"
         module = self._load_auto_reply_module("bujamentor_proactive_topic_test")
@@ -11176,10 +11315,54 @@ print(json.dumps({"stdin_eof": value == b""}), flush=True)
         self.assertEqual(queued[0]["proactive_query"], "geeknews-rss")
         self.assertNotEqual(queued[0]["event_id"], "db:42:99")
         self.assertTrue(str(queued[0]["event_id"]).startswith("db:42:"))
+        self.assertEqual(queued[0]["log_id"], 99)
+        self.assertEqual(queued[0]["burst_tail_log_id"], 99)
+        self.assertNotEqual(queued[0]["event_id"], f"db:42:{queued[0]['log_id']}")
         self.assertEqual(queued[0]["author_id"], 7)
         self.assertEqual(queued[0]["author_nickname"], "문승현")
         self.assertEqual(queued[0]["urls"], ["https://example.test/tax"])
         self.assertEqual(queued[0]["proactive_source_log_id"], 99)
+        self.assertTrue(module.canonical_db_event(queued[0]))
+        recent_room = dict(source)
+        recent_room["room_last_sent_at"] = int(now) - 10
+        recent_room["inbound_silence_at"] = int(now) - 10_000
+        too_recent_room = module.maybe_enqueue_proactive_topic(
+            connection,
+            now=now,
+            response_time=stats,
+            style_profile=style,
+            last_observed_sent_at=int(now) - 10,
+            conversation_advanced=False,
+            source_event=recent_room,
+            enqueue=enqueue,
+            search=search,
+        )
+        self.assertIsNone(too_recent_room)
+        tail_events = []
+        tail_source = dict(source)
+        tail_source["room_last_sent_at"] = int(now) - 10_000
+        tail_source["room_tail_log_id"] = 120
+        tail_connection = sqlite3.connect(":memory:")
+        tail_connection.execute(
+            "CREATE TABLE reply_jobs(event_id TEXT, event_json TEXT, status TEXT)"
+        )
+        tail_queued = module.maybe_enqueue_proactive_topic(
+            tail_connection,
+            now=now,
+            response_time=stats,
+            style_profile=style,
+            last_observed_sent_at=int(now) - 10_000,
+            conversation_advanced=False,
+            source_event=tail_source,
+            enqueue=lambda event: tail_events.append(event) or True,
+            search=search,
+        )
+        self.assertIsNotNone(tail_queued)
+        self.assertEqual(tail_events[0]["log_id"], 120)
+        self.assertEqual(tail_events[0]["burst_tail_log_id"], 120)
+        self.assertEqual(tail_events[0]["proactive_source_log_id"], 99)
+        self.assertEqual(tail_events[0]["author_nickname"], "문승현")
+        self.assertNotEqual(tail_events[0]["event_id"], "db:42:120")
         connection.execute(
             "INSERT INTO reply_jobs VALUES (?, ?, ?)",
             (queued[0]["event_id"], json.dumps(queued[0], ensure_ascii=False), "pending"),
@@ -11241,6 +11424,7 @@ print(json.dumps({"stdin_eof": value == b""}), flush=True)
         self.assertEqual(source["event_id"], "db:42:99")
         self.assertEqual(source["author_nickname"], "문승현")
         self.assertEqual(source["room_last_sent_at"], 200)
+        self.assertEqual(source["room_tail_log_id"], 120)
 
     def test_silence_source_falls_back_to_context_authorized_inbound(self):
         module = self._load_auto_reply_module("bujamentor_silence_context_fallback_test")
@@ -11292,6 +11476,7 @@ print(json.dumps({"stdin_eof": value == b""}), flush=True)
         self.assertEqual(source["event_id"], "db:42:99")
         self.assertEqual(source["author_nickname"], "문승현")
         self.assertEqual(source["room_last_sent_at"], 200)
+        self.assertEqual(source["room_tail_log_id"], 120)
 
     def test_empty_tail_uses_context_inbound_as_silence_not_advanced(self):
         module = self._load_auto_reply_module("bujamentor_empty_tail_silence_test")
@@ -11324,7 +11509,30 @@ print(json.dumps({"stdin_eof": value == b""}), flush=True)
         self.assertEqual(source["event_id"], "db:42:99")
         self.assertEqual(source["inbound_silence_at"], 100)
 
+    def test_geeknews_daily_slots_block_repeat_posts(self):
+        module = self._load_auto_reply_module("bujamentor_geeknews_slots_test")
+        with tempfile.TemporaryDirectory() as temporary:
+            module.QUEUE = Path(temporary) / "reply-queue.sqlite3"
+            morning = datetime(2026, 8, 16, 8, 40, tzinfo=module.GEEKNEWS_SLOT_TZ)
+            evening = datetime(2026, 8, 16, 19, 50, tzinfo=module.GEEKNEWS_SLOT_TZ)
+            start, end = module._geeknews_slot_window(morning.date(), "morning", 8, 40, 20)
+            inside = start + 60
+            before = start - 60
+            self.assertIsNone(module._geeknews_slot_at(before))
+            self.assertEqual(module._geeknews_slot_at(inside), ("2026-08-16", "morning"))
+            self.assertTrue(module._geeknews_slot_open(inside))
+            module._store_geeknews_seen_ids({10}, 10, now=inside)
+            self.assertTrue(module._geeknews_slot_open(inside + 60))
+            module._store_geeknews_seen_ids({10}, 10, now=inside, mark_posted_slot=True)
+            self.assertFalse(module._geeknews_slot_open(inside + 60))
+            lunch_start, _ = module._geeknews_slot_window(morning.date(), "lunch", 12, 35, 15)
+            self.assertTrue(module._geeknews_slot_open(lunch_start + 10))
+            self.assertEqual(module.GEEKNEWS_ROOM_QUIET_SECONDS, 600)
+            self.assertEqual(len(module.GEEKNEWS_DAILY_SLOTS), 3)
+            _ = evening
+
     def test_geeknews_digest_posts_unseen_feed_items_once(self):
+
         module = self._load_auto_reply_module("bujamentor_geeknews_digest_test")
         with tempfile.TemporaryDirectory() as temporary:
             module.QUEUE = Path(temporary) / "reply-queue.sqlite3"
@@ -11342,13 +11550,68 @@ print(json.dumps({"stdin_eof": value == b""}), flush=True)
               </entry>
             </feed>
             """
-            first = module._next_geeknews_digest(fetcher=lambda: feed)
-            second = module._next_geeknews_digest(fetcher=lambda: feed)
+            noon = datetime(2026, 8, 17, 16, 20, tzinfo=module.GEEKNEWS_SLOT_TZ).timestamp()
+            first = module._next_geeknews_digest(fetcher=lambda: feed, now=noon)
+            second = module._next_geeknews_digest(fetcher=lambda: feed, now=noon)
         self.assertIsNotNone(first)
         self.assertEqual(first["ids"], [10, 11])
-        self.assertIn("새 글 A", first["message"])
-        self.assertIn("https://news.hada.io/topic?id=10", first["message"])
+        self.assertEqual(
+            first["message"],
+            "GeekNews TOP5 · 2026-08-17 16:20 KST\n\n1. 새 글 A https://news.hada.io/topic?id=10\n2. 새 글 B https://news.hada.io/topic?id=11",
+        )
+        self.assertEqual(first["message"].splitlines(keepends=False), [
+            "GeekNews TOP5 · 2026-08-17 16:20 KST",
+            "",
+            "1. 새 글 A https://news.hada.io/topic?id=10",
+            "2. 새 글 B https://news.hada.io/topic?id=11",
+        ])
         self.assertIsNone(second)
+    def test_geeknews_enqueue_does_not_persist_seen_until_confirmed(self):
+        module = self._load_auto_reply_module("bujamentor_geeknews_confirm_seen")
+        with tempfile.TemporaryDirectory() as temporary:
+            module.QUEUE = Path(temporary) / "reply-queue.sqlite3"
+            feed = """
+            <feed>
+              <entry>
+                <title><![CDATA[새 글 A]]></title>
+                <link rel='alternate' href='https://news.hada.io/topic?id=10' />
+              </entry>
+            </feed>
+            """
+            first = module._next_geeknews_digest(fetcher=lambda: feed, persist_seen=False)
+            second = module._next_geeknews_digest(fetcher=lambda: feed, persist_seen=False)
+            self.assertEqual(first["ids"], [10])
+            self.assertEqual(second["ids"], [10])
+            event = {"proactive_ids": [10], "proactive_query": "geeknews-rss"}
+            module._mark_geeknews_digest_confirmed(event, now=1_700_000_000)
+            third = module._next_geeknews_digest(fetcher=lambda: feed, persist_seen=False)
+            self.assertIsNone(third)
+            cursor = module._load_geeknews_cursor()
+            self.assertIn("10", [str(item) for item in cursor.get("seen_ids") or []])
+    def test_geeknews_operator_preview_does_not_persist_seen(self):
+        module = self._load_auto_reply_module("bujamentor_geeknews_operator_preview")
+        with tempfile.TemporaryDirectory() as temporary:
+            module.QUEUE = Path(temporary) / "reply-queue.sqlite3"
+            feed = """
+            <feed>
+              <entry>
+                <title><![CDATA[새 글 A]]></title>
+                <link rel='alternate' href='https://news.hada.io/topic?id=10' />
+              </entry>
+            </feed>
+            """
+            first = module._next_geeknews_digest(
+                fetcher=lambda: feed, persist_seen=False
+            )
+            second = module._next_geeknews_digest(
+                fetcher=lambda: feed, persist_seen=False
+            )
+        self.assertIsNotNone(first)
+        self.assertEqual(first["ids"], [10])
+        self.assertIsNotNone(second)
+        self.assertEqual(second["ids"], [10])
+        self.assertTrue(first["message"].startswith("GeekNews TOP5 ·"))
+        self.assertIn("\n\n1. ", first["message"])
 
     def test_pre_send_usage_limit_unknown_heals_to_skip_without_retransmit(self):
         module = self._load_auto_reply_module("bujamentor_usage_limit_leftover_heal")
@@ -11418,6 +11681,281 @@ print(json.dumps({"stdin_eof": value == b""}), flush=True)
                 ).fetchone()
                 self.assertEqual(tuple(row), ("pending", None, None, None))
                 complete.assert_not_called()
+            finally:
+                queue.close()
+                if previous is None:
+                    os.environ.pop("OPENKAKAO_TARGET_CHAT_ID", None)
+                else:
+                    os.environ["OPENKAKAO_TARGET_CHAT_ID"] = previous
+
+    def test_formed_ordinary_unknown_reschedules_without_retransmit(self):
+        module = self._load_auto_reply_module("bujamentor_formed_ordinary_unknown_heal")
+        previous_owner = os.environ.get("OPENKAKAO_SUPERVISOR_OWNER")
+        previous_epoch = os.environ.get("OPENKAKAO_DB_SOURCE_EPOCH")
+        previous = os.environ.get("OPENKAKAO_TARGET_CHAT_ID")
+        os.environ["OPENKAKAO_TARGET_CHAT_ID"] = "42"
+        os.environ["OPENKAKAO_SUPERVISOR_OWNER"] = "live-owner-1"
+        os.environ["OPENKAKAO_DB_SOURCE_EPOCH"] = "1786970496860608000"
+        event = {
+            "chat_id": 42,
+            "log_id": 3909361223857141762,
+            "author_nickname": "현준",
+            "owner_id": "dead-owner",
+            "source_epoch": 1,
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            module.QUEUE = root / "42" / "reply-queue.sqlite3"
+            queue = self._worker_queue_connection(module)
+            try:
+                queue.execute(
+                    """
+                    INSERT INTO reply_jobs(
+                        event_id,event_json,status,due_at,decision,reason,category,
+                        reply,scheduled_delay_seconds,error_class,created_at,updated_at
+                    ) VALUES(
+                        'db:42:3909361223857141762', ?, 'delivery_unknown',
+                        NULL, 'reply', 'useful_information', 'social',
+                        '구름 미리 풀어보면서 감 잡으시면 되죠 ㅋㅋㅋ', 45.0,
+                        'reconcile_required', 1.0, 1.0
+                    )
+                    """,
+                    (json.dumps(event, ensure_ascii=False),),
+                )
+                queue.commit()
+                self.assertEqual(module._queue_reconciliation_blockers(queue), 0)
+                self.assertFalse(
+                    module.leftover_unknown_has_ax_mutation(
+                        queue, "db:42:3909361223857141762"
+                    )
+                )
+                with mock.patch.object(module, "complete_event") as complete:
+                    module.recover_stale_jobs(queue)
+                row = queue.execute(
+                    "SELECT status,decision,reason,reply,error_class,event_json "
+                    "FROM reply_jobs WHERE event_id='db:42:3909361223857141762'"
+                ).fetchone()
+                self.assertEqual(row[0], "scheduled")
+                self.assertEqual(row[1], "reply")
+                self.assertEqual(row[2], "useful_information")
+                self.assertEqual(row[3], "구름 미리 풀어보면서 감 잡으시면 되죠 ㅋㅋㅋ")
+                self.assertEqual(row[4], "pre_send_unavailable")
+                rebound = json.loads(row[5])
+                self.assertEqual(rebound["owner_id"], "live-owner-1")
+                self.assertEqual(rebound["source_epoch"], 1786970496860608000)
+                self.assertNotIn("candidate", rebound)
+                complete.assert_not_called()
+            finally:
+                queue.close()
+                if previous is None:
+                    os.environ.pop("OPENKAKAO_TARGET_CHAT_ID", None)
+                else:
+                    os.environ["OPENKAKAO_TARGET_CHAT_ID"] = previous
+                if previous_owner is None:
+                    os.environ.pop("OPENKAKAO_SUPERVISOR_OWNER", None)
+                else:
+                    os.environ["OPENKAKAO_SUPERVISOR_OWNER"] = previous_owner
+                if previous_epoch is None:
+                    os.environ.pop("OPENKAKAO_DB_SOURCE_EPOCH", None)
+                else:
+                    os.environ["OPENKAKAO_DB_SOURCE_EPOCH"] = previous_epoch
+
+    def test_empty_stale_backlog_unknown_skips_without_blocking(self):
+        module = self._load_auto_reply_module("bujamentor_empty_stale_unknown_heal")
+        previous = os.environ.get("OPENKAKAO_TARGET_CHAT_ID")
+        os.environ["OPENKAKAO_TARGET_CHAT_ID"] = "42"
+        event = {"chat_id": 42, "log_id": 11, "author_nickname": "현준"}
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            module.QUEUE = root / "42" / "reply-queue.sqlite3"
+            queue = self._worker_queue_connection(module)
+            try:
+                queue.execute(
+                    """
+                    INSERT INTO reply_jobs(
+                        event_id,event_json,status,due_at,decision,reason,category,
+                        reply,scheduled_delay_seconds,error_class,created_at,updated_at
+                    ) VALUES(
+                        'db:42:11', ?, 'delivery_unknown',
+                        NULL, 'skip', 'stale_backlog', 'policy', NULL, NULL,
+                        'reconcile_required', 1.0, 1.0
+                    )
+                    """,
+                    (json.dumps(event, ensure_ascii=False),),
+                )
+                queue.commit()
+                self.assertEqual(module._queue_reconciliation_blockers(queue), 0)
+                with mock.patch.object(module, "complete_event") as complete:
+                    module.recover_stale_jobs(queue)
+                row = queue.execute(
+                    "SELECT status,decision,reason,reply FROM reply_jobs WHERE event_id='db:42:11'"
+                ).fetchone()
+                self.assertEqual(tuple(row), ("skipped", "skip", "stale_backlog", None))
+                complete.assert_called_once_with("db:42:11", "")
+            finally:
+                queue.close()
+                if previous is None:
+                    os.environ.pop("OPENKAKAO_TARGET_CHAT_ID", None)
+                else:
+                    os.environ["OPENKAKAO_TARGET_CHAT_ID"] = previous
+
+    def test_proactive_unix_unknown_heals_to_stale_backlog_without_retransmit(self):
+        module = self._load_auto_reply_module("bujamentor_proactive_unix_leftover_heal")
+        previous = os.environ.get("OPENKAKAO_TARGET_CHAT_ID")
+        os.environ["OPENKAKAO_TARGET_CHAT_ID"] = "42"
+        event = {
+            "chat_id": 42,
+            "log_id": 1786898326,
+            "proactive": True,
+            "author_nickname": "현준",
+            "proactive_source_log_id": 3908727927221581825,
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            module.QUEUE = root / "42" / "reply-queue.sqlite3"
+            queue = self._worker_queue_connection(module)
+            try:
+                queue.execute(
+                    """
+                    INSERT INTO reply_jobs(
+                        event_id,event_json,status,due_at,decision,reason,category,
+                        reply,scheduled_delay_seconds,error_class,created_at,updated_at
+                    ) VALUES(
+                        'db:42:1786898326', ?, 'delivery_unknown',
+                        NULL, NULL, NULL, NULL, NULL, NULL,
+                        'reconcile_required', 1.0, 1.0
+                    )
+                    """,
+                    (json.dumps(event, ensure_ascii=False),),
+                )
+                queue.commit()
+                self.assertEqual(module._queue_reconciliation_blockers(queue), 0)
+                self.assertFalse(
+                    module.leftover_unknown_has_ax_mutation(queue, "db:42:1786898326")
+                )
+                with mock.patch.object(module, "complete_event") as complete:
+                    module.recover_stale_jobs(queue)
+                row = queue.execute(
+                    "SELECT status,decision,reason,reply FROM reply_jobs "
+                    "WHERE event_id='db:42:1786898326'"
+                ).fetchone()
+                self.assertEqual(tuple(row), ("skipped", "skip", "stale_backlog", None))
+                complete.assert_called_once_with("db:42:1786898326", "")
+            finally:
+                queue.close()
+                if previous is None:
+                    os.environ.pop("OPENKAKAO_TARGET_CHAT_ID", None)
+                else:
+                    os.environ["OPENKAKAO_TARGET_CHAT_ID"] = previous
+
+    def test_proactive_real_tail_unknown_heals_to_stale_backlog_without_retransmit(self):
+        module = self._load_auto_reply_module("bujamentor_proactive_real_tail_leftover")
+        previous = os.environ.get("OPENKAKAO_TARGET_CHAT_ID")
+        os.environ["OPENKAKAO_TARGET_CHAT_ID"] = "42"
+        event = {
+            "chat_id": 42,
+            "log_id": 3908825674271338497,
+            "burst_tail_log_id": 3908825674271338497,
+            "proactive": True,
+            "author_nickname": "현준",
+            "proactive_source_log_id": 3908727927221581825,
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            module.QUEUE = root / "42" / "reply-queue.sqlite3"
+            queue = self._worker_queue_connection(module)
+            try:
+                queue.execute(
+                    """
+                    INSERT INTO reply_jobs(
+                        event_id,event_json,status,due_at,decision,reason,category,
+                        reply,scheduled_delay_seconds,error_class,created_at,updated_at
+                    ) VALUES(
+                        'db:42:1786905792', ?, 'delivery_unknown',
+                        NULL, NULL, NULL, NULL, NULL, NULL,
+                        'reconcile_required', 1.0, 1.0
+                    )
+                    """,
+                    (json.dumps(event, ensure_ascii=False),),
+                )
+                queue.commit()
+                self.assertEqual(module._queue_reconciliation_blockers(queue), 0)
+                with mock.patch.object(module, "complete_event") as complete:
+                    module.recover_stale_jobs(queue)
+                row = queue.execute(
+                    "SELECT status,decision,reason,reply FROM reply_jobs "
+                    "WHERE event_id='db:42:1786905792'"
+                ).fetchone()
+                self.assertEqual(tuple(row), ("skipped", "skip", "stale_backlog", None))
+                complete.assert_called_once_with("db:42:1786905792", "")
+            finally:
+                queue.close()
+                if previous is None:
+                    os.environ.pop("OPENKAKAO_TARGET_CHAT_ID", None)
+                else:
+                    os.environ["OPENKAKAO_TARGET_CHAT_ID"] = previous
+
+    def test_proactive_process_job_defines_analysis_event(self):
+        module = self._load_auto_reply_module("bujamentor_proactive_analysis_event")
+        previous = os.environ.get("OPENKAKAO_TARGET_CHAT_ID")
+        os.environ["OPENKAKAO_TARGET_CHAT_ID"] = "42"
+        event = self._burst_event(module, 120, "세금 일정 업데이트\nhttps://example.test/tax", 5_100)
+        event["event_id"] = "db:42:1786898326"
+        event["canonical_event_id"] = "db:42:1786898326"
+        event["proactive"] = True
+        event["proactive_source_log_id"] = 99
+        event["author_nickname"] = "문승현"
+        event["author_id"] = 7
+        job = {
+            "event_id": event["event_id"],
+            "event_json": json.dumps(event, ensure_ascii=False),
+            "reply": None,
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            module.QUEUE = root / "42" / "reply-queue.sqlite3"
+            queue = self._worker_queue_connection(module)
+            try:
+                queue.execute(
+                    """
+                    INSERT INTO reply_jobs(
+                        event_id,event_json,status,due_at,decision,reason,category,
+                        reply,scheduled_delay_seconds,error_class,created_at,updated_at
+                    ) VALUES(
+                        ?, ?, 'processing', NULL, NULL, NULL, NULL, NULL,
+                        NULL, NULL, 1.0, 1.0
+                    )
+                    """,
+                    (event["event_id"], job["event_json"]),
+                )
+                queue.commit()
+                with (
+                    mock.patch.object(module, "db_authoritative_event_allowed", return_value=True),
+                    mock.patch.object(module, "privacy_attestation_current", return_value=True),
+                    mock.patch.object(module, "numeric_author_identity_status", return_value="allowed"),
+                    mock.patch.object(
+                        module,
+                        "sample_response_delay_for_analysis",
+                        return_value={
+                            "delay_seconds": 12.0,
+                            "response_window_upper_seconds": 180.0,
+                        },
+                    ),
+                    mock.patch.object(module, "response_due_at", return_value=time.time() + 12.0),
+                    mock.patch.object(module, "record_context_decision", return_value=True),
+                    mock.patch.object(module, "analyze_event") as analyze,
+                ):
+                    module.process_job(job, "pending", queue)
+                analyze.assert_not_called()
+                row = queue.execute(
+                    "SELECT status,decision,reason,category,reply FROM reply_jobs WHERE event_id=?",
+                    (event["event_id"],),
+                ).fetchone()
+                self.assertEqual(row["status"], "scheduled")
+                self.assertEqual(row["decision"], "reply")
+                self.assertEqual(row["reason"], "geeknews_rss")
+                self.assertEqual(row["category"], "proactive")
+                self.assertIn("세금 일정 업데이트", row["reply"])
             finally:
                 queue.close()
                 if previous is None:

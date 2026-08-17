@@ -601,6 +601,64 @@ class TransitionJournalTests(unittest.TestCase):
             self.assertEqual(tail, ("recovery", "idle", "reconciled"))
             self.assertEqual(state["acked_watermark"], 9)
 
+    def test_room_binding_allows_proactive_unique_event_id(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = self.private_root(temporary)
+            room = root / "42"
+            room.mkdir(mode=0o700)
+            connection = journal.open_queue(
+                room / "reply-queue.sqlite3", create=True, expected_chat_id=42
+            )
+            try:
+                connection.execute(
+                    "INSERT INTO reply_jobs("
+                    "event_id,event_json,status,due_at,decision,reason,category,"
+                    "reply,scheduled_delay_seconds,error_class,created_at,updated_at"
+                    ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        "db:42:1786898326",
+                        '{"event_id":"db:42:1786898326",'
+                        '"canonical_event_id":"db:42:1786898326",'
+                        '"chat_id":42,"log_id":3908781794201088001,'
+                        '"proactive":true,"proactive_source_log_id":99}',
+                        "pending",
+                        0.0,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        1.0,
+                        1.0,
+                    ),
+                )
+                connection.commit()
+                journal.validate_queue_room_binding(connection, 42)
+                connection.execute(
+                    "UPDATE reply_jobs SET event_json=? WHERE event_id='db:42:1786898326'",
+                    (
+                        '{"event_id":"db:42:1786898326",'
+                        '"canonical_event_id":"db:42:1786898326",'
+                        '"chat_id":42,"log_id":1786898326,"proactive":true}',
+                    ),
+                )
+                connection.commit()
+                journal.validate_queue_room_binding(connection, 42)
+                connection.execute(
+                    "UPDATE reply_jobs SET event_json=? WHERE event_id='db:42:1786898326'",
+                    (
+                        '{"event_id":"db:42:1786898326",'
+                        '"canonical_event_id":"db:42:1786898326",'
+                        '"chat_id":42,"log_id":99}',
+                    ),
+                )
+                connection.commit()
+                with self.assertRaises(sqlite3.DatabaseError):
+                    journal.validate_queue_room_binding(connection, 42)
+            finally:
+                connection.close()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,6 +1,9 @@
 #!/bin/sh
 set -eu
 
+# NON-CURRENT. Do not use this installer as the reply-owner layout.
+# Current persistence is session-monitor + Terminal + immutable bake.
+# See docs/bujamentor-launchd-supervision.md.
 LABEL="com.openkakao.bujamentor.autoreply"
 MODE=""
 BIN=""

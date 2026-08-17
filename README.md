@@ -93,6 +93,7 @@ openkakao-cli ax-watch --hook-cmd 'my-script.sh'
 ### 채팅방별 오프라인 맥락 인덱스
 
 CSV 내보내기 파일을 채팅방 이름과 원본 경로로 격리해 로컬 SQLite FTS5 키워드 인덱스와 결정적 로컬 벡터 인덱스를 함께 만듭니다. 대화 내용은 네트워크로 전송하지 않습니다. 벡터 모드는 외부 모델이 아닌 결정적 lexical hash vector이므로 의미 임베딩이 필요한 경우가 아니라 안전한 로컬 검색 보조로 사용합니다.
+이 인덱스와 스타일/답변 검색은 **최연우/Bujamentor 페르소나 전용 보조 근거**입니다. 공개 CLI의 일반 기능이 아니고, 의미 임베딩이나 외부 벡터 DB가 아닙니다.
 
 ```bash
 openkakao-cli context-index \
@@ -125,6 +126,44 @@ openkakao-cli context-reply-search "지난번 세금 일정" \
 `context-response-time`은 평균·중앙값·p90·표준편차와 함께 버전이 지정된 응답시간 혼합분포를 보관합니다. 응답 표본의 `log1p` 간격을 세 군집으로 나누고, 즉답형·단기형·지연형 중 하나를 실제 표본 비율로 선택한 뒤 해당 구간 안에서 bounded Gaussian을 뽑습니다. 상한은 방별 경험적 p90이며, 선택한 성분·분포 버전·예약 시각은 한 번만 내구 저장되어 재시작 때 다시 추첨하지 않습니다. 지연 중 대화가 다음 메시지로 진행되면 오래된 일반 메시지를 보내지 않고 구조화된 `conversation_advanced` 보류로 종결합니다. 따라서 하나의 고정 평균이나 평균 중심의 단일 정규분포로 답하지 않습니다. `reply_decisions` 벡터 테이블에는 답변/보류 결정·근거·분류·유사도·예약/전송 상태를 구조화해 기록하고, 유사하게 보류했던 메시지와 이미 처리한 메시지에 중복 답변하지 않도록 사용합니다.
 `context-style-search`는 최연우의 일반 대화 말투만 별도 벡터 테이블에 보관합니다. 링크·숫자·목록·다중 행·긴 정보 전달문·복사/요약 표식이 있는 메시지는 맥락 검색에는 남기되 말투 학습에서는 제외합니다. 자동 답변에서는 수신자와 바로 이어진 최연우 답변을 별도로 집계해 수신자별 존댓말/반말·길이·종결·구두점 프로필을 우선 사용하고, 직접 표본이 3개 미만이거나 신뢰도 합이 2 미만이면 방 전체 프로필로 명시적으로 fallback합니다.
 포그라운드/Terminal-hosted 세션 자동 답변이 시작되면 로컬 KakaoTalk DB 전체를 최초 1회 backfill한 뒤 60초마다 증분 동기화합니다. 계정 fingerprint·채팅방 ID·checkpoint에 묶인 source가 끝까지 완전하게 처리된 경우에만 authoritative로 승격하며, 동기화가 누락·시간 초과·불일치하면 오래된 인덱스로 계속 답하지 않고 delivery를 fenced합니다. 확정된 자동 생성 자기 메시지는 학습 표본에서 제외됩니다. 이 맥락 검색·결정 기록은 로컬에서 처리되지만, Codex 답변 생성에는 아래의 명시적인 원격 egress 설정이 적용됩니다.
+### 경로 상태 (keep-and-quarantine)
+
+| 경로 | 상태 | 역할 |
+|---|---|---|
+| Local SQLCipher (`local-chats` / `local-read` / `local-search`) | **지원 읽기 / 신원** | `chat_id`, `author_id`, watermark. 키/계정 불일치면 fail-closed. |
+| AX (`local-send` / `ax-read` / `ax-watch`) | **지원 쓰기 + 화면 읽기** | 문서화된 전송은 `local-send` (`allow_ax_send` + 화이트리스트). 실시간 watch는 `ax-watch`. |
+| REST (`me` / `friends` / `chats --rest` / `doctor` / 보이는 `chatinfo`) | **지원 저위험 계정** | 전송 없음. |
+| LOCO gated writes (`send`, `send-me`, `send-photo`, `send-file`, `delete`, `edit`, `react`) | **연구 격리** | `allow_loco_write` + dry-run. 제품 전송 경로가 아니다. |
+| LOCO `mark-read` | **연구 격리** | `allow_loco_write` + `--dry-run`. 게이트 전에는 NOTIREAD를 보내지 않는다. |
+| LOCO `watch` | **연구 격리** | 지원 실시간 watch는 `ax-watch`. |
+| LOCO `chats` / `read` / `members` / `probe` | **연구 가능, 비문서** | 문서화된 제품 읽기가 아니다. |
+| Hidden `loco-*` / `loco-chatinfo` | **연구 격리 별칭** | 숨김/deprecated. |
+
+Bujamentor 무인 호스트는 공개 CLI 안이 아니다. 현재 레이아웃은 LaunchAgent `com.openkakao.bujamentor.session-monitor` → Terminal → immutable bake → `auto-reply` 다. watch/health LaunchAgent는 답장 오너가 아니다.
+`local-delete`는 이미 열린 창의 보이는 메시지를 AX 컨텍스트 메뉴 `모두에게서 삭제`로 지운다. LOCO `delete`가 아니다.
+
+#### Bujamentor session-monitor
+
+무인 자동답의 현재 레이아웃만 쓴다. `scripts/install-bujamentor-auto-reply-service.sh`와 watch/health LaunchAgent는 답장 오너가 아니다.
+
+- LaunchAgent `com.openkakao.bujamentor.session-monitor`는 Kakao-blind다. 해시로 고정된 `.command`만 Terminal에서 연다.
+- 돌아가는 watchdog 창만 최소화한다. 끝난 `.command` 창(`busy=false`)은 닫는다. 사용자가 쓰던 Terminal은 숨기지 않는다.
+- 런타임은 immutable bake다. 이미 구운 디렉터리를 고치지 말고 새로 구운 뒤 LaunchAgent를 바꾼다.
+- 문서화된 전송은 AX `local-send`다. leftover unix / `delivery_unknown`+AX 흔적은 재전송하지 않는다.
+
+#### GeekNews
+
+공식 Atom `https://news.hada.io/rss/news`에서 아직 안 보낸 글을 하루 최대 3번 올린다. 슬롯은 넓은 시간대가 아니라 KST 앵커+그날 결정적 지터다.
+
+| 회차 | 앵커 | 지터 | 창 |
+|---|---|---|---|
+| morning | 08:40 | ±20분 | 앵커 후 30분 |
+| lunch | 12:35 | ±15분 | 30분 |
+| evening | 19:50 | ±25분 | 30분 |
+
+방 마지막 말 이후 10분 조용해야 한다. 포맷은 `GeekNews TOP5 · {시각}` 다음 빈 줄, 그다음 `1.`–`5.`다. `posted_slots`와 seen ID는 **로컬 확인된 전송 후에만** 찍는다.
+
+
 ### 서버 로그인 기반 (현재 대부분 깨짐)
 
 ```bash
@@ -342,9 +381,10 @@ Luna 호출 상태의 단일 권한은 Bujamentor state root의 private mode-`06
 | `read <id> --rest` | REST API 메시지 읽기 | REST |
 | `send ... --dry-run` | 전송 미리보기 | 없음 |
 | `local-send ... --dry-run` | AX 전송 미리보기 | 없음 |
+| `local-delete ... --dry-run` | AX 삭제 미리보기 (`모두에게서 삭제`) | 없음 |
 
 > [!NOTE]
-> `local-send`/`ax-read`/`ax-watch`는 macOS Accessibility API로 카카오톡의 **메인 채팅 목록 창**을 찾아야 동작합니다. 이 창이 **최소화**돼 있거나 현재 보고 있는 것과 **다른 macOS Space(가상 데스크탑)**에 있으면 찾지 못합니다(포커스를 뺏지 않고는 자동 복구가 불가능해서, 명확한 에러만 내고 직접 복원을 요청합니다). 계속 겪는다면 Dock의 카카오톡 아이콘 우클릭 → Options → Assign To → All Desktops로 한 번만 설정해두세요.
+> `local-send`/`ax-read`/`ax-watch`는 카카오톡 **메인 채팅 목록 창**이 이미 열려 있어야 한다. **최소화**되거나 창이 없으면 포커스를 뺏지 않으므로 자동 복구하지 않는다. Dock → Options → Assign To → **All Desktops**면 다른 Space에서도 보통 동작한다. 같은 Space에서 다른 앱에 가려진 것만으로는 보통 막히지 않는다. 행 선택 `Ax(-25201)`은 포커스 없이 짧게 재시도한다.
 
 ## 요구 사항
 

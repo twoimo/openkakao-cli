@@ -56,13 +56,34 @@ const BOUND_TRANSCRIPT_MIN_SUFFIX: usize = 3;
 const BOUND_TRANSCRIPT_MIN_DISTINCT: usize = 2;
 const BOUND_TRANSCRIPT_MIN_UTF8_BYTES: usize = 24;
 const BOUND_TRANSCRIPT_MIN_TRUNCATED_PREFIX_UTF8_BYTES: usize = 256;
+const AX_DELETED_MESSAGE_TOKEN: &str = "메시지가 삭제되었습니다.";
 
 /// Normalize an AX or already-canonical transcript value before comparing it.
 /// Local database rows must go through `normalize_local_binding_message` so
 /// media is classified from its numeric message type and validated attachment,
 /// never guessed from user-controlled text.
 pub(crate) fn normalize_binding_message(value: &str) -> String {
-    value.trim().to_string()
+    let trimmed = value.trim();
+    if trimmed == AX_DELETED_MESSAGE_TOKEN {
+        return String::new();
+    }
+    trimmed.to_string()
+}
+
+fn deleted_control_log_id(message: &crate::local_db::LocalMessage) -> Option<i64> {
+    let parsed: serde_json::Value = serde_json::from_str(&message.message).ok()?;
+    if parsed.get("hidden").and_then(serde_json::Value::as_bool) != Some(true) {
+        return None;
+    }
+    parsed.get("logId").and_then(serde_json::Value::as_i64)
+}
+
+fn is_local_deleted_control_message(message: &crate::local_db::LocalMessage) -> bool {
+    message.message.trim() == AX_DELETED_MESSAGE_TOKEN || deleted_control_log_id(message).is_some()
+}
+
+fn hidden_local_log_ids(messages: &[crate::local_db::LocalMessage]) -> std::collections::BTreeSet<i64> {
+    messages.iter().filter_map(deleted_control_log_id).collect()
 }
 
 /// Produce the exact AX transcript token for one authoritative local row.
@@ -102,8 +123,37 @@ pub(crate) fn normalize_local_binding_message(
             }
             Ok("[사진]".to_string())
         }
+        71 => normalize_local_sharp_search_binding(&message.attachment),
         _ => Ok(normalize_binding_message(&message.message)),
     }
+}
+
+/// KakaoTalk AX exposes a type-71 sharp-search card as the last rendered
+/// headline, often with a trailing ellipsis. Bind against that headline, not
+/// the local `샵검색: #tag` body, or a later two-token tail cannot attest.
+fn normalize_local_sharp_search_binding(attachment: &str) -> anyhow::Result<String> {
+    let parsed: serde_json::Value = serde_json::from_str(attachment).map_err(|error| {
+        anyhow::anyhow!("local sharp-search attachment is invalid for transcript binding: {error}")
+    })?;
+    let items = parsed
+        .get("C")
+        .and_then(|value| value.get("ITL"))
+        .and_then(serde_json::Value::as_array)
+        .filter(|items| !items.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!("local sharp-search attachment has no card headlines for transcript binding")
+        })?;
+    let headline = items
+        .last()
+        .and_then(|item| item.get("TD"))
+        .and_then(|value| value.get("T"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!("local sharp-search attachment is missing the last card headline")
+        })?;
+    Ok(normalize_binding_message(headline))
 }
 
 /// Normalize a chronological local transcript without ever matching across an
@@ -121,12 +171,15 @@ pub(crate) fn normalize_local_binding_message(
 pub(crate) fn normalize_local_binding_suffix(
     messages: &[crate::local_db::LocalMessage],
 ) -> Vec<(i64, String)> {
+    let hidden_ids = hidden_local_log_ids(messages);
     let mut suffix = Vec::new();
     for message in messages {
-        // Edit/control records are stored in NTChatMessage but are not
-        // independent rendered transcript rows. They must neither become
-        // attestation tokens nor break an otherwise strong room suffix.
-        if !crate::local_db::is_local_conversation_message_type(message.message_type) {
+        // Edit/control records and AX-deleted leftovers are not rendered
+        // transcript rows. Tombstoned log IDs must not remain in the suffix.
+        if !crate::local_db::is_local_conversation_message_type(message.message_type)
+            || is_local_deleted_control_message(message)
+            || hidden_ids.contains(&message.log_id)
+        {
             continue;
         }
         match normalize_local_binding_message(message) {
@@ -153,27 +206,48 @@ impl TranscriptSuffixMatch {
     }
 }
 
-fn transcript_endpoint_matches(ax: &str, local: &str) -> bool {
-    if ax == local {
-        return true;
-    }
-    let Some(prefix) = ax
+fn truncated_prefix(value: &str) -> Option<&str> {
+    value
         .strip_suffix('…')
-        .or_else(|| ax.strip_suffix("..."))
+        .or_else(|| value.strip_suffix("..."))
         .map(str::trim_end)
-    else {
+        .filter(|prefix| !prefix.is_empty())
+}
+
+fn transcript_truncated_prefix_matches(ax: &str, local: &str, min_prefix_bytes: usize) -> bool {
+    let Some(prefix) = truncated_prefix(ax) else {
         return false;
     };
-    prefix.len() >= BOUND_TRANSCRIPT_MIN_TRUNCATED_PREFIX_UTF8_BYTES
+    prefix.len() >= min_prefix_bytes
         && local.len() > prefix.len()
         && local.starts_with(prefix)
 }
 
-/// Compare two chronological, already-normalized transcript tails. Only the
-/// latest endpoint may use KakaoTalk's bounded long-message truncation form;
-/// every preceding row in the matching suffix must remain exact. A matching
-/// run earlier in either transcript must not bind an AX title to a numeric
-/// local chat ID.
+fn transcript_endpoint_matches(ax: &str, local: &str) -> bool {
+    ax == local
+        || transcript_truncated_prefix_matches(
+            ax,
+            local,
+            BOUND_TRANSCRIPT_MIN_TRUNCATED_PREFIX_UTF8_BYTES,
+        )
+}
+
+fn transcript_row_matches(ax: &str, local: &str) -> bool {
+    if ax == local {
+        return true;
+    }
+    // Interior rows stay exact except type-71 card headlines, which AX shortens
+    // with an ellipsis well below the long-message truncation floor.
+    transcript_truncated_prefix_matches(ax, local, 1)
+        && local.contains('…')
+        && ax.chars().count() >= 8
+}
+
+/// Compare two chronological, already-normalized transcript tails. The latest
+/// endpoint may use KakaoTalk's bounded long-message truncation form. Earlier
+/// rows must be exact, except type-71 card headlines which AX also shortens
+/// with an ellipsis. A matching run earlier in either transcript must not bind
+/// an AX title to a numeric local chat ID.
 pub(crate) fn match_transcript_suffix(
     ax_texts: &[String],
     local_texts: &[String],
@@ -181,7 +255,9 @@ pub(crate) fn match_transcript_suffix(
     let mut endpoints = ax_texts.iter().rev().zip(local_texts.iter().rev());
     let matched_count = match endpoints.next() {
         Some((ax, local)) if transcript_endpoint_matches(ax, local) => {
-            1 + endpoints.take_while(|(ax, local)| ax == local).count()
+            1 + endpoints
+                .take_while(|(ax, local)| transcript_row_matches(ax, local))
+                .count()
         }
         _ => 0,
     };
@@ -212,8 +288,10 @@ fn extend_unique<T: PartialEq>(target: &mut Vec<T>, candidates: impl IntoIterato
 
 /// Drive one composer submission through a fail-closed, single-Return state
 /// machine.  The callbacks keep the policy testable without a live AX session:
-/// an unreadable or non-empty composer is never focused or mutated, every
-/// successful write is re-read exactly, and a Return is never retried.
+/// an unreadable composer is treated as empty after focus, a foreign draft is
+/// never overwritten, an already-staged exact outbound draft is submitted
+/// without rewriting it, every successful write is re-read exactly, and a
+/// Return is never retried.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 #[allow(
     clippy::too_many_arguments,
@@ -245,8 +323,34 @@ where
         initial = read();
     }
     match initial.as_deref() {
-        Some("") => {}
-        None => {}
+        Some("") | None => {}
+        Some(value) if value == message => {
+            // A prior accepted_unconfirmed local-send can leave the exact
+            // outbound text sitting uncommitted. Re-apply that same value so
+            // KakaoTalk treats it as a fresh composer mutation, then Return
+            // once. Never replace a different draft.
+            attest("before existing composer reapply")?;
+            if read().as_deref() != Some(message) {
+                anyhow::bail!("message composer changed before send; refusing to overwrite it");
+            }
+            focus()?;
+            begin_mutation();
+            if !set_value() && read().as_deref() != Some(message) {
+                anyhow::bail!(
+                    "message composer is unreadable or changed after write failure; refusing to type"
+                );
+            }
+            attest("after existing composer reapply")?;
+            if read().as_deref() != Some(message) {
+                anyhow::bail!("message composer does not exactly match the intended outbound text");
+            }
+            attest("immediately before send")?;
+            if read().as_deref() != Some(message) {
+                anyhow::bail!("message composer changed before send; refusing to press Return");
+            }
+            press_return()?;
+            return Ok(());
+        }
         Some(value) => anyhow::bail!(
             "message composer in the selected window is not empty ({} chars); refusing to overwrite it",
             value.chars().count()
@@ -259,6 +363,9 @@ where
     attest("before composer write")?;
     match read().as_deref() {
         Some("") | None => {}
+        Some(value) if value == message => {
+            anyhow::bail!("message composer changed before write; refusing to overwrite it")
+        }
         Some(_) => anyhow::bail!("message composer changed before write; refusing to overwrite it"),
     }
 
@@ -640,6 +747,63 @@ mod match_tests {
             .collect::<Vec<_>>();
         assert!(match_transcript_suffix(&texts, &texts).is_strong());
     }
+    #[test]
+    fn deleted_control_rows_do_not_break_a_strong_transcript_suffix() {
+        let mut first = local_message(1, "서로 다른 첫 번째 정상 메시지입니다", String::new());
+        first.log_id = 1;
+        let mut second = local_message(1, "서로 다른 두 번째 정상 메시지입니다", String::new());
+        second.log_id = 2;
+        let mut third = local_message(1, "서로 다른 세 번째 정상 메시지입니다", String::new());
+        third.log_id = 3;
+        let mut deleted = local_message(
+            0,
+            r#"{"logId":3909400248360808449,"byHost":false,"hidden":true,"feedType":14}"#,
+            String::new(),
+        );
+        deleted.log_id = 4;
+        let mut latest = local_message(1, "GeekNews TOP5 latest digest body", String::new());
+        let mut leftover_body = local_message(
+            1,
+            "GeekNews TOP3 leftover draft that AX already deleted",
+            String::new(),
+        );
+        leftover_body.log_id = 3909400248360808449;
+        leftover_body.message =
+            "GeekNews TOP3 leftover draft that AX already deleted".to_string();
+        latest.log_id = 5;
+
+        let suffix = normalize_local_binding_suffix(&[
+            first,
+            second,
+            third,
+            leftover_body,
+            deleted,
+            latest,
+        ]);
+        assert_eq!(
+            suffix.iter().map(|(log_id, _)| *log_id).collect::<Vec<_>>(),
+            vec![1, 2, 3, 5]
+        );
+
+        let ax = [
+            "서로 다른 첫 번째 정상 메시지입니다",
+            "서로 다른 두 번째 정상 메시지입니다",
+            "서로 다른 세 번째 정상 메시지입니다",
+            AX_DELETED_MESSAGE_TOKEN,
+            "GeekNews TOP5 latest digest body",
+        ]
+        .map(str::to_string);
+        let ax_norm: Vec<String> = ax
+            .iter()
+            .map(|item| normalize_binding_message(item))
+            .filter(|item| !item.is_empty())
+            .collect();
+        let local_texts = suffix
+            .iter()
+            .map(|(_, text)| text.clone())
+            .collect::<Vec<_>>();
+        assert!(match_transcript_suffix(&ax_norm, &local_texts).is_strong());
+    }
 
     #[test]
     fn invalid_media_inside_latest_tail_prevents_matching_across_it() {
@@ -773,10 +937,81 @@ mod match_tests {
             0
         );
     }
+    #[test]
+    fn sharp_search_binds_last_card_headline_and_accepts_ax_ellipsis() {
+        let attachment = serde_json::json!({
+            "P": {"ME": "샵검색: #청년일자리대책", "RF": "sharp_search"},
+            "C": {
+                "ITL": [
+                    {"TD": {"T": "깊어지는 세대간 고용 양극화…30만개 '청년 일자리' 대책 주목"}},
+                    {"TD": {"T": "李 “혁신적 대책” 주문했는데…돌연 발표 연기된 ‘청년 일자리 대책’"}},
+                    {"TD": {"T": "한성숙 국무총리 “청년 일경험 경력 인정 확대”…정부, 청년 일자리 대책 발표 예고"}}
+                ]
+            }
+        })
+        .to_string();
+        let card = local_message(71, "샵검색: #청년일자리대책", attachment);
+        let headline = "한성숙 국무총리 “청년 일경험 경력 인정 확대”…정부, 청년 일자리 대책 발표 예고";
+        assert_eq!(normalize_local_binding_message(&card).unwrap(), headline);
+
+        let older = [
+            "자주보던 사람들이긴해".to_string(),
+            headline.to_string(),
+            "후".to_string(),
+            "ㄷㄷ".to_string(),
+        ];
+        let ax = [
+            "자주보던 사람들이긴해".to_string(),
+            "한성숙 국무총리 “청년 일경험 경력 인정 확대”…".to_string(),
+            "후".to_string(),
+            "ㄷㄷ".to_string(),
+        ];
+        let matched = match_transcript_suffix(&ax, &older);
+        assert_eq!(matched.matched_count, 4);
+        assert!(matched.is_strong());
+
+        assert!(normalize_local_binding_message(&local_message(
+            71,
+            "샵검색: #청년일자리대책",
+            String::new()
+        ))
+        .is_err());
+    }
 
     #[test]
     fn composer_guard_never_mutates_nonempty_composer() {
         let (result, probe) = run_composer_probe([Some("human draft")], true);
+        assert!(result.is_err());
+        assert_eq!(probe.focuses, 0);
+        assert_eq!(probe.set_attempts, 0);
+        assert_eq!(probe.mutation_begins, 0);
+        assert_eq!(probe.typed, 0);
+        assert_eq!(probe.returns, 0);
+    }
+
+    #[test]
+    fn composer_guard_submits_exact_existing_draft_without_rewrite() {
+        let (result, probe) = run_composer_probe(
+            [
+                Some("reply"),
+                Some("reply"),
+                Some("reply"),
+                Some("reply"),
+                Some("reply"),
+            ],
+            true,
+        );
+        assert!(result.is_ok());
+        assert_eq!(probe.focuses, 1);
+        assert_eq!(probe.set_attempts, 1);
+        assert_eq!(probe.mutation_begins, 1);
+        assert_eq!(probe.typed, 0);
+        assert_eq!(probe.returns, 1);
+    }
+
+    #[test]
+    fn composer_guard_aborts_if_exact_draft_changes_before_return() {
+        let (result, probe) = run_composer_probe([Some("reply"), Some("human edited")], true);
         assert!(result.is_err());
         assert_eq!(probe.focuses, 0);
         assert_eq!(probe.set_attempts, 0);
@@ -948,10 +1183,10 @@ mod imp {
     const RETURN_KEYCODE: u16 = 36;
     const CONTEXT_MENU_TIMEOUT: Duration = Duration::from_secs(2);
     const CONTEXT_MENU_TITLES_REPLY: &[&str] = &["답장"];
-    #[allow(dead_code)]
     const CONTEXT_MENU_TITLES_DELETE_EVERYONE: &[&str] = &["모두에게서 삭제"];
     const OPEN_CHAT_TIMEOUT: Duration = Duration::from_secs(5);
     const SERVICE_AX_TRAVERSAL_TIMEOUT: Duration = Duration::from_secs(10);
+    const CHAT_ROW_SELECT_RETRY_DELAYS_MS: [u64; 2] = [250, 500];
     const SERVICE_AX_MESSAGING_TIMEOUT_SECS: f32 = 0.5;
     const MAX_AX_STRING_UTF16_UNITS: usize = 256 * 1024;
 
@@ -1548,32 +1783,50 @@ mod imp {
     fn open_chat_row(app: &AXUIElement, chat_display_name: &str) -> Result<()> {
         let debug = std::env::var("OPENKAKAO_CLI_DEBUG").is_ok();
         let start = Instant::now();
+        let mut last_error = None;
 
-        let main_window = find_main_window(app)?;
-        let (table, row) = find_chat_row_live(&main_window, chat_display_name)?;
-        if debug {
-            eprintln!(
-                "[ax_send] open_chat_row: live lookup took {:?}",
-                start.elapsed()
-            );
+        // Transient AX -25201 happens when the chat-list table exists but the
+        // row attribute set fails (covered window / Space race). Retry without
+        // activating KakaoTalk or restoring minimized windows.
+        for (attempt, retry_delay_ms) in CHAT_ROW_SELECT_RETRY_DELAYS_MS
+            .into_iter()
+            .map(Some)
+            .chain(std::iter::once(None))
+            .enumerate()
+        {
+            let main_window = find_main_window(app)?;
+            let (table, row) = find_chat_row_live(&main_window, chat_display_name)?;
+            if debug {
+                eprintln!(
+                    "[ax_send] open_chat_row: live lookup attempt {} took {:?}",
+                    attempt + 1,
+                    start.elapsed()
+                );
+            }
+
+            let selected_rows_attr: AXAttribute<CFType> =
+                AXAttribute::new(&CFString::new("AXSelectedRows"));
+            let one_row = CFArray::from_CFTypes(std::slice::from_ref(&row));
+            match table.set_attribute(&selected_rows_attr, one_row.as_CFType()) {
+                Ok(()) => {
+                    if debug {
+                        eprintln!("[ax_send] open_chat_row: total {:?}", start.elapsed());
+                    }
+                    return Ok(());
+                }
+                Err(error) => {
+                    last_error = Some(error);
+                    if let Some(delay_ms) = retry_delay_ms {
+                        std::thread::sleep(Duration::from_millis(delay_ms));
+                    }
+                }
+            }
         }
 
-        // Select via AX attribute (works even for off-screen rows — this is the
-        // fix kakaocli landed for its off-screen-row regression) rather than a
-        // coordinate-based double click. `AXSelectedRows` is a settable
-        // attribute of the *table*, not the row (has no typed accessor in the
-        // `accessibility` crate either way, so it's addressed by raw name).
-        let selected_rows_attr: AXAttribute<CFType> =
-            AXAttribute::new(&CFString::new("AXSelectedRows"));
-        let one_row = CFArray::from_CFTypes(std::slice::from_ref(&row));
-        table
-            .set_attribute(&selected_rows_attr, one_row.as_CFType())
-            .map_err(|e| anyhow!("failed to select chat row: {e:?}"))?;
-
-        if debug {
-            eprintln!("[ax_send] open_chat_row: total {:?}", start.elapsed());
-        }
-        Ok(())
+        Err(anyhow!(
+            "failed to select chat row: {:?}",
+            last_error.expect("chat-row select always records an error")
+        ))
     }
 
     /// Search a single root (a window, or the whole app as a fallback) for the
@@ -1921,7 +2174,6 @@ mod imp {
         send_via_ax(chat_display_name, message)
     }
 
-    #[allow(dead_code)]
     pub fn delete_via_ax(chat_display_name: &str, source: &str) -> Result<()> {
         let pid = find_kakaotalk_pid()?;
         ensure_ax_permission()?;
@@ -2392,7 +2644,7 @@ mod imp {
 
 #[cfg(target_os = "macos")]
 pub use imp::{
-    preflight_bound_via_ax, read_open_exact_via_ax, read_via_ax, reply_via_ax,
+    delete_via_ax, preflight_bound_via_ax, read_open_exact_via_ax, read_via_ax, reply_via_ax,
     scrape_chat_list, scrape_chat_list_for_service, scrape_chat_list_for_service_isolated,
     send_bound_via_ax, send_via_ax, ChatListRow,
 };

@@ -5,6 +5,7 @@ openkakao-cli is designed for AI agent integration. All commands support `--json
 ## Safety Model
 
 LOCO write operations (send, delete, edit, react) are **disabled by default** to prevent account bans.
+Documented product send is AX `local-send` (`allow_ax_send` + `allowed_send_chats`). `local-delete` is AX `모두에게서 삭제`, not LOCO. LOCO `send`/`delete`/`edit`/`react`/`mark-read` stay research-quarantined behind `allow_loco_write`. Supported realtime watch is `ax-watch`, not LOCO `watch`. Context/style search is 최연우-persona adjunct. GeekNews uses the official Atom feed, three KST slots, TOP5 numbered after a blank line, and persists seen/slots only after a confirmed send. Session-monitor is the only unattended host; never hide the user's existing Terminal.
 
 ### Safe commands (always available, no server contact)
 
@@ -40,6 +41,7 @@ openkakao-cli send --me "test" -y --json    # Send to memo chat
 openkakao-cli delete <chat_id> <log_id> -y --json
 openkakao-cli edit <chat_id> <log_id> "new" -y --json
 openkakao-cli react <chat_id> <log_id> --json
+openkakao-cli local-delete "부자멘토멘티" "보이는 메시지 일부" -y --json
 ```
 
 ### Foreground automatic replies

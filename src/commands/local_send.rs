@@ -220,6 +220,44 @@ pub fn emit_pre_send_unavailable(chat_name: &str, json: bool) -> Result<()> {
     }
     Ok(())
 }
+pub fn cmd_local_delete(chat_name: &str, source: &str, skip_confirm: bool, dry_run: bool, json: bool) -> Result<()> {
+    let source = source.trim();
+    if source.is_empty() {
+        anyhow::bail!("delete selector must not be empty");
+    }
+    if dry_run {
+        if json {
+            crate::util::output_json(&serde_json::json!({
+                "dry_run": true,
+                "action": "local_delete",
+                "chat_name": chat_name,
+                "source": source,
+            }))?;
+        } else {
+            println!("[dry-run] Would AX-delete visible message in \"{chat_name}\": {source:?}");
+        }
+        return Ok(());
+    }
+    if !skip_confirm {
+        eprint!("AX-delete visible message matching {source:?} in {chat_name}?\n[y/N] ");
+        if !crate::util::confirm()? {
+            println!("Cancelled.");
+            return Ok(());
+        }
+    }
+    ax_send::delete_via_ax(chat_name, source)?;
+    if json {
+        crate::util::output_json(&serde_json::json!({
+            "action": "local_delete",
+            "chat_name": chat_name,
+            "source": source,
+            "status": "deleted",
+        }))?;
+    } else {
+        println!("AX-deleted visible message in {chat_name}.");
+    }
+    Ok(())
+}
 
 fn require_pre_mutation_failure(failure: ax_send::BoundSendFailure) -> Result<()> {
     if failure.mutation_started() {

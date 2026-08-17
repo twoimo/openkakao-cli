@@ -340,6 +340,8 @@ watchdog or guardian dies. See the
 [Bujamentor launchd runbook](docs/bujamentor-launchd-supervision.md#persistent-auto-reply-launchagent)
 for the trust boundary and status checks.
 
+The current unattended host is session-monitor only: LaunchAgent → Terminal → immutable bake → `auto-reply`. Do not use `install-bujamentor-auto-reply-service.sh` or the watch/health LaunchAgent as a reply owner. A running watchdog window is miniaturized; a finished `.command` window (`busy=false`) is closed. The user's existing Terminal is never hidden. GeekNews posts at most three times per KST day from the official Atom feed (`https://news.hada.io/rss/news`): morning 08:40±20m, lunch 12:35±15m, evening 19:50±25m, each a 30-minute window, only after 10 minutes of room quiet. Format is `GeekNews TOP5 · {time}`, a blank line, then numbered `1.`–`5.`. Seen IDs and `posted_slots` are written only after a locally confirmed send.
+
 This provides recovery after the same user logs back in and Aqua, Terminal,
 the existing TCC authorization, logged-in KakaoTalk, and the exact window are
 available. It does not operate while the Mac is powered off or the user is
@@ -388,9 +390,10 @@ Read-only operations are always available:
 | `read <id> --rest` | Read messages via REST | REST |
 | `send ... --dry-run` | Preview send without executing | None |
 | `local-send ... --dry-run` | Preview an AX send without executing | None |
+| `local-delete ... --dry-run` | Preview an AX delete (`모두에게서 삭제`) | None |
 
 > [!NOTE]
-> `local-send`/`ax-read`/`ax-watch` need to find KakaoTalk's **main chat-list window** via the macOS Accessibility API. If that window is **minimized**, or on a different **macOS Space** (virtual desktop) than the one you're currently viewing, it won't be found — restoring it automatically isn't possible without risking a stolen foreground focus, so these commands give a clear error and ask you to restore it by hand instead. If this keeps happening, a one-time fix is: right-click the KakaoTalk Dock icon → Options → Assign To → All Desktops.
+> `local-send`/`ax-read`/`ax-watch` need KakaoTalk's **main chat-list window already open**. A **minimized** or missing window is not restored (that would steal focus). Assign KakaoTalk to **All Desktops** if you work on another Space. Being covered by another app on the same Space is usually fine. Transient `Ax(-25201)` row-select failures retry briefly without activating KakaoTalk.
 
 ## Requirements
 

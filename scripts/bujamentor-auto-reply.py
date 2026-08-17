@@ -29,6 +29,7 @@ import sqlite3
 import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from pathlib import Path
 import stat
 MAX_LINK_BODY_BYTES = 1_000_000
@@ -168,6 +169,8 @@ REPLY_JOB_RETENTION_SECONDS = REPLY_JOB_RETENTION_DAYS_DEFAULT * 24.0 * 60.0 * 6
 REPLY_JOB_RETENTION_BATCH_SIZE = 100
 REPLY_JOB_RETENTION_INTERVAL_SECONDS = 60.0
 MIN_REPLY_DELAY_SECONDS = 5.0
+PRE_SEND_RETRY_GRACE_SECONDS = 120.0
+SCHEDULED_REPLY_DELAY_CAP_SECONDS = 20.0
 RESPONSE_TIME_DISTRIBUTION_SCHEMA_VERSION = 2
 RESPONSE_TIME_DISTRIBUTION_POLICY_VERSION = "empirical-log1p-three-means-p90-v1"
 RESPONSE_TIME_DISTRIBUTION_MODEL_KIND = "bounded-normal-mixture"
@@ -776,7 +779,7 @@ def _apply_recovered_terminal(
     for name, value in fields.items():
         if name not in {
             "status", "decision", "reason", "category", "reply",
-            "scheduled_delay_seconds", "error_class", "due_at",
+            "scheduled_delay_seconds", "error_class", "due_at", "event_json",
         }:
             raise ValueError("unsupported recovered terminal field")
         assignments.append(f"{name} = ?")
@@ -2418,14 +2421,46 @@ def leftover_unknown_has_ax_mutation(
     return int(count[0] or 0) > 0
 
 
+def _rebind_formed_reply_to_live_owner(row: sqlite3.Row) -> str | None:
+    owner = os.environ.get(SUPERVISOR_OWNER_ENV, "").strip()
+    epoch = _fence_env_int(os.environ.get(DB_SOURCE_EPOCH_ENV, ""))
+    if not owner or epoch is None:
+        return None
+    try:
+        event = json.loads(str(row["event_json"]))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(event, dict) or event.get("proactive") is True:
+        return None
+    event["owner_id"] = owner
+    event["source_epoch"] = epoch
+    event.pop("candidate", None)
+    return json.dumps(event, ensure_ascii=False, separators=(",", ":"))
+
 def leftover_pre_send_unknown_skip_fields(
     connection: sqlite3.Connection, row: sqlite3.Row
 ) -> dict | None:
     reason = str(row["reason"] or "")
-    if row["reply"] not in {None, ""}:
-        return None
     if leftover_unknown_has_ax_mutation(connection, str(row["event_id"])):
         return None
+    reply = row["reply"]
+    if reply not in {None, ""}:
+        if _proactive_unix_leftover_job(row):
+            return None
+        rebound = _rebind_formed_reply_to_live_owner(row)
+        if rebound is None:
+            return None
+        return {
+            "status": "scheduled",
+            "decision": "reply",
+            "reason": reason or "useful_information",
+            "category": str(row["category"] or "social"),
+            "reply": reply,
+            "scheduled_delay_seconds": row["scheduled_delay_seconds"] or 8.0,
+            "error_class": "pre_send_unavailable",
+            "due_at": time.time() + 8.0,
+            "event_json": rebound,
+        }
     if reason in PRE_SEND_USAGE_LIMIT_REASONS:
         return {
             "status": "skipped",
@@ -2436,8 +2471,28 @@ def leftover_pre_send_unknown_skip_fields(
             "scheduled_delay_seconds": None,
             "error_class": None,
         }
+    if reason in {"stale_backlog", "conversation_advanced", "burst_superseded"}:
+        return {
+            "status": "skipped",
+            "decision": "skip",
+            "reason": reason,
+            "category": str(row["category"] or "policy"),
+            "reply": None,
+            "scheduled_delay_seconds": None,
+            "error_class": None,
+        }
     if reason:
         return None
+    if _proactive_unix_leftover_job(row):
+        return {
+            "status": "skipped",
+            "decision": "skip",
+            "reason": "stale_backlog",
+            "category": "policy",
+            "reply": None,
+            "scheduled_delay_seconds": None,
+            "error_class": None,
+        }
     return {
         "status": "pending",
         "decision": None,
@@ -2449,6 +2504,41 @@ def leftover_pre_send_unknown_skip_fields(
         "due_at": time.time(),
     }
 
+
+def _unix_stamp_log_id(value: object) -> bool:
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, int)
+        and 10**9 <= value < 10**12
+    )
+
+
+def _proactive_unix_leftover_job(row: sqlite3.Row) -> bool:
+    try:
+        event = json.loads(str(row["event_json"]))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+    if not isinstance(event, dict):
+        return False
+    event_id = str(row["event_id"] or "")
+    try:
+        suffix = int(event_id.rsplit(":", 1)[-1])
+    except (TypeError, ValueError):
+        suffix = None
+    log_id = event.get("log_id")
+    if event.get("proactive") is True:
+        # A proactive unknown with no AX mutation is leftover, whether the
+        # unique event_id is unix-shaped or the tail log_id is a real Kakao id.
+        # Reopening it as pending retransmits the same digest.
+        return True
+    if suffix is None:
+        return False
+    if isinstance(log_id, bool) or not isinstance(log_id, int):
+        return False
+    if log_id != suffix:
+        return _unix_stamp_log_id(suffix)
+    return _unix_stamp_log_id(log_id)
+
 def _queue_reconciliation_blockers(connection: sqlite3.Connection) -> int:
     row = connection.execute(
         """
@@ -2456,11 +2546,20 @@ def _queue_reconciliation_blockers(connection: sqlite3.Connection) -> int:
         WHERE status IN ('delivery_unknown', 'reconcile_required', 'poison')
           AND NOT (
             status = 'delivery_unknown'
-            AND (reply IS NULL OR reply = '')
             AND (
-              reason IS NULL
-              OR reason = ''
-              OR reason IN ('model_usage_limited', 'model_rate_limited', 'model_authentication_unavailable', 'model_temporarily_unavailable')
+              (
+                (reply IS NULL OR reply = '')
+                AND (
+                  reason IS NULL
+                  OR reason = ''
+                  OR reason IN ('model_usage_limited', 'model_rate_limited', 'model_authentication_unavailable', 'model_temporarily_unavailable', 'stale_backlog', 'conversation_advanced', 'burst_superseded')
+                )
+              )
+              OR (
+                reply IS NOT NULL
+                AND length(reply) > 0
+                AND COALESCE(json_extract(event_json, '$.proactive'), 0) != 1
+              )
             )
           )
         """
@@ -3960,6 +4059,16 @@ def emit_ack(
     print(json.dumps(payload, ensure_ascii=False), flush=True)
 
 
+def _valid_db_event_id(value: object, chat_id: int) -> str:
+    if not isinstance(value, str):
+        return ""
+    try:
+        validated = transition_journal.validated_event_id(value, expected_chat_id=chat_id)
+    except (TypeError, ValueError):
+        return ""
+    return validated
+
+
 def canonical_db_event(event: dict) -> bool:
     if event.get("method") != "local_db" or event.get("event_type") != "local_db_message":
         return False
@@ -3977,11 +4086,22 @@ def canonical_db_event(event: dict) -> bool:
         return False
     if chat_id <= 0 or not 0 < log_id < MAX_INT64:
         return False
+    event_id = _valid_db_event_id(event.get("event_id"), chat_id)
+    canonical_event_id = _valid_db_event_id(event.get("canonical_event_id"), chat_id)
+    if not event_id or event_id != canonical_event_id:
+        return False
     expected = f"db:{chat_id}:{log_id}"
-    return (
-        str(event.get("event_id") or "") == expected
-        and str(event.get("canonical_event_id") or "") == expected
-    )
+    if event.get("proactive") is True:
+        source_log_id = event.get("proactive_source_log_id")
+        if (
+            isinstance(source_log_id, bool)
+            or not isinstance(source_log_id, int)
+            or not 0 < source_log_id < MAX_INT64
+            or event_id == expected
+        ):
+            return False
+        return True
+    return event_id == expected
 
 
 def _enrolled_reply_author_bindings(target_chat_id: int) -> dict[str, int] | None:
@@ -4344,10 +4464,12 @@ def db_authoritative_event_allowed(event: dict) -> bool:
     ):
         return False
     expected_event_id = f"db:{target_chat_id}:{log_id}"
-    if (
-        str(event.get("event_id") or "") != expected_event_id
-        or str(event.get("canonical_event_id") or "") != expected_event_id
-    ):
+    event_id = str(event.get("event_id") or "")
+    canonical_event_id = str(event.get("canonical_event_id") or "")
+    if event.get("proactive") is True:
+        if event_id == expected_event_id or event_id != canonical_event_id:
+            return False
+    elif event_id != expected_event_id or canonical_event_id != expected_event_id:
         return False
     try:
         encoded = json.dumps(event, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
@@ -5653,26 +5775,27 @@ def sample_response_delay_for_analysis(
     *,
     rng: object | None = None,
 ) -> dict:
-    """Sample human pacing while keeping actionable questions responsive.
+    """Sample human pacing while keeping ordinary replies from waiting too long.
 
-    A delayed mixture component is useful for ordinary social/information
-    messages, but it makes a direct question likely to become stale whenever
-    another participant speaks first. Keep the learned immediate component
-    Gaussian variation and lower bound; only the component selection is
-    constrained for questions and advice.
+    Direct questions and advice stay on the learned immediate component.
+    Other ordinary replies use the short component and are hard-capped so a
+    delayed social sample cannot sit for minutes and then die as stale_backlog.
     """
     category = str(analysis.get("category") or "").strip()
     reason = str(analysis.get("reason") or "").strip()
-    component_name = (
-        "immediate"
-        if category in {"question", "advice"} or reason == "direct_question"
-        else None
-    )
-    return sample_response_delay(
+    if category in {"question", "advice"} or reason == "direct_question":
+        component_name = "immediate"
+    else:
+        component_name = "short"
+    sampled = sample_response_delay(
         stats,
         rng=rng,
         component_name=component_name,
     )
+    delay = min(float(sampled["delay_seconds"]), SCHEDULED_REPLY_DELAY_CAP_SECONDS)
+    sampled["delay_seconds"] = round(delay, 1)
+    sampled["scheduled_delay_cap_seconds"] = SCHEDULED_REPLY_DELAY_CAP_SECONDS
+    return sampled
 
 
 def event_exceeds_response_window(
@@ -7124,7 +7247,11 @@ def send_reply(
     )
     if not ready:
         return False
-    if event is not None and conversation_advanced_past_event(event) is not False:
+    if (
+        event is not None
+        and event.get("proactive") is not True
+        and conversation_advanced_past_event(event) is not False
+    ):
         return False
     command = [
         str(BIN),
@@ -7167,8 +7294,7 @@ def send_reply(
         "OPENKAKAO_TARGET_CHAT_ID": str(expected_target_chat_id or ""),
         "OPENKAKAO_TARGET_CHAT_NAME": CHAT,
         "OPENKAKAO_EXPECTED_SOURCE_LOG_ID": str(
-            _fence_int((event or {}).get("burst_tail_log_id"))
-            or _fence_int((event or {}).get("log_id"))
+            _proactive_expected_source_log_id(event or {})
             or ""
         ),
         "OPENKAKAO_EXPECTED_SOURCE_AUTHOR_ID": str(
@@ -7176,6 +7302,9 @@ def send_reply(
         ),
         "OPENKAKAO_EXPECTED_SOURCE_AUTHOR_NICKNAME": str(
             (event or {}).get("author_nickname") or ""
+        ),
+        "OPENKAKAO_PROACTIVE_SEND": (
+            "1" if (event or {}).get("proactive") is True else ""
         ),
         "OPENKAKAO_SUPERVISOR_STATUS": os.environ.get(
             "OPENKAKAO_SUPERVISOR_STATUS", ""
@@ -7236,7 +7365,11 @@ def send_reply(
     )
     if not ready:
         return False
-    if event is not None and conversation_advanced_past_event(event) is not False:
+    if (
+        event is not None
+        and event.get("proactive") is not True
+        and conversation_advanced_past_event(event) is not False
+    ):
         return False
     if (
         os.environ.get(DB_MODE_ENV) == "database_authoritative"
@@ -7284,9 +7417,7 @@ def send_reply(
         return False
     except (IndexError, UnicodeError, json.JSONDecodeError):
         return False
-    expected_source_log_id = _fence_int((event or {}).get("burst_tail_log_id")) or _fence_int(
-        (event or {}).get("log_id")
-    )
+    expected_source_log_id = _proactive_expected_source_log_id(event or {})
     confirmation_log_id = result.get("confirmation_log_id") if isinstance(result, dict) else None
     if (
         returncode == 0
@@ -7352,6 +7483,12 @@ def send_reply(
                     "post-mutation transition journal unavailable"
                 )
             return False
+    if (
+        event is not None
+        and event.get("proactive_query") == "geeknews-rss"
+        and confirmation_log_id is not None
+    ):
+        _mark_geeknews_digest_confirmed(event, now=time.time())
     return True
 
 
@@ -8075,9 +8212,13 @@ def defer_scheduled_pre_send_unavailable(
         finish_delivery_unknown(event, event_id, connection)
         return
     if deadline <= current:
-        finish_scheduled_stale_backlog(event, event_id, connection)
-        return
-    retry_at = min(current + MODEL_MIN_DEFER_SECONDS, deadline)
+        grace_until = deadline + PRE_SEND_RETRY_GRACE_SECONDS
+        if current >= grace_until:
+            finish_scheduled_stale_backlog(event, event_id, connection)
+            return
+        retry_at = min(current + MODEL_MIN_DEFER_SECONDS, grace_until)
+    else:
+        retry_at = min(current + MODEL_MIN_DEFER_SECONDS, deadline)
     settle_processing_transition(
         event,
         event_id,
@@ -8248,7 +8389,7 @@ def process_job(
         except (KeyError, RetrievalError):
             finish_delivery_unknown(event, event_id, connection)
             return
-        if stale_backlog:
+        if stale_backlog and not str(job.get("reply") or "").strip():
             finish_scheduled_stale_backlog(event, event_id, connection)
             return
         if event.get("proactive") is True:
@@ -8377,7 +8518,10 @@ def process_job(
                 connection,
             )
             return
-        advanced = conversation_advanced_past_event(event)
+        if event.get("proactive") is True:
+            advanced = False
+        else:
+            advanced = conversation_advanced_past_event(event)
         if advanced is None:
             finish_delivery_unknown(event, event_id, connection)
             return
@@ -8428,7 +8572,10 @@ def process_job(
             if connection is not None and _superseded_by(connection, event):
                 finish_burst_superseded(event, event_id, connection)
                 return
-            if conversation_advanced_past_event(event) is True:
+            if (
+                event.get("proactive") is not True
+                and conversation_advanced_past_event(event) is True
+            ):
                 finish_conversation_advanced(event, event_id, connection)
                 return
             # send_reply commits ``sending`` before invoking local-send.
@@ -8500,6 +8647,7 @@ def process_job(
         complete_event(event_id, reply)
         return
 
+    analysis_event = event if event.get("proactive") is True else _coalesced_burst_event(event)
     if event.get("proactive") is True:
         reply = str(event.get("message") or "").strip()
         if not reply:
@@ -8513,7 +8661,6 @@ def process_job(
             "provenance": {},
         }
     else:
-        analysis_event = _coalesced_burst_event(event)
         with _active_job_journal(connection, analysis_event):
             analysis = (
                 analyze_media_unavailable_clarification(analysis_event)
@@ -8681,10 +8828,17 @@ PROACTIVE_TOKEN_DENYLIST = {
 GEEKNEWS_FEED_URL = "https://news.hada.io/rss/news"
 GEEKNEWS_TOPIC_RE = re.compile(r"^https://news\.hada\.io/topic\?id=([1-9][0-9]{0,9})\Z")
 GEEKNEWS_CURSOR_NAME = "geeknews-rss-cursor.json"
-GEEKNEWS_MAX_ITEMS = 3
+GEEKNEWS_MAX_ITEMS = 5
 GEEKNEWS_MAX_SUMMARY_CHARS = 90
 GEEKNEWS_FEED_MAX_BYTES = 400_000
 GEEKNEWS_FEED_TIMEOUT_SECONDS = 8.0
+GEEKNEWS_SLOT_TZ = ZoneInfo("Asia/Seoul")
+GEEKNEWS_DAILY_SLOTS = (
+    ("morning", 8, 40, 20),
+    ("lunch", 12, 35, 15),
+    ("evening", 19, 50, 25),
+)
+GEEKNEWS_ROOM_QUIET_SECONDS = 10 * 60
 
 
 def _style_topic_candidates(common_tokens_json: str) -> list[str]:
@@ -8717,12 +8871,14 @@ def _geeknews_cursor_path() -> Path:
     return QUEUE.with_name(GEEKNEWS_CURSOR_NAME)
 
 
-def _load_geeknews_seen_ids() -> set[int]:
+def _load_geeknews_cursor() -> dict:
     path = _geeknews_cursor_path()
     payload = _read_fence_object(path)
-    if payload is None:
-        return set()
-    values = payload[0].get("seen_ids")
+    return payload[0] if payload is not None else {}
+
+
+def _load_geeknews_seen_ids() -> set[int]:
+    values = _load_geeknews_cursor().get("seen_ids")
     if not isinstance(values, list):
         return set()
     seen: set[int] = set()
@@ -8732,13 +8888,104 @@ def _load_geeknews_seen_ids() -> set[int]:
     return seen
 
 
-def _store_geeknews_seen_ids(seen_ids: set[int], newest_id: int) -> None:
+def _geeknews_slot_window(
+    day, name: str, hour: int, minute: int, jitter_minutes: int
+) -> tuple[float, float]:
+    from datetime import timedelta
+
+    seed = f"{day.isoformat()}:{name}".encode("utf-8")
+    digest = hashlib.sha256(seed).digest()
+    span = jitter_minutes * 2 + 1
+    offset = int.from_bytes(digest[:2], "big") % span - jitter_minutes
+    anchor = datetime(
+        day.year, day.month, day.day, hour, minute, tzinfo=GEEKNEWS_SLOT_TZ
+    ) + timedelta(minutes=offset)
+    start = anchor.timestamp()
+    return start, start + 30 * 60
+
+
+def _geeknews_slot_at(now: float) -> tuple[str, str] | None:
+    try:
+        local = datetime.fromtimestamp(now, GEEKNEWS_SLOT_TZ)
+    except (OSError, OverflowError, ValueError):
+        return None
+    day = local.date()
+    for name, hour, minute, jitter in GEEKNEWS_DAILY_SLOTS:
+        start, end = _geeknews_slot_window(day, name, hour, minute, jitter)
+        if start <= now < end:
+            return day.isoformat(), name
+    return None
+
+
+def _geeknews_slot_open(now: float) -> bool:
+    slot = _geeknews_slot_at(now)
+    if slot is None:
+        return False
+    day, name = slot
+    posted = _load_geeknews_cursor().get("posted_slots")
+    if not isinstance(posted, list):
+        return True
+    marker = f"{day}:{name}"
+    return marker not in {str(item) for item in posted[-32:]}
+
+
+def _mark_geeknews_digest_confirmed(event: dict, *, now: float | None = None) -> None:
+    ids: set[int] = set()
+    for item in event.get("proactive_ids") or []:
+        if isinstance(item, int) and not isinstance(item, bool) and item > 0:
+            ids.add(item)
+    cursor = _load_geeknews_cursor()
+    values = cursor.get("seen_ids")
+    if isinstance(values, list):
+        for item in values[-200:]:
+            if isinstance(item, int) and not isinstance(item, bool) and item > 0:
+                ids.add(item)
+    newest = cursor.get("newest_id")
+    if not isinstance(newest, int) or isinstance(newest, bool) or newest <= 0:
+        newest = max(ids) if ids else 0
+    else:
+        newest = max(newest, max(ids) if ids else 0)
+    _store_geeknews_seen_ids(ids, newest, now=now, mark_posted_slot=True)
+
+
+def _mark_geeknews_slot_posted(*, now: float | None = None) -> None:
+    cursor = _load_geeknews_cursor()
+    seen_ids = set()
+    values = cursor.get("seen_ids")
+    if isinstance(values, list):
+        for item in values[-200:]:
+            if isinstance(item, int) and not isinstance(item, bool) and item > 0:
+                seen_ids.add(item)
+    newest = cursor.get("newest_id")
+    if not isinstance(newest, int) or isinstance(newest, bool) or newest <= 0:
+        newest = max(seen_ids) if seen_ids else 0
+    _store_geeknews_seen_ids(seen_ids, newest, now=now, mark_posted_slot=True)
+
+def _store_geeknews_seen_ids(
+    seen_ids: set[int],
+    newest_id: int,
+    *,
+    now: float | None = None,
+    mark_posted_slot: bool = False,
+) -> None:
     path = _geeknews_cursor_path()
+    previous = _load_geeknews_cursor()
+    posted = previous.get("posted_slots")
+    if not isinstance(posted, list):
+        posted = []
+    stamp = time.time() if now is None else float(now)
+    if mark_posted_slot:
+        slot = _geeknews_slot_at(stamp)
+        if slot is not None:
+            marker = f"{slot[0]}:{slot[1]}"
+            if marker not in {str(item) for item in posted}:
+                posted = [*(str(item) for item in posted[-31:]), marker]
     payload = {
         "feed": GEEKNEWS_FEED_URL,
         "newest_id": newest_id,
         "seen_ids": sorted(seen_ids)[-200:],
-        "updated_at": int(time.time()),
+        "posted_slots": posted[-32:],
+        "updated_at": int(stamp),
     }
     raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     fd, temporary = tempfile.mkstemp(prefix="geeknews-cursor.", dir=path.parent)
@@ -8823,7 +9070,39 @@ def _fetch_geeknews_feed_xml(fetcher=None) -> str:
     return body.decode("utf-8", "replace")
 
 
-def _next_geeknews_digest(*, fetcher=None) -> dict | None:
+def _format_geeknews_top3_line(
+    items: list[dict],
+    *,
+    now: float | None = None,
+) -> str:
+    stamp = time.time() if now is None else float(now)
+    try:
+        when = datetime.fromtimestamp(stamp, GEEKNEWS_SLOT_TZ).strftime(
+            "%Y-%m-%d %H:%M KST"
+        )
+    except (OSError, OverflowError, ValueError):
+        return ""
+    parts: list[str] = []
+    for item in items[:GEEKNEWS_MAX_ITEMS]:
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("title") or "").strip()
+        url = str(item.get("url") or "").strip()
+        if not title:
+            continue
+        if url.startswith("https://"):
+            parts.append(f"{title} {url}")
+        else:
+            parts.append(title)
+    if not parts:
+        return ""
+    numbered = [f"{index}. {part}" for index, part in enumerate(parts, start=1)]
+    return f"GeekNews TOP5 · {when}\n\n" + "\n".join(numbered)
+
+
+def _next_geeknews_digest(
+    *, fetcher=None, now: float | None = None, persist_seen: bool = True
+) -> dict | None:
     xml = _fetch_geeknews_feed_xml(fetcher)
     items = _parse_geeknews_entries(xml)
     if not items:
@@ -8834,19 +9113,16 @@ def _next_geeknews_digest(*, fetcher=None) -> dict | None:
         return None
     chosen = fresh[:GEEKNEWS_MAX_ITEMS]
     newest = max(item["id"] for item in items)
-    seen.update(item["id"] for item in chosen)
-    _store_geeknews_seen_ids(seen, newest)
-    lines = ["긱뉴스 새 글"]
-    for item in chosen:
-        block = f"- {item['title']}"
-        if item["summary"]:
-            block += f"\n{item['summary']}"
-        block += f"\n{item['url']}"
-        lines.append(block)
+    if persist_seen:
+        seen.update(item["id"] for item in chosen)
+        _store_geeknews_seen_ids(seen, newest, now=now)
+    message = _format_geeknews_top3_line(chosen, now=now)
+    if not message:
+        return None
     return {
         "title": chosen[0]["title"],
         "url": chosen[0]["url"],
-        "message": "\n\n".join(lines),
+        "message": message,
         "ids": [item["id"] for item in chosen],
     }
 
@@ -8984,12 +9260,16 @@ def _latest_inbound_silence_source() -> tuple[dict | None, bool]:
         return None, True
     inbound = None
     last_sent_at = None
+    last_tail_log_id = None
     for item in tail:
         if not isinstance(item, dict):
             return None, True
         sent_at = item.get("sent_at")
         if isinstance(sent_at, int) and not isinstance(sent_at, bool):
             last_sent_at = sent_at
+        item_log_id = _fence_int(item.get("log_id"))
+        if item_log_id is not None:
+            last_tail_log_id = item_log_id
         if item.get("is_self") is True:
             continue
         if item.get("reply_authorized") is not True:
@@ -9001,6 +9281,8 @@ def _latest_inbound_silence_source() -> tuple[dict | None, bool]:
         return None, False
     inbound["room_last_sent_at"] = last_sent_at
     inbound["inbound_silence_at"] = inbound.get("sent_at")
+    observed = _fence_int(state.get("last_observed_log_id"))
+    inbound["room_tail_log_id"] = observed if observed is not None else last_tail_log_id
     return inbound, False
 
 
@@ -9090,14 +9372,35 @@ def _latest_authorized_inbound_from_context(room_last_sent_at: int | None) -> di
     return source
 
 
-def _next_proactive_event_id(chat_id: int, inbound_log_id: int, now: float) -> str:
+def _current_room_tail_log_id() -> int | None:
+    path = _fence_path(DB_WATCH_STATE_ENV, DB_WATCH_STATE_PATH)
+    first = _read_fence_object(path)
+    second = _read_fence_object(path)
+    if first is None or second is None or first[1] != second[1]:
+        return None
+    return _fence_int(first[0].get("last_observed_log_id"))
+
+
+def _proactive_expected_source_log_id(event: dict) -> int | None:
+    if event.get("proactive") is True:
+        current = _current_room_tail_log_id()
+        if current is not None:
+            return current
+    return _fence_int(event.get("burst_tail_log_id")) or _fence_int(event.get("log_id"))
+
+
+def _next_proactive_event_id(
+    chat_id: int,
+    reserved_log_ids: set[int],
+    now: float,
+) -> str:
     stamp = int(now)
     if not 0 < stamp < MAX_INT64:
         return ""
     candidate = stamp
-    while candidate == inbound_log_id and candidate + 1 < MAX_INT64:
+    while candidate in reserved_log_ids and candidate + 1 < MAX_INT64:
         candidate += 1
-    if not 0 < candidate < MAX_INT64:
+    if not 0 < candidate < MAX_INT64 or candidate in reserved_log_ids:
         return ""
     return f"db:{chat_id}:{candidate}"
 
@@ -9118,22 +9421,19 @@ def maybe_enqueue_proactive_topic(
         return None
     if not isinstance(source_event, dict):
         return None
-    inbound_sent_at = source_event.get("inbound_silence_at")
-    if not isinstance(inbound_sent_at, int) or isinstance(inbound_sent_at, bool):
-        inbound_sent_at = source_event.get("sent_at")
-    if not isinstance(inbound_sent_at, int) or isinstance(inbound_sent_at, bool):
+    quiet_at = source_event.get("room_last_sent_at")
+    if not isinstance(quiet_at, int) or isinstance(quiet_at, bool):
+        quiet_at = source_event.get("inbound_silence_at")
+    if not isinstance(quiet_at, int) or isinstance(quiet_at, bool):
+        quiet_at = source_event.get("sent_at")
+    if not isinstance(quiet_at, int) or isinstance(quiet_at, bool):
         return None
-    if now - float(inbound_sent_at) < 1:
+    if now - float(quiet_at) < GEEKNEWS_ROOM_QUIET_SECONDS:
         return None
-    try:
-        timing = sample_response_delay(response_time, component_name="delayed")
-        silence_needed = min(float(timing["delay_seconds"]), 180.0)
-        window_upper = max(float(timing.get("response_window_upper_seconds") or 180.0), 180.0)
-    except RetrievalError:
-        silence_needed = 180.0
-        window_upper = 180.0
-    if now - float(inbound_sent_at) < silence_needed:
+    if not _geeknews_slot_open(now):
         return None
+    silence_needed = float(GEEKNEWS_ROOM_QUIET_SECONDS)
+    window_upper = float(GEEKNEWS_ROOM_QUIET_SECONDS)
     existing = connection.execute(
         """
         SELECT 1 FROM reply_jobs
@@ -9154,11 +9454,14 @@ def maybe_enqueue_proactive_topic(
                 digest = {
                     "title": title,
                     "url": url,
-                    "message": f"{title}\n{url}",
+                    "message": _format_geeknews_top3_line(
+                        [{"title": title, "url": url}],
+                        now=now,
+                    ),
                     "ids": [],
                 }
     if digest is None:
-        digest = _next_geeknews_digest()
+        digest = _next_geeknews_digest(now=now, persist_seen=False)
     if not isinstance(digest, dict):
         return None
     title = str(digest.get("title") or "").strip()
@@ -9168,6 +9471,9 @@ def maybe_enqueue_proactive_topic(
         return None
     chat_id = source_event.get("chat_id")
     inbound_log_id = source_event.get("log_id")
+    tail_log_id = source_event.get("room_tail_log_id")
+    if not isinstance(tail_log_id, int) or isinstance(tail_log_id, bool):
+        tail_log_id = inbound_log_id
     if (
         not isinstance(chat_id, int)
         or isinstance(chat_id, bool)
@@ -9175,15 +9481,28 @@ def maybe_enqueue_proactive_topic(
         or not isinstance(inbound_log_id, int)
         or isinstance(inbound_log_id, bool)
         or inbound_log_id <= 0
+        or not isinstance(tail_log_id, int)
+        or isinstance(tail_log_id, bool)
+        or tail_log_id <= 0
+        or tail_log_id >= MAX_INT64
+        or inbound_log_id >= MAX_INT64
     ):
         return None
-    event_id = _next_proactive_event_id(chat_id, inbound_log_id, now)
+    event_id = _next_proactive_event_id(
+        chat_id,
+        {inbound_log_id, tail_log_id},
+        now,
+    )
     if not event_id:
         return None
     event = dict(source_event)
     event["event_id"] = event_id
     event["canonical_event_id"] = event_id
-    event["log_id"] = int(event_id.rsplit(":", 1)[-1])
+    event["log_id"] = tail_log_id
+    event["burst_tail_log_id"] = tail_log_id
+    event["burst_source_log_ids"] = [tail_log_id]
+    event["burst_message_count"] = 1
+    event["burst_policy_version"] = "same-author-contiguous-v1"
     event["sent_at"] = int(now)
     event["urls"] = [url]
     event["owner_id"] = os.environ.get(SUPERVISOR_OWNER_ENV, "").strip()
@@ -9277,7 +9596,9 @@ def worker_main() -> int:
                         style_profile, response_time = _load_proactive_vector_profiles()
                         sent_at = None
                         if isinstance(source, dict):
-                            raw_sent = source.get("inbound_silence_at")
+                            raw_sent = source.get("room_last_sent_at")
+                            if not isinstance(raw_sent, int) or isinstance(raw_sent, bool):
+                                raw_sent = source.get("inbound_silence_at")
                             if not isinstance(raw_sent, int) or isinstance(raw_sent, bool):
                                 raw_sent = source.get("sent_at")
                             if isinstance(raw_sent, int) and not isinstance(raw_sent, bool):
@@ -9435,9 +9756,103 @@ def main() -> int:
     return ack_return("accepted", fingerprint)
 
 
+def geeknews_operator_cli(arguments: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="bujamentor-auto-reply.py --geeknews")
+    parser.add_argument("--geeknews", action="store_true", required=True)
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--preview", action="store_true")
+    group.add_argument("--send", action="store_true")
+    parser.add_argument("--mark-slot", default="")
+    parser.add_argument("--bin", default=str(BIN))
+    parser.add_argument("--chat", default=CHAT)
+    parser.add_argument(
+        "--queue",
+        default=str(
+            Path.home()
+            / "Library/Application Support/openkakao/bujamentor/rooms/417780809780519/reply-queue.sqlite3"
+        ),
+    )
+    args = parser.parse_args(arguments)
+    global QUEUE
+    QUEUE = Path(args.queue)
+    digest = _next_geeknews_digest(persist_seen=False)
+    if digest is None:
+        print("no unseen GeekNews items", file=sys.stderr)
+        return 2
+    message = str(digest["message"])
+    ids = [int(item) for item in (digest.get("ids") or []) if isinstance(item, int)]
+    if args.preview:
+        print(message)
+        print(f"# ids={ids}", file=sys.stderr)
+        return 0
+    completed = subprocess.run(
+        [str(Path(args.bin)), "local-send", str(args.chat), message, "-y", "--json"],
+        check=False,
+    )
+    if completed.returncode != 0:
+        return completed.returncode or 1
+    confirm = subprocess.run(
+        [str(Path(args.bin)), "local-search", "GeekNews TOP5", "--json"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    confirmation_log_id = None
+    if confirm.returncode == 0 and confirm.stdout.strip():
+        try:
+            rows = json.loads(confirm.stdout)
+        except json.JSONDecodeError:
+            rows = []
+        if isinstance(rows, list):
+            for row in rows:
+                if (
+                    isinstance(row, dict)
+                    and row.get("is_self")
+                    and str(row.get("message") or "") == message
+                ):
+                    confirmation_log_id = row.get("log_id")
+                    break
+    if confirmation_log_id is None:
+        print("sent but not locally confirmed; cursor unchanged", file=sys.stderr)
+        return 3
+    seen = _load_geeknews_seen_ids()
+    seen.update(ids)
+    newest = max(seen) if seen else 0
+    _store_geeknews_seen_ids(seen, newest, mark_posted_slot=False)
+    if args.mark_slot:
+        cursor = _load_geeknews_cursor()
+        posted = cursor.get("posted_slots")
+        if not isinstance(posted, list):
+            posted = []
+        if args.mark_slot not in {str(item) for item in posted}:
+            cursor["posted_slots"] = [*(str(item) for item in posted[-31:]), args.mark_slot][-32:]
+            cursor["seen_ids"] = sorted(seen)[-200:]
+            cursor["newest_id"] = newest
+            cursor["updated_at"] = int(time.time())
+            path = _geeknews_cursor_path()
+            raw = json.dumps(cursor, ensure_ascii=False, separators=(",", ":")).encode()
+            fd, temporary = tempfile.mkstemp(prefix="geeknews-cursor.", dir=path.parent)
+            try:
+                os.fchmod(fd, QUEUE_FILE_MODE)
+                with os.fdopen(fd, "wb") as stream:
+                    stream.write(raw)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(temporary, path)
+            except OSError:
+                try:
+                    os.unlink(temporary)
+                except OSError:
+                    pass
+                raise
+    print(f"# confirmed log_id={confirmation_log_id} ids={ids}", file=sys.stderr)
+    return 0
+
 if __name__ == "__main__":
     if "--model-capacity-probe" in sys.argv[1:]:
         raise SystemExit(model_capacity_probe_cli(sys.argv[1:]))
+    if "--geeknews" in sys.argv[1:]:
+        raise SystemExit(geeknews_operator_cli(sys.argv[1:]))
     if "--worker" in sys.argv[1:]:
         raise SystemExit(worker_main())
     raise SystemExit(main())

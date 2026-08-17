@@ -1,5 +1,37 @@
 # Bujamentor launchd supervision
 
+**Do not use watch/health (`com.openkakao.bujamentor.watch` / `.health`) as a reply owner.** The current reply-owner layout is session-monitor only. `scripts/status-bujamentor-launchd.sh` is named after the old pair but is the **current** status probe and must print `service_kind=terminal_monitor`. `scripts/install-bujamentor-auto-reply-service.sh` is **non-current**.
+
+### Artifact status
+
+| Artifact | Status |
+|---|---|
+| `scripts/bujamentor-session-monitor.py` | **current** host |
+| `scripts/prepare-bujamentor-session-runtime.py` | **current** bake |
+| `scripts/bujamentor-auto-reply-service.py` | **current** Terminal session entry |
+| `scripts/bujamentor-supervisor.py` | **current** |
+| `scripts/bujamentor-db-watch.py` | **current** |
+| `scripts/bujamentor-auto-reply.py` | **current** |
+| `scripts/bujamentor_transition_journal.py` | **current** |
+| `scripts/bujamentor_ax_ui.py` | **current** |
+| `scripts/bujamentor_metrics.py` | **current** |
+| `scripts/bujamentor-tui.py` | **current** operator UI |
+| `scripts/uninstall-bujamentor-session-monitor.sh` | **current companion** |
+| `scripts/bujamentor-reply-schema.json` | **current** bake data asset |
+| `scripts/status-bujamentor-launchd.sh` | **current** despite the name; prints `service_kind=terminal_monitor` |
+| `scripts/status-bujamentor-auto-reply-service.sh` | **non-current** companion of the old direct installer |
+| `scripts/install-bujamentor-auto-reply-service.sh` | **non-current** |
+| `scripts/uninstall-bujamentor-auto-reply-service.sh` | **non-current** companion |
+| `scripts/install-bujamentor-launchd.sh` | **legacy** watch/health installer — not a reply owner |
+| `scripts/uninstall-bujamentor-launchd.sh` | **legacy** |
+| `scripts/doctor-bujamentor-launchd.sh` | **legacy-observation** |
+| `scripts/test-bujamentor-launchd-artifacts.sh` | **legacy test helper** |
+| `scripts/verify-launchd-watch.sh` | **legacy-watch-adjacent** |
+| `scripts/bujamentor-apple-watch.py` | **legacy-observation**; not a reply owner |
+| `src/bin/openkakao-bujamentor-health.rs` | **legacy-observation** binary; keep; not a reply owner |
+| `src/bujamentor_service.rs` LaunchAgent labels | **legacy identity** |
+| `src/bujamentor_service.rs` status/log/hook helpers | **current shared** (`ax-watch`, health binary) |
+
 This runbook covers two distinct layouts. The current layout restores the
 database-authoritative foreground CLI inside the logged-in user's Aqua session
 through Terminal. A per-user LaunchAgent owns only a small, Kakao-blind monitor;
@@ -18,7 +50,7 @@ an immutable mode-`0500` `.command`, checks the session-watchdog owner lock, and
 only when the lock is free requests this exact command with:
 
 ```text
-/usr/bin/open -g -j -b com.apple.Terminal <pinned-command>
+/usr/bin/open -g -j --hide -b com.apple.Terminal <pinned-command>
 ```
 
 The monitor does not read the KakaoTalk database, call Accessibility or System

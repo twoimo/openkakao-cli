@@ -1293,7 +1293,14 @@ def save_state(
     except (TypeError, ValueError):
         epoch = 0
     STATE.parent.mkdir(parents=True, exist_ok=True)
-    generation_guard = nullcontext() if _generation_lock_held else _generation_lock()
+    # Heartbeats and ordinary poll persistence serialize on the state-file
+    # lock only. The generation lock is reserved for owner/epoch/candidate
+    # transitions so a final local-send is not starved every second.
+    generation_guard = (
+        nullcontext()
+        if _generation_lock_held or _require_ready is False
+        else _generation_lock()
+    )
     with generation_guard:
         if owner:
             if not 0 < epoch < MAX_INT64:

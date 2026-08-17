@@ -64,17 +64,25 @@ class SessionMonitorTests(unittest.TestCase):
                 module.run_once(manifest, state, now_ns=1_000_000_000_000, runner=runner),
                 0,
             )
+            self.assertGreaterEqual(len(calls), 1)
             self.assertEqual(
                 calls[0][0],
                 [
                     "/usr/bin/open",
                     "-g",
                     "-j",
+                    "--hide",
                     "-b",
                     "com.apple.Terminal",
                     str(command),
                 ],
             )
+            if len(calls) > 1:
+                self.assertEqual(calls[1][0][:2], ["/usr/bin/osascript", "-e"])
+                self.assertIn("start-bujamentor-session.command", calls[1][0][2])
+                self.assertIn("close w saving no", calls[1][0][2])
+                self.assertIn("busy of w", calls[1][0][2])
+                self.assertNotIn("visible of process", calls[1][0][2])
             self.assertIs(calls[0][1]["stdin"], subprocess.DEVNULL)
             self.assertEqual(calls[0][1]["timeout"], module.OPEN_TIMEOUT_SECONDS)
             self.assertEqual(
