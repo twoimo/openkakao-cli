@@ -2741,9 +2741,9 @@ mod stub {
 
 #[cfg(not(target_os = "macos"))]
 pub use stub::{
-    preflight_bound_via_ax, read_open_exact_via_ax, read_via_ax, scrape_chat_list,
-    scrape_chat_list_for_service, scrape_chat_list_for_service_isolated, send_bound_via_ax,
-    send_via_ax, ChatListRow,
+    delete_via_ax, preflight_bound_via_ax, read_open_exact_via_ax, read_via_ax, reply_via_ax,
+    scrape_chat_list, scrape_chat_list_for_service, scrape_chat_list_for_service_isolated,
+    send_bound_via_ax, send_via_ax, ChatListRow,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
