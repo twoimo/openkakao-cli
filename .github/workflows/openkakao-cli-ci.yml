@@ -58,14 +58,14 @@ jobs:
       - name: Cargo test
         run: cargo test --manifest-path $MANIFEST
 
-      - name: Fake-only Python Bujamentor tests
+      - name: Fake-only Python AutoReply tests
         run: >-
           python3 -m unittest
-          tests.test_bujamentor_cli_runtime
-          tests.test_bujamentor_service_entry
-          tests.test_bujamentor_session_monitor
-          tests.test_bujamentor_session_packager
-          tests.test_bujamentor_tui
+          tests.test_auto_reply_cli_runtime
+          tests.test_auto_reply_service_entry
+          tests.test_auto_reply_session_monitor
+          tests.test_auto_reply_session_packager
+          tests.test_auto_reply_tui
 
   lint:
     runs-on: ubuntu-latest
@@ -99,16 +99,16 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Launchd artifact harness
-        run: sh scripts/test-bujamentor-launchd-artifacts.sh
+        run: sh scripts/test-auto-reply-launchd-artifacts.sh
 
-      - name: Fake-only Python Bujamentor tests
+      - name: Fake-only Python AutoReply tests
         run: >-
           python3 -m unittest
-          tests.test_bujamentor_cli_runtime
-          tests.test_bujamentor_service_entry
-          tests.test_bujamentor_session_monitor
-          tests.test_bujamentor_session_packager
-          tests.test_bujamentor_tui
+          tests.test_auto_reply_cli_runtime
+          tests.test_auto_reply_service_entry
+          tests.test_auto_reply_session_monitor
+          tests.test_auto_reply_session_packager
+          tests.test_auto_reply_tui
 
   macos:
     runs-on: macos-14
@@ -134,7 +134,7 @@ jobs:
         run: cargo test --manifest-path $MANIFEST
 
       - name: Launchd artifact harness
-        run: sh scripts/test-bujamentor-launchd-artifacts.sh
+        run: sh scripts/test-auto-reply-launchd-artifacts.sh
 
       - name: Build release
         run: cargo build --release --manifest-path $MANIFEST

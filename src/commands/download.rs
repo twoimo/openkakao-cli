@@ -338,7 +338,7 @@ pub fn cmd_download(
                 let dir = if output_dir
                     .file_name()
                     .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.starts_with("bujamentor-db-media-"))
+                    .is_some_and(|name| name.starts_with("auto-reply-db-media-"))
                 {
                     output_dir.to_path_buf()
                 } else {

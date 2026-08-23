@@ -5,7 +5,7 @@ openkakao-cli is designed for AI agent integration. All commands support `--json
 ## Safety Model
 
 LOCO write operations (send, delete, edit, react) are **disabled by default** to prevent account bans.
-Documented product send is AX `local-send` (`allow_ax_send` + `allowed_send_chats`). `local-delete` is AX `모두에게서 삭제`, not LOCO. LOCO `send`/`delete`/`edit`/`react`/`mark-read` stay research-quarantined behind `allow_loco_write`. Supported realtime watch is `ax-watch`, not LOCO `watch`. Context/style search is 최연우-persona adjunct. GeekNews uses the official Atom feed, three KST slots, TOP5 numbered after a blank line, and persists seen/slots only after a confirmed send. Session-monitor is the only unattended host; never hide the user's existing Terminal.
+Documented product send is AX `local-send` (`allow_ax_send` + `allowed_send_chats`). `local-delete` is AX `모두에게서 삭제`, not LOCO. LOCO `send`/`delete`/`edit`/`react`/`mark-read` stay research-quarantined behind `allow_loco_write`. Supported realtime watch is `ax-watch`, not LOCO `watch`. Context/style search is 최연우-persona adjunct. GeekNews uses the official Atom feed, three KST slots, TOP5 numbered after a blank line with blank lines between items, and persists seen/slots only after a confirmed send. Session-monitor is the only unattended host; never hide the user's existing Terminal.
 
 ### Safe commands (always available, no server contact)
 
@@ -57,6 +57,10 @@ openkakao-cli auto-reply --chat 'name:부자멘토멘티' --chat id:123456789
 # For an unnamed local group-room row, attest the already-open exact AX window:
 openkakao-cli auto-reply --chat 'bind:417780809780519:부자멘토멘티' --check --json
 ```
+# Unattended host (Kakao-blind monitor only; never owns AX send)
+openkakao-cli auto-reply-host --status --json
+openkakao-cli auto-reply-host --bake --json
+openkakao-cli auto-reply-host --tick --manifest <runtime>/session-monitor-manifest.json --state-root "$HOME/Library/Application Support/openkakao/auto-reply"
 
 `--chat` may be repeated or contain comma-separated exact `id:`/`name:`
 selectors. The command is foreground-only and `Ctrl-C` stops its owned

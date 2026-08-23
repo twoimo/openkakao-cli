@@ -18,7 +18,7 @@ use crate::commands::watch::{
     watch_hook_matches, WatchHookConfig, WatchMessageEvent, WebhookFormat,
 };
 use crate::util::require_permission;
-use openkakao_cli::bujamentor_service::{
+use openkakao_cli::auto_reply_service::{
     append_log_record, run_direct_service_hook, validate_hook_program_path,
     validate_watch_runtime_paths, watch_log_record, write_config_invalid_status, write_status,
     ClosedReason, DirectHookLimiter, DirectServiceHookError, LogEvent, ServiceHookEvent,
@@ -655,7 +655,7 @@ mod tests {
 
         assert_eq!(
             loop_state.status.state,
-            openkakao_cli::bujamentor_service::WatchState::Healthy
+            openkakao_cli::auto_reply_service::WatchState::Healthy
         );
         assert_eq!(loop_state.status.poll_count, 1);
         assert_eq!(loop_state.status.hook_success_count, 0);
@@ -713,7 +713,7 @@ mod tests {
 
         assert_eq!(
             loop_state.status.state,
-            openkakao_cli::bujamentor_service::WatchState::Healthy
+            openkakao_cli::auto_reply_service::WatchState::Healthy
         );
         assert_eq!(loop_state.status.hook_success_count, 0);
         assert_eq!(loop_state.status.hook_failure_count, 0);
@@ -759,7 +759,7 @@ mod tests {
         assert_eq!(persisted.failure, Some(ClosedReason::LoggerFailed));
         assert_eq!(
             persisted.state,
-            openkakao_cli::bujamentor_service::WatchState::Degraded
+            openkakao_cli::auto_reply_service::WatchState::Degraded
         );
     }
 }

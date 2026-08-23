@@ -4,18 +4,18 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 
 use crate::ax_send;
-use crate::local_db::{LocalDbReader, LocalPollEnvelope, LOCAL_POLL_SCHEMA_VERSION};
+use crate::local_db::{LocalDbReader, LocalMessage, LocalPollEnvelope, LOCAL_POLL_SCHEMA_VERSION};
 use crate::util::{confirm, normalize_outgoing_message, truncate, validate_outbound_message};
 use openkakao_cli::reply_policy::validate_auto_reply_laughter;
 
-const WORKER_LOCAL_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(15);
+const WORKER_LOCAL_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(3);
 const WORKER_LOCAL_CONFIRMATION_INTERVAL: Duration = Duration::from_millis(250);
-const WORKER_LOCAL_CONFIRMATION_ROW_LIMIT: usize = 2;
+const WORKER_LOCAL_CONFIRMATION_ROW_LIMIT: usize = 8;
 
 pub struct BoundLocalSend {
     pub chat_id: i64,
     pub expected_source_log_id: i64,
-    pub local_tail: Vec<String>,
+    pub local_tail: Vec<crate::ax_send::BindingToken>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,13 +30,13 @@ pub struct LocalSendOptions {
     pub message: String,
     pub skip_confirm: bool,
     pub dry_run: bool,
-    /// Read-only Bujamentor worker probe. The main CLI only permits this when
+    /// Read-only AutoReply worker probe. The main CLI only permits this when
     /// the worker identity and database-authoritative binding have passed.
     pub preflight: bool,
     pub json: bool,
     /// Visible message text to quote via the KakaoTalk context-menu 답장 item.
     pub reply_to: Option<String>,
-    /// Present only for the database-authoritative Bujamentor worker. The AX
+    /// Present only for the database-authoritative AutoReply worker. The AX
     /// layer must bind this numeric chat ID's current local transcript to the
     /// exact open window before it may touch the composer.
     pub bound_chat: Option<BoundLocalSend>,
@@ -73,9 +73,6 @@ fn classify_worker_local_confirmation(
             && completeness.last_log_id.is_none()
             && completeness.available_max_log_id.is_none()
             && completeness.proof == "sqlite_snapshot_rowset";
-        // NTChatRoom.lastLogId may become visible just before its corresponding
-        // NTChatMessage row. This is the only incomplete shape that is safe to
-        // retry: it contains no competing or mismatched row to overlook.
         let narrow_snapshot_race = completeness.status == "gap"
             && completeness.has_gap
             && !completeness.has_more
@@ -93,33 +90,33 @@ fn classify_worker_local_confirmation(
         };
     }
 
-    if envelope.messages.len() != 1
-        || completeness.status != "complete"
-        || completeness.has_gap
-        || completeness.has_more
-        || completeness.row_count != 1
-        || completeness.returned_count != 1
-        || completeness.proof != "sqlite_snapshot_rowset"
+    let expected = normalize_outgoing_message(expected_message);
+    if expected.trim().is_empty() {
+        return LocalConfirmationObservation::Rejected;
+    }
+    let matches: Vec<&LocalMessage> = envelope
+        .messages
+        .iter()
+        .filter(|row| {
+            row.chat_id == expected_chat_id
+                && row.log_id > expected_source_log_id
+                && row.is_self
+                && row.message_type == 1
+                && normalize_outgoing_message(&row.message) == expected
+        })
+        .collect();
+    if matches.len() == 1 {
+        return LocalConfirmationObservation::Confirmed(matches[0].log_id);
+    }
+    if matches.len() > 1
+        || envelope
+            .messages
+            .iter()
+            .any(|row| row.is_self && row.log_id > expected_source_log_id)
     {
         return LocalConfirmationObservation::Rejected;
     }
-
-    let row = &envelope.messages[0];
-    let complete_exact_row = !expected_message.trim().is_empty()
-        && row.chat_id == expected_chat_id
-        && row.log_id > expected_source_log_id
-        && row.is_self
-        && row.message_type == 1
-        && completeness.first_log_id == Some(row.log_id)
-        && completeness.last_log_id == Some(row.log_id)
-        && completeness.available_max_log_id == Some(row.log_id)
-        && completeness.chat_last_log_id == row.log_id
-        && normalize_outgoing_message(&row.message) == normalize_outgoing_message(expected_message);
-    if complete_exact_row {
-        LocalConfirmationObservation::Confirmed(row.log_id)
-    } else {
-        LocalConfirmationObservation::Rejected
-    }
+    LocalConfirmationObservation::Pending
 }
 
 /// After AX has posted its one and only Return, wait briefly for a durable,
@@ -203,13 +200,24 @@ fn local_send_result_json(
 }
 
 fn pre_send_unavailable_result_json(chat_name: &str) -> serde_json::Value {
-    serde_json::json!({
+    pre_send_unavailable_result_json_with_reason(chat_name, None)
+}
+
+fn pre_send_unavailable_result_json_with_reason(
+    chat_name: &str,
+    reason: Option<&str>,
+) -> serde_json::Value {
+    let mut value = serde_json::json!({
         "chat_name": chat_name,
         "status": "pre_send_unavailable",
         "mutation_started": false,
         "confirmed": false,
         "network": false,
-    })
+    });
+    if let Some(reason) = reason {
+        value["reason"] = serde_json::Value::String(reason.to_string());
+    }
+    value
 }
 
 pub fn emit_pre_send_unavailable(chat_name: &str, json: bool) -> Result<()> {
@@ -220,7 +228,13 @@ pub fn emit_pre_send_unavailable(chat_name: &str, json: bool) -> Result<()> {
     }
     Ok(())
 }
-pub fn cmd_local_delete(chat_name: &str, source: &str, skip_confirm: bool, dry_run: bool, json: bool) -> Result<()> {
+pub fn cmd_local_delete(
+    chat_name: &str,
+    source: &str,
+    skip_confirm: bool,
+    dry_run: bool,
+    json: bool,
+) -> Result<()> {
     let source = source.trim();
     if source.is_empty() {
         anyhow::bail!("delete selector must not be empty");
@@ -268,7 +282,7 @@ fn require_pre_mutation_failure(failure: ax_send::BoundSendFailure) -> Result<()
 
 /// Send a message via AX automation (drives the real KakaoTalk window) without
 /// a LOCO/REST session. Interactive sends remain AX-only. A database-bound
-/// Bujamentor worker additionally requires exact local transcript attestation
+/// AutoReply worker additionally requires exact local transcript attestation
 /// before mutation and exact local outgoing-row confirmation after Return.
 pub fn cmd_local_send(opts: LocalSendOptions) -> Result<()> {
     let LocalSendOptions {
@@ -299,7 +313,11 @@ pub fn cmd_local_send(opts: LocalSendOptions) -> Result<()> {
     if dry_run {
         eprintln!(
             "[dry-run] Would AX-{} to chat \"{}\": \"{}\"",
-            if reply_to.is_some() { "quote-reply" } else { "send" },
+            if reply_to.is_some() {
+                "quote-reply"
+            } else {
+                "send"
+            },
             chat_name,
             truncate(&message, 80)
         );
@@ -317,10 +335,29 @@ pub fn cmd_local_send(opts: LocalSendOptions) -> Result<()> {
     if preflight {
         let bound = bound_chat.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
-                "local-send --preflight is only available to the database-authoritative Bujamentor worker"
+                "local-send --preflight is only available to the database-authoritative AutoReply worker"
             )
         })?;
-        ax_send::preflight_bound_via_ax(chat_name, bound.chat_id, &bound.local_tail)?;
+        match ax_send::preflight_bound_via_ax(chat_name, bound.chat_id, &bound.local_tail) {
+            Ok(()) => {}
+            Err(error) => {
+                let message = error.to_string();
+                if message.contains("composer is not empty")
+                    || message.contains("composer changed during preflight")
+                {
+                    if json {
+                        crate::util::output_json(&pre_send_unavailable_result_json_with_reason(
+                            chat_name,
+                            Some("composer_occupied"),
+                        ))?;
+                    } else {
+                        println!("AX send preflight unavailable; composer occupied.");
+                    }
+                    return Ok(());
+                }
+                return Err(error);
+            }
+        }
         if json {
             crate::util::output_json(&serde_json::json!({
                 "chat_name": chat_name,
@@ -349,7 +386,13 @@ pub fn cmd_local_send(opts: LocalSendOptions) -> Result<()> {
 
     let worker_bound = bound_chat.is_some();
     let confirmation_log_id = if let Some(bound) = bound_chat {
-        match ax_send::send_bound_via_ax(chat_name, bound.chat_id, &message, &bound.local_tail) {
+        // Bound worker sends must not spend the 6s context-menu walk first.
+        // A failed 답장 arm leaves Kakao menus/composer in a bad state and
+        // then the fallback bound send also fails. Quote-reply stays for
+        // unbound interactive local-send.
+        let send_result =
+            ax_send::send_bound_via_ax(chat_name, bound.chat_id, &message, &bound.local_tail);
+        match send_result {
             Ok(()) => {}
             Err(failure) => {
                 require_pre_mutation_failure(failure)?;
@@ -493,7 +536,7 @@ mod tests {
             bound_chat: worker_bound.then(|| BoundLocalSend {
                 chat_id: CHAT_ID,
                 expected_source_log_id: SOURCE_LOG_ID,
-                local_tail: vec!["source".to_string()],
+                local_tail: vec![crate::ax_send::BindingToken::from("source".to_string())],
             }),
             reply_to: None,
         };
@@ -532,7 +575,7 @@ mod tests {
         );
         assert_eq!(
             classify_worker_local_confirmation(&incoming, CHAT_ID, SOURCE_LOG_ID, "reply"),
-            LocalConfirmationObservation::Rejected
+            LocalConfirmationObservation::Pending
         );
 
         let wrong_body = page(
@@ -548,10 +591,10 @@ mod tests {
             LocalConfirmationObservation::Rejected
         );
 
-        let ambiguous = page(
+        let later_inbound = page(
             vec![
                 message(REPLY_LOG_ID, true, "reply"),
-                message(REPLY_LOG_ID + 1, false, "concurrent"),
+                message(REPLY_LOG_ID + 1, false, "already wrote it"),
             ],
             "complete",
             REPLY_LOG_ID + 1,
@@ -560,8 +603,8 @@ mod tests {
             false,
         );
         assert_eq!(
-            classify_worker_local_confirmation(&ambiguous, CHAT_ID, SOURCE_LOG_ID, "reply"),
-            LocalConfirmationObservation::Rejected
+            classify_worker_local_confirmation(&later_inbound, CHAT_ID, SOURCE_LOG_ID, "reply"),
+            LocalConfirmationObservation::Confirmed(REPLY_LOG_ID)
         );
     }
 

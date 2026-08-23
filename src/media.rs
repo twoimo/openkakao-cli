@@ -195,6 +195,17 @@ fn normalized_media_type(value: &str) -> Option<&'static str> {
     }
 }
 
+fn still_raster_media_type(value: &str) -> bool {
+    matches!(value, "jpeg" | "png" | "webp")
+}
+
+fn attachment_media_type_accepts_payload(expected: &str, actual: &str) -> bool {
+    // Kakao Talk CDN often serves PNG or WebP bytes while the local DB row
+    // still says `mt=image/jpg` and a `.jpg` key. Trust the decoded payload
+    // when both sides are still rasters this pipeline already allows.
+    expected == actual || (still_raster_media_type(expected) && still_raster_media_type(actual))
+}
+
 fn locator_extension_media_type(value: &str) -> Option<&'static str> {
     let path = reqwest::Url::parse(value)
         .ok()
@@ -1055,7 +1066,7 @@ pub fn normalize_downloaded_image(
     if source
         .expected_media_type
         .as_deref()
-        .is_some_and(|expected| expected != media_type)
+        .is_some_and(|expected| !attachment_media_type_accepts_payload(expected, media_type))
     {
         anyhow::bail!("Downloaded image media type does not match its attachment");
     }
@@ -1432,6 +1443,21 @@ mod tests {
         let encoded = encoded.into_inner();
         assert!(encoded.starts_with(&JPEG_START_OF_IMAGE));
         assert!(encoded.ends_with(&JPEG_END_OF_IMAGE));
+        encoded
+    }
+
+    fn encoded_test_png(width: u32, height: u32) -> Vec<u8> {
+        let original = image::DynamicImage::ImageRgba8(image::ImageBuffer::from_pixel(
+            width,
+            height,
+            image::Rgba([12, 34, 56, 255]),
+        ));
+        let mut encoded = Cursor::new(Vec::new());
+        original
+            .write_to(&mut encoded, image::ImageFormat::Png)
+            .unwrap();
+        let encoded = encoded.into_inner();
+        assert!(encoded.starts_with(b"\x89PNG\r\n\x1a\n"));
         encoded
     }
 
@@ -1825,6 +1851,62 @@ mod tests {
         assert_eq!(
             manifest,
             validate_normalized_image(&normalized_path).unwrap()
+        );
+    }
+
+    #[test]
+    fn attachment_accepts_kakao_jpg_label_for_still_raster_payloads() {
+        assert!(attachment_media_type_accepts_payload("jpeg", "png"));
+        assert!(attachment_media_type_accepts_payload("jpeg", "webp"));
+        assert!(attachment_media_type_accepts_payload("png", "jpeg"));
+        assert!(attachment_media_type_accepts_payload("jpeg", "jpeg"));
+        assert!(!attachment_media_type_accepts_payload("jpeg", "gif"));
+        assert!(!attachment_media_type_accepts_payload("gif", "png"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kakao_jpg_attachment_normalizes_png_payload() {
+        let directory = tempfile::tempdir().unwrap();
+        let source_path = directory.path().join("source.download");
+        let normalized_path = directory.path().join("normalized.part");
+        let encoded = encoded_test_png(2_000, 1_000);
+        write_private_test_image(&source_path, &encoded);
+        let source = ImageDownloadSource {
+            url: "https://talk.kakaocdn.net/dna/photo.jpg".to_string(),
+            requires_credentials: false,
+            declared_size: Some(encoded.len() as u64),
+            declared_width: Some(2_000),
+            declared_height: Some(1_000),
+            expected_media_type: Some("jpeg".to_string()),
+        };
+        let manifest = normalize_downloaded_image(&source_path, &normalized_path, 2, &source)
+            .expect("Kakao jpg-labeled PNG payload should normalize");
+        assert_eq!(manifest.media_type, "png");
+        assert_eq!((manifest.width, manifest.height), (1_024, 512));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kakao_jpg_attachment_still_rejects_png_with_wrong_dimensions() {
+        let directory = tempfile::tempdir().unwrap();
+        let source_path = directory.path().join("source.download");
+        let normalized_path = directory.path().join("normalized.part");
+        let encoded = encoded_test_png(32, 24);
+        write_private_test_image(&source_path, &encoded);
+        let source = ImageDownloadSource {
+            url: "https://talk.kakaocdn.net/dna/photo.jpg".to_string(),
+            requires_credentials: false,
+            declared_size: Some(encoded.len() as u64),
+            declared_width: Some(1440),
+            declared_height: Some(1440),
+            expected_media_type: Some("jpeg".to_string()),
+        };
+        let error = normalize_downloaded_image(&source_path, &normalized_path, 2, &source)
+            .expect_err("dimension mismatch must stay fatal");
+        assert_eq!(
+            error.to_string(),
+            "Downloaded image does not match its declared dimensions"
         );
     }
 

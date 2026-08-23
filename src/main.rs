@@ -1,7 +1,7 @@
 mod auth;
 mod auth_flow;
 mod ax_send;
-mod bujamentor_host;
+mod auto_reply_runtime;
 mod commands;
 mod config;
 mod credentials;
@@ -16,6 +16,7 @@ mod model;
 mod rest;
 mod state;
 mod util;
+mod room_catalog;
 
 use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
@@ -43,7 +44,7 @@ use crate::commands::read::ReadCommandOptions;
 use crate::commands::watch::{WatchOptions, WebhookFormat};
 use crate::config::load_config;
 use crate::util::{format_outgoing_message, NO_COLOR, VERSION};
-use openkakao_cli::bujamentor_service;
+use openkakao_cli::auto_reply_service;
 
 const SELF_CLASSIFICATION_GRACE_SECONDS: i64 = 180;
 const SELF_CLASSIFICATION_RETRY_MAX_SECONDS: i64 = 5;
@@ -254,7 +255,7 @@ fn validate_service_bootstrap_paths(command: &Commands) -> Result<Option<&std::p
             log_path: Some(log_path),
             ..
         } => {
-            bujamentor_service::validate_watch_runtime_paths(
+            auto_reply_service::validate_watch_runtime_paths(
                 std::path::Path::new(status_path),
                 std::path::Path::new(log_path),
             )?;
@@ -803,6 +804,8 @@ enum Commands {
     LocalChats {
         #[arg(short = 'n', long, default_value_t = 50)]
         limit: usize,
+        #[arg(long, help = "List KakaoTalk group chat titles only")]
+        groups: bool,
     },
     /// Read messages from local KakaoTalk database (no server contact, safe)
     LocalRead {
@@ -827,6 +830,8 @@ enum Commands {
         query: String,
         #[arg(short = 'n', long, default_value_t = 20)]
         count: usize,
+        #[arg(long = "chat-id", value_parser = parse_local_poll_chat_id)]
+        chat_id: Option<i64>,
     },
     /// Show local KakaoTalk database schema
     LocalSchema,
@@ -848,6 +853,9 @@ enum Commands {
         chat: String,
         #[arg(long)]
         db: Option<String>,
+        /// Index only 최연우 interest topics (stocks/coins/investing/real estate/auction/business/AI).
+        #[arg(long = "interest-only")]
+        interest_only: bool,
     },
     /// Search the local per-chat context index without network access
     ContextSearch {
@@ -1038,6 +1046,25 @@ enum Commands {
         #[arg(long = "model")]
         model: Option<String>,
     },
+    /// Stage or inspect the Kakao-blind session-monitor host. Never owns AX send.
+    AutoReplyHost {
+        #[arg(long)]
+        bake: bool,
+        #[arg(long)]
+        status: bool,
+        #[arg(long)]
+        disable: bool,
+        /// Kakao-blind LaunchAgent tick. Opens Terminal only; never owns AX.
+        #[arg(long)]
+        tick: bool,
+        /// Exact chat selectors used only when baking a new immutable runtime.
+        #[arg(long = "chat")]
+        chat: Vec<String>,
+        #[arg(long, hide = true)]
+        manifest: Option<std::path::PathBuf>,
+        #[arg(long = "state-root", hide = true)]
+        state_root: Option<std::path::PathBuf>,
+    },
     /// Run diagnostic checks on KakaoTalk installation and connectivity
     Doctor {
         /// Also test LOCO booking connectivity (makes network request)
@@ -1068,17 +1095,18 @@ fn is_local_only_command(command: &Commands) -> bool {
             | Commands::AxRead { .. }
             | Commands::AxWatch { .. }
             | Commands::AutoReply { .. }
+            | Commands::AutoReplyHost { .. }
     )
 }
 
 static AUTO_REPLY_STOP: AtomicBool = AtomicBool::new(false);
 static AUTO_REPLY_GUARDIAN_LOST: AtomicBool = AtomicBool::new(false);
-const BUJAMENTOR_PYTHON_ISOLATION_ARGS: [&str; 3] = ["-E", "-B", "-S"];
-const BUJAMENTOR_ENROLLMENT_SCHEMA_VERSION: i64 = 4;
-const BUJAMENTOR_CURSOR_AUTHORITY_SCHEMA_VERSION: i64 = 1;
-const BUJAMENTOR_CURSOR_FRESH_KIND: &str = "fresh_attested_tail";
-const BUJAMENTOR_CURSOR_REPLAY_KIND: &str = "stopped_clean_ack_replay";
-const BUJAMENTOR_CURSOR_LEFTOVER_KIND: &str = "fenced_leftover_ack_resume";
+const AUTO_REPLY_PYTHON_ISOLATION_ARGS: [&str; 3] = ["-E", "-B", "-S"];
+const AUTO_REPLY_ENROLLMENT_SCHEMA_VERSION: i64 = 4;
+const AUTO_REPLY_CURSOR_AUTHORITY_SCHEMA_VERSION: i64 = 1;
+const AUTO_REPLY_CURSOR_FRESH_KIND: &str = "fresh_attested_tail";
+const AUTO_REPLY_CURSOR_REPLAY_KIND: &str = "stopped_clean_ack_replay";
+const AUTO_REPLY_CURSOR_LEFTOVER_KIND: &str = "fenced_leftover_ack_resume";
 const AUTO_REPLY_GUARDIAN_LIVENESS_ENV: &str = "OPENKAKAO_SESSION_GUARDIAN_LIVENESS_FD";
 
 extern "C" fn handle_auto_reply_signal(_: i32) {
@@ -1190,17 +1218,30 @@ fn start_auto_reply_guardian_liveness_monitor(
 fn auto_reply_selector_values(
     config: &config::OpenKakaoConfig,
     cli_values: Vec<String>,
+    chats: &[local_db::LocalChat],
+    state_root: &Path,
+    group_titles: &[(i64, String)],
 ) -> Result<Vec<String>> {
-    let configured = config.bujamentor.chats.clone();
+    let configured = config.auto_reply.chats.clone();
+    let catalog_ids = room_catalog::catalog_auto_reply_chat_ids(state_root)?;
     let values = if cli_values.is_empty() {
-        configured
+        room_catalog::merge_configured_and_catalog_selectors_named(
+            &configured,
+            &catalog_ids,
+            chats,
+            group_titles,
+        )?
     } else {
-        expand_plain_chat_names_with_configured_bindings(cli_values, &configured)
+        let expanded = expand_plain_chat_names_with_configured_bindings(cli_values, &configured);
+        room_catalog::merge_configured_and_catalog_selectors_named(
+            &expanded,
+            &catalog_ids,
+            chats,
+            group_titles,
+        )?
     };
     if values.is_empty() {
-        anyhow::bail!(
-            "no chat selected; pass --chat 부자멘토멘티 or configure [bujamentor].chats"
-        );
+        anyhow::bail!("no chat selected; pass --chat 부자멘토멘티, configure [auto_reply].chats, or enable a menubar room");
     }
     Ok(values)
 }
@@ -1239,10 +1280,10 @@ fn expand_plain_chat_names_with_configured_bindings(
         .collect()
 }
 
-fn resolve_bujamentor_supervisor(binary: &Path) -> Result<(PathBuf, PathBuf)> {
+fn resolve_auto_reply_supervisor(binary: &Path) -> Result<(PathBuf, PathBuf)> {
     let mut candidates = Vec::new();
     if let Some(runtime_root) =
-        std::env::var_os("OPENKAKAO_BUJAMENTOR_RUNTIME_ROOT").filter(|value| !value.is_empty())
+        std::env::var_os("OPENKAKAO_AUTO_REPLY_RUNTIME_ROOT").filter(|value| !value.is_empty())
     {
         candidates.push(PathBuf::from(runtime_root).join("scripts"));
     }
@@ -1262,15 +1303,15 @@ fn resolve_bujamentor_supervisor(binary: &Path) -> Result<(PathBuf, PathBuf)> {
         if !scripts_metadata.is_dir() || scripts_metadata.file_type().is_symlink() {
             continue;
         }
-        let supervisor = scripts_root.join("bujamentor-supervisor.py");
+        let supervisor = scripts_root.join("auto-reply-supervisor.py");
         let runtime_files = [
-            "bujamentor-supervisor.py",
-            "bujamentor-db-watch.py",
-            "bujamentor-auto-reply.py",
-            "bujamentor-apple-watch.py",
-            "bujamentor_ax_ui.py",
-            "bujamentor_metrics.py",
-            "bujamentor-reply-schema.json",
+            "auto-reply-supervisor.py",
+            "auto-reply-db-watch.py",
+            "auto-reply-worker.py",
+            "auto-reply-apple-watch.py",
+            "auto_reply_ax_ui.py",
+            "auto_reply_metrics.py",
+            "auto-reply-schema.json",
         ];
         let trusted = runtime_files.iter().all(|name| {
             let path = scripts_root.join(name);
@@ -1298,11 +1339,11 @@ fn resolve_bujamentor_supervisor(binary: &Path) -> Result<(PathBuf, PathBuf)> {
         }
     }
     anyhow::bail!(
-        "Bujamentor runtime assets are missing; expected bujamentor-supervisor.py beside the binary or in the packaged scripts directory"
+        "AutoReply runtime assets are missing; expected auto-reply-supervisor.py beside the binary or in the packaged scripts directory"
     )
 }
 
-fn validate_bujamentor_executable(
+fn validate_auto_reply_executable(
     value: Option<&str>,
     label: &str,
     default_name: &str,
@@ -1399,7 +1440,7 @@ fn is_homebrew_cellar_version_path(path: &Path) -> bool {
 }
 
 #[derive(Debug, Clone)]
-struct BujamentorRunner {
+struct AutoReplyRunner {
     path: String,
     kind: String,
     model: String,
@@ -1411,20 +1452,24 @@ struct BujamentorRunner {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AutoReplyLlmChoice {
-    GjcGemini36Flash,
+    GjcGemini37Flash,
     CodexGpt56Luna,
 }
 
 impl AutoReplyLlmChoice {
     fn all() -> [Self; 2] {
-        [Self::GjcGemini36Flash, Self::CodexGpt56Luna]
+        [Self::GjcGemini37Flash, Self::CodexGpt56Luna]
     }
 
     fn from_model(model: &str) -> Option<Self> {
         match model.trim() {
-            "google-antigravity/gemini-3.6-flash-tiered" | "gjc" | "gemini" | "gemini-3.6-flash" => {
-                Some(Self::GjcGemini36Flash)
-            }
+            "google-antigravity/gemini-3.7-flash-high"
+            | "google-antigravity/gemini-3.7-flash-tiered"
+            | "google-antigravity/gemini-3.6-flash-tiered"
+            | "gjc"
+            | "gemini"
+            | "gemini-3.7-flash"
+            | "gemini-3.6-flash" => Some(Self::GjcGemini37Flash),
             "gpt-5.6-luna" | "codex" | "luna" => Some(Self::CodexGpt56Luna),
             _ => None,
         }
@@ -1432,34 +1477,34 @@ impl AutoReplyLlmChoice {
 
     fn label(self) -> &'static str {
         match self {
-            Self::GjcGemini36Flash => "Gajae-Code Gemini 3.6 Flash (tiered)",
+            Self::GjcGemini37Flash => "Gajae-Code Gemini 3.7 Flash (high)",
             Self::CodexGpt56Luna => "Codex GPT-5.6 Luna",
         }
     }
 
     fn model(self) -> &'static str {
         match self {
-            Self::GjcGemini36Flash => "google-antigravity/gemini-3.6-flash-tiered",
+            Self::GjcGemini37Flash => "google-antigravity/gemini-3.7-flash-tiered",
             Self::CodexGpt56Luna => "gpt-5.6-luna",
         }
     }
 
     fn apply(self, config: &mut config::OpenKakaoConfig) {
         match self {
-            Self::GjcGemini36Flash => {
+            Self::GjcGemini37Flash => {
                 config.model.privacy_mode = Some("remote_explicit".into());
                 config.model.allow_egress = true;
                 config.model.provider = Some("google-antigravity".into());
                 config.model.retention = Some("provider-policy".into());
-                config.bujamentor.reply_runner_kind = Some("gjc".into());
-                config.bujamentor.reply_model = Some(self.model().into());
-                config.bujamentor.reply_reasoning_effort = Some("medium".into());
-                config.bujamentor.reply_service_tier = Some("default".into());
-                if config.bujamentor.reply_runner.is_none() {
+                config.auto_reply.reply_runner_kind = Some("gjc".into());
+                config.auto_reply.reply_model = Some(self.model().into());
+                config.auto_reply.reply_reasoning_effort = Some("high".into());
+                config.auto_reply.reply_service_tier = Some("default".into());
+                if config.auto_reply.reply_runner.is_none() {
                     if let Some(home) = dirs::home_dir() {
                         let wrapper = home.join(".local/lib/openkakao/gjc.js");
                         if wrapper.is_file() {
-                            config.bujamentor.reply_runner =
+                            config.auto_reply.reply_runner =
                                 Some(wrapper.to_string_lossy().into_owned());
                         }
                     }
@@ -1470,10 +1515,10 @@ impl AutoReplyLlmChoice {
                 config.model.allow_egress = true;
                 config.model.provider = Some("openai-codex".into());
                 config.model.retention = Some("provider-policy".into());
-                config.bujamentor.reply_runner_kind = Some("codex".into());
-                config.bujamentor.reply_model = Some(self.model().into());
-                config.bujamentor.reply_reasoning_effort = Some("max".into());
-                config.bujamentor.reply_service_tier = Some("priority".into());
+                config.auto_reply.reply_runner_kind = Some("codex".into());
+                config.auto_reply.reply_model = Some(self.model().into());
+                config.auto_reply.reply_reasoning_effort = Some("max".into());
+                config.auto_reply.reply_service_tier = Some("priority".into());
             }
         }
     }
@@ -1486,11 +1531,11 @@ fn select_auto_reply_llm(
 ) -> Result<AutoReplyLlmChoice> {
     if let Some(requested) = requested {
         return AutoReplyLlmChoice::from_model(requested).with_context(|| {
-            format!("unknown reply model {requested:?}; use gemini-3.6-flash or gpt-5.6-luna")
+            format!("unknown reply model {requested:?}; use gemini-3.7-flash or gpt-5.6-luna")
         });
     }
     if json_output || !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
-        let configured = config.bujamentor.reply_model.as_deref().unwrap_or("");
+        let configured = config.auto_reply.reply_model.as_deref().unwrap_or("");
         return AutoReplyLlmChoice::from_model(configured).with_context(|| {
             "no working reply model selected; pass --model or run interactively to pick one"
         });
@@ -1503,20 +1548,27 @@ fn select_auto_reply_llm(
         })
         .collect::<Vec<_>>();
     let selected = config
-        .bujamentor
+        .auto_reply
         .reply_model
         .as_deref()
         .and_then(AutoReplyLlmChoice::from_model)
-        .and_then(|current| AutoReplyLlmChoice::all().iter().position(|item| *item == current))
+        .and_then(|current| {
+            AutoReplyLlmChoice::all()
+                .iter()
+                .position(|item| *item == current)
+        })
         .unwrap_or(0);
     let index = crate::util::select_with_arrows("Select the reply LLM", &items, selected)?;
     Ok(AutoReplyLlmChoice::all()[index])
 }
 
-fn probe_auto_reply_llm(config: &config::OpenKakaoConfig, choice: AutoReplyLlmChoice) -> Result<()> {
-    let runner = validate_bujamentor_runner(config)?;
+fn probe_auto_reply_llm(
+    config: &config::OpenKakaoConfig,
+    choice: AutoReplyLlmChoice,
+) -> Result<()> {
+    let runner = validate_auto_reply_runner(config)?;
     let output = match choice {
-        AutoReplyLlmChoice::GjcGemini36Flash => Command::new(&runner.path)
+        AutoReplyLlmChoice::GjcGemini37Flash => Command::new(&runner.path)
             .args([
                 "-p",
                 "--no-session",
@@ -1542,7 +1594,7 @@ fn probe_auto_reply_llm(config: &config::OpenKakaoConfig, choice: AutoReplyLlmCh
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     match choice {
-        AutoReplyLlmChoice::GjcGemini36Flash => {
+        AutoReplyLlmChoice::GjcGemini37Flash => {
             if !output.status.success() || !stdout.contains("OK") {
                 anyhow::bail!(
                     "selected LLM {} did not respond; stdout={} stderr={}",
@@ -1579,11 +1631,11 @@ fn sha256_file(path: &Path) -> Result<String> {
 }
 
 #[cfg(unix)]
-fn validate_bujamentor_codex_auth(path: &Path, uid: u32) -> Result<()> {
+fn validate_auto_reply_codex_auth(path: &Path, uid: u32) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
 
     let metadata = fs::symlink_metadata(path)
-        .context("Bujamentor reply_codex_home/auth.json is unavailable")?;
+        .context("AutoReply reply_codex_home/auth.json is unavailable")?;
     if metadata.file_type().is_symlink()
         || !metadata.is_file()
         || metadata.uid() != uid
@@ -1591,31 +1643,31 @@ fn validate_bujamentor_codex_auth(path: &Path, uid: u32) -> Result<()> {
         || metadata.mode() & 0o077 != 0
         || metadata.len() == 0
     {
-        anyhow::bail!("Bujamentor Codex auth must be a private non-empty user-owned regular file");
+        anyhow::bail!("AutoReply Codex auth must be a private non-empty user-owned regular file");
     }
     Ok(())
 }
 
-fn validate_bujamentor_runner(config: &config::OpenKakaoConfig) -> Result<BujamentorRunner> {
+fn validate_auto_reply_runner(config: &config::OpenKakaoConfig) -> Result<AutoReplyRunner> {
     let runner = config
-        .bujamentor
+        .auto_reply
         .reply_runner
         .as_deref()
-        .context("Bujamentor reply_runner must be configured explicitly")?;
+        .context("AutoReply reply_runner must be configured explicitly")?;
     let kind = config
-        .bujamentor
+        .auto_reply
         .reply_runner_kind
         .as_deref()
         .unwrap_or("gjc");
     if !matches!(kind, "codex" | "gjc") {
-        anyhow::bail!("Bujamentor reply_runner_kind must be codex or gjc");
+        anyhow::bail!("AutoReply reply_runner_kind must be codex or gjc");
     }
     let resolved =
-        validate_bujamentor_executable(Some(runner), "Bujamentor reply_runner", kind, false)?;
+        validate_auto_reply_executable(Some(runner), "AutoReply reply_runner", kind, false)?;
     let home = dirs::home_dir()
-        .context("resolve home directory for Bujamentor reply_runner")?
+        .context("resolve home directory for AutoReply reply_runner")?
         .canonicalize()
-        .context("resolve canonical home directory for Bujamentor reply_runner")?;
+        .context("resolve canonical home directory for AutoReply reply_runner")?;
     let resolved_path = Path::new(&resolved);
     #[cfg(unix)]
     {
@@ -1623,7 +1675,7 @@ fn validate_bujamentor_runner(config: &config::OpenKakaoConfig) -> Result<Bujame
         let uid = unsafe { libc::geteuid() };
         let metadata = fs::metadata(resolved_path)?;
         if metadata.uid() != uid {
-            anyhow::bail!("Bujamentor reply_runner must be owned by the current user");
+            anyhow::bail!("AutoReply reply_runner must be owned by the current user");
         }
         if resolved_path.starts_with(&home) {
             let mut current = resolved_path.parent();
@@ -1631,7 +1683,7 @@ fn validate_bujamentor_runner(config: &config::OpenKakaoConfig) -> Result<Bujame
                 let metadata = fs::metadata(path)?;
                 if metadata.uid() != uid || metadata.mode() & 0o022 != 0 {
                     anyhow::bail!(
-                        "Bujamentor reply_runner parent has unsafe ownership or permissions"
+                        "AutoReply reply_runner parent has unsafe ownership or permissions"
                     );
                 }
                 if path == home {
@@ -1646,19 +1698,19 @@ fn validate_bujamentor_runner(config: &config::OpenKakaoConfig) -> Result<Bujame
                 || resolved_path.file_name().and_then(|value| value.to_str()) != Some("codex")
             {
                 anyhow::bail!(
-                    "Bujamentor reply_runner outside the current user's home must be the native Homebrew Codex CLI"
+                    "AutoReply reply_runner outside the current user's home must be the native Homebrew Codex CLI"
                 );
             }
         }
     }
     let model = config
-        .bujamentor
+        .auto_reply
         .reply_model
         .as_deref()
         .unwrap_or(if kind == "codex" {
             "gpt-5.6-luna"
         } else if kind == "gjc" {
-            "google-antigravity/gemini-3.6-flash-tiered"
+            "google-antigravity/gemini-3.7-flash-tiered"
         } else {
             ""
         })
@@ -1671,10 +1723,10 @@ fn validate_bujamentor_runner(config: &config::OpenKakaoConfig) -> Result<Bujame
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || b"._-/".contains(&byte)))
     {
-        anyhow::bail!("Bujamentor reply_model is invalid");
+        anyhow::bail!("AutoReply reply_model is invalid");
     }
     let reasoning_effort = config
-        .bujamentor
+        .auto_reply
         .reply_reasoning_effort
         .as_deref()
         .unwrap_or(if kind == "codex" { "max" } else { "medium" })
@@ -1686,10 +1738,10 @@ fn validate_bujamentor_runner(config: &config::OpenKakaoConfig) -> Result<Bujame
             "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
         )
     {
-        anyhow::bail!("Bujamentor reply_reasoning_effort is invalid");
+        anyhow::bail!("AutoReply reply_reasoning_effort is invalid");
     }
     let service_tier = config
-        .bujamentor
+        .auto_reply
         .reply_service_tier
         .as_deref()
         .unwrap_or(if kind == "codex" {
@@ -1700,55 +1752,55 @@ fn validate_bujamentor_runner(config: &config::OpenKakaoConfig) -> Result<Bujame
         .trim()
         .to_owned();
     if kind == "codex" && !matches!(service_tier.as_str(), "default" | "priority" | "flex") {
-        anyhow::bail!("Bujamentor reply_service_tier is invalid");
+        anyhow::bail!("AutoReply reply_service_tier is invalid");
     }
     if kind == "codex" {
         let output = Command::new(resolved_path)
             .arg("--version")
             .stdin(Stdio::null())
             .output()
-            .context("probe Bujamentor Codex reply runner")?;
+            .context("probe AutoReply Codex reply runner")?;
         let version = String::from_utf8_lossy(&output.stdout);
         if !output.status.success()
             || !version.trim().starts_with("codex-cli ")
             || !output.stderr.is_empty()
         {
-            anyhow::bail!("Bujamentor Codex reply runner version probe failed");
+            anyhow::bail!("AutoReply Codex reply runner version probe failed");
         }
     }
     let codex_home = if kind == "codex" {
         let configured = config
-            .bujamentor
+            .auto_reply
             .reply_codex_home
             .as_deref()
-            .context("Bujamentor reply_codex_home must be configured for Codex")?;
+            .context("AutoReply reply_codex_home must be configured for Codex")?;
         let path = Path::new(configured);
         if !path.is_absolute() {
-            anyhow::bail!("Bujamentor reply_codex_home must be an absolute path");
+            anyhow::bail!("AutoReply reply_codex_home must be an absolute path");
         }
         let resolved_home =
-            fs::canonicalize(path).context("Bujamentor reply_codex_home must already exist")?;
+            fs::canonicalize(path).context("AutoReply reply_codex_home must already exist")?;
         if !resolved_home.starts_with(&home) {
-            anyhow::bail!("Bujamentor reply_codex_home must stay inside the current user's home");
+            anyhow::bail!("AutoReply reply_codex_home must stay inside the current user's home");
         }
         let metadata = fs::symlink_metadata(&resolved_home)?;
         if !metadata.is_dir() || metadata.file_type().is_symlink() {
-            anyhow::bail!("Bujamentor reply_codex_home must be a real directory");
+            anyhow::bail!("AutoReply reply_codex_home must be a real directory");
         }
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
             let uid = unsafe { libc::geteuid() };
             if metadata.uid() != uid || metadata.mode() & 0o077 != 0 {
-                anyhow::bail!("Bujamentor reply_codex_home must be private and user-owned");
+                anyhow::bail!("AutoReply reply_codex_home must be private and user-owned");
             }
-            validate_bujamentor_codex_auth(&resolved_home.join("auth.json"), uid)?;
+            validate_auto_reply_codex_auth(&resolved_home.join("auth.json"), uid)?;
         }
         Some(resolved_home.to_string_lossy().into_owned())
     } else {
         None
     };
-    Ok(BujamentorRunner {
+    Ok(AutoReplyRunner {
         path: resolved.clone(),
         kind: kind.to_owned(),
         model,
@@ -1761,17 +1813,17 @@ fn validate_bujamentor_runner(config: &config::OpenKakaoConfig) -> Result<Bujame
 
 fn auto_reply_state_root(config: &config::OpenKakaoConfig) -> Result<std::path::PathBuf> {
     let root = config
-        .bujamentor
+        .auto_reply
         .state_root
         .as_deref()
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| {
             dirs::home_dir()
-                .map(|home| bujamentor_service::default_state_root(&home))
-                .unwrap_or_else(|| std::path::PathBuf::from("bujamentor"))
+                .map(|home| auto_reply_service::default_state_root(&home))
+                .unwrap_or_else(|| std::path::PathBuf::from("auto-reply"))
         });
     if !root.is_absolute() {
-        anyhow::bail!("Bujamentor state_root must be an absolute path");
+        anyhow::bail!("AutoReply state_root must be an absolute path");
     }
     Ok(root)
 }
@@ -1796,7 +1848,7 @@ fn auto_reply_legacy_conflict(root: &Path) -> Result<()> {
             let path = root.join(residual);
             if fs::symlink_metadata(&path).is_ok() {
                 anyhow::bail!(
-                    "legacy Bujamentor residual state exists without a drained supervisor status: {}",
+                    "legacy AutoReply residual state exists without a drained supervisor status: {}",
                     path.display()
                 );
             }
@@ -1806,7 +1858,7 @@ fn auto_reply_legacy_conflict(root: &Path) -> Result<()> {
     if status_metadata.as_ref().is_some_and(|metadata| {
         metadata.file_type().is_symlink() || !metadata.file_type().is_file()
     }) {
-        anyhow::bail!("existing Bujamentor supervisor status is not a regular file");
+        anyhow::bail!("existing AutoReply supervisor status is not a regular file");
     }
     let value = read_bounded_json_file(&status_path)?;
     let active_state = value.get("state").and_then(serde_json::Value::as_str);
@@ -1815,7 +1867,7 @@ fn auto_reply_legacy_conflict(root: &Path) -> Result<()> {
         Some("starting" | "running" | "stopping" | "fenced")
     ) {
         anyhow::bail!(
-            "existing Bujamentor supervisor is running at {}; stop/drain it before CLI activation",
+            "existing AutoReply supervisor is running at {}; stop/drain it before CLI activation",
             status_path.display()
         );
     }
@@ -1823,13 +1875,13 @@ fn auto_reply_legacy_conflict(root: &Path) -> Result<()> {
         && value.get("legacy_drained") != Some(&serde_json::Value::Bool(true))
     {
         anyhow::bail!(
-            "existing Bujamentor supervisor at {} is stopped but not explicitly drained; resolve terminal queue state before CLI activation",
+            "existing AutoReply supervisor at {} is stopped but not explicitly drained; resolve terminal queue state before CLI activation",
             status_path.display()
         );
     }
     if active_state != Some("stopped") {
         anyhow::bail!(
-            "existing Bujamentor supervisor status at {} is not a recognized drained state",
+            "existing AutoReply supervisor status at {} is not a recognized drained state",
             status_path.display()
         );
     }
@@ -1844,7 +1896,7 @@ fn walk_auto_reply_directory_no_follow(path: &Path, create: bool) -> Result<std:
     use std::path::Component;
 
     if !path.is_absolute() {
-        anyhow::bail!("Bujamentor directory must be an absolute path");
+        anyhow::bail!("AutoReply directory must be an absolute path");
     }
     let mut options = fs::OpenOptions::new();
     options
@@ -1857,11 +1909,11 @@ fn walk_auto_reply_directory_no_follow(path: &Path, create: bool) -> Result<std:
             Component::RootDir => continue,
             Component::Normal(name) => name,
             Component::CurDir | Component::ParentDir | Component::Prefix(_) => {
-                anyhow::bail!("Bujamentor directory path is not normalized")
+                anyhow::bail!("AutoReply directory path is not normalized")
             }
         };
         saw_component = true;
-        let name = CString::new(name.as_bytes()).context("Bujamentor directory contains NUL")?;
+        let name = CString::new(name.as_bytes()).context("AutoReply directory contains NUL")?;
         let open_component = || unsafe {
             libc::openat(
                 directory.as_raw_fd(),
@@ -1876,7 +1928,7 @@ fn walk_auto_reply_directory_no_follow(path: &Path, create: bool) -> Result<std:
             if !create || error.raw_os_error() != Some(libc::ENOENT) {
                 return Err(error).with_context(|| {
                     format!(
-                        "open Bujamentor directory component {}",
+                        "open AutoReply directory component {}",
                         name.to_string_lossy()
                     )
                 });
@@ -1886,7 +1938,7 @@ fn walk_auto_reply_directory_no_follow(path: &Path, create: bool) -> Result<std:
                 if mkdir_error.raw_os_error() != Some(libc::EEXIST) {
                     return Err(mkdir_error).with_context(|| {
                         format!(
-                            "create Bujamentor directory component {}",
+                            "create AutoReply directory component {}",
                             name.to_string_lossy()
                         )
                     });
@@ -1898,7 +1950,7 @@ fn walk_auto_reply_directory_no_follow(path: &Path, create: bool) -> Result<std:
             if descriptor < 0 {
                 return Err(std::io::Error::last_os_error()).with_context(|| {
                     format!(
-                        "open created Bujamentor directory component {}",
+                        "open created AutoReply directory component {}",
                         name.to_string_lossy()
                     )
                 });
@@ -1908,22 +1960,22 @@ fn walk_auto_reply_directory_no_follow(path: &Path, create: bool) -> Result<std:
         let next = unsafe { std::fs::File::from_raw_fd(descriptor) };
         let metadata = next.metadata()?;
         if !metadata.file_type().is_dir() || metadata.nlink() == 0 {
-            anyhow::bail!("Bujamentor directory component is unsafe");
+            anyhow::bail!("AutoReply directory component is unsafe");
         }
         if created {
             let uid = unsafe { libc::geteuid() };
             if metadata.uid() != uid || unsafe { libc::fchmod(next.as_raw_fd(), 0o700) } != 0 {
-                anyhow::bail!("created Bujamentor directory component is unsafe");
+                anyhow::bail!("created AutoReply directory component is unsafe");
             }
             let private = next.metadata()?;
             if private.uid() != uid || private.mode() & 0o777 != 0o700 {
-                anyhow::bail!("created Bujamentor directory component is not private");
+                anyhow::bail!("created AutoReply directory component is not private");
             }
         }
         directory = next;
     }
     if !saw_component {
-        anyhow::bail!("Bujamentor state root cannot be the filesystem root");
+        anyhow::bail!("AutoReply state root cannot be the filesystem root");
     }
     Ok(directory)
 }
@@ -1937,24 +1989,24 @@ fn open_private_auto_reply_directory(
     use std::os::unix::fs::MetadataExt;
 
     if !path.is_absolute() {
-        anyhow::bail!("Bujamentor {label} must be an absolute path");
+        anyhow::bail!("AutoReply {label} must be an absolute path");
     }
     let directory = walk_auto_reply_directory_no_follow(path, create)
-        .with_context(|| format!("open Bujamentor {label} {}", path.display()))?;
+        .with_context(|| format!("open AutoReply {label} {}", path.display()))?;
     let uid = unsafe { libc::geteuid() };
     let initial = directory
         .metadata()
-        .with_context(|| format!("inspect open Bujamentor {label} {}", path.display()))?;
+        .with_context(|| format!("inspect open AutoReply {label} {}", path.display()))?;
     if !initial.file_type().is_dir() || initial.uid() != uid || initial.nlink() == 0 {
-        anyhow::bail!("Bujamentor {label} is unsafe: {}", path.display());
+        anyhow::bail!("AutoReply {label} is unsafe: {}", path.display());
     }
     if unsafe { libc::fchmod(directory.as_raw_fd(), 0o700) } != 0 {
         return Err(std::io::Error::last_os_error())
-            .with_context(|| format!("privatize Bujamentor {label} {}", path.display()));
+            .with_context(|| format!("privatize AutoReply {label} {}", path.display()));
     }
     let private = directory.metadata()?;
     let current_directory = walk_auto_reply_directory_no_follow(path, false)
-        .with_context(|| format!("revalidate Bujamentor {label} {}", path.display()))?;
+        .with_context(|| format!("revalidate AutoReply {label} {}", path.display()))?;
     let current = current_directory.metadata()?;
     if !private.file_type().is_dir()
         || private.uid() != uid
@@ -1966,7 +2018,7 @@ fn open_private_auto_reply_directory(
         || current.mode() & 0o777 != 0o700
         || (private.dev(), private.ino()) != (current.dev(), current.ino())
     {
-        anyhow::bail!("Bujamentor {label} is not private: {}", path.display());
+        anyhow::bail!("AutoReply {label} is not private: {}", path.display());
     }
     Ok(directory)
 }
@@ -1974,17 +2026,17 @@ fn open_private_auto_reply_directory(
 #[cfg(not(unix))]
 fn ensure_private_auto_reply_directory(path: &Path, label: &str, create: bool) -> Result<()> {
     if !path.is_absolute() {
-        anyhow::bail!("Bujamentor {label} must be an absolute path");
+        anyhow::bail!("AutoReply {label} must be an absolute path");
     }
     if create {
         fs::create_dir_all(path)
-            .with_context(|| format!("create Bujamentor {label} {}", path.display()))?;
+            .with_context(|| format!("create AutoReply {label} {}", path.display()))?;
     }
     let metadata = fs::symlink_metadata(path)
-        .with_context(|| format!("inspect Bujamentor {label} {}", path.display()))?;
+        .with_context(|| format!("inspect AutoReply {label} {}", path.display()))?;
     if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
         anyhow::bail!(
-            "Bujamentor {label} must be a real directory: {}",
+            "AutoReply {label} must be a real directory: {}",
             path.display()
         );
     }
@@ -2005,10 +2057,10 @@ fn acquire_auto_reply_owner_lock(root: &Path) -> Result<std::fs::File> {
 
         let name = CString::new(
             path.file_name()
-                .context("Bujamentor owner lock name missing")?
+                .context("AutoReply owner lock name missing")?
                 .as_bytes(),
         )
-        .context("Bujamentor owner lock name contains NUL")?;
+        .context("AutoReply owner lock name contains NUL")?;
         let descriptor = unsafe {
             libc::openat(
                 root_directory.as_raw_fd(),
@@ -2019,7 +2071,7 @@ fn acquire_auto_reply_owner_lock(root: &Path) -> Result<std::fs::File> {
         };
         if descriptor < 0 {
             return Err(std::io::Error::last_os_error())
-                .with_context(|| format!("open Bujamentor owner lock {}", path.display()));
+                .with_context(|| format!("open AutoReply owner lock {}", path.display()));
         }
         // SAFETY: openat returned a newly owned descriptor on success.
         unsafe { std::fs::File::from_raw_fd(descriptor) }
@@ -2031,29 +2083,29 @@ fn acquire_auto_reply_owner_lock(root: &Path) -> Result<std::fs::File> {
         options.create(true).truncate(false).read(true).write(true);
         options
             .open(&path)
-            .with_context(|| format!("open Bujamentor owner lock {}", path.display()))?
+            .with_context(|| format!("open AutoReply owner lock {}", path.display()))?
     };
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
         let metadata = file
             .metadata()
-            .with_context(|| format!("inspect Bujamentor owner lock {}", path.display()))?;
+            .with_context(|| format!("inspect AutoReply owner lock {}", path.display()))?;
         let uid = unsafe { libc::geteuid() };
         if !metadata.file_type().is_file() || metadata.uid() != uid || metadata.nlink() != 1 {
-            anyhow::bail!("Bujamentor owner lock is unsafe: {}", path.display());
+            anyhow::bail!("AutoReply owner lock is unsafe: {}", path.display());
         }
         if unsafe { libc::fchmod(file.as_raw_fd(), 0o600) } != 0 {
             return Err(std::io::Error::last_os_error())
-                .with_context(|| format!("privatize Bujamentor owner lock {}", path.display()));
+                .with_context(|| format!("privatize AutoReply owner lock {}", path.display()));
         }
         let metadata = file.metadata()?;
         if metadata.mode() & 0o777 != 0o600 {
-            anyhow::bail!("Bujamentor owner lock is not private: {}", path.display());
+            anyhow::bail!("AutoReply owner lock is not private: {}", path.display());
         }
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
             anyhow::bail!(
-                "Bujamentor owner lock is held by another supervisor: {}",
+                "AutoReply owner lock is held by another supervisor: {}",
                 path.display()
             );
         }
@@ -2077,7 +2129,7 @@ fn validate_private_auto_reply_file_at(
         )
     };
     if descriptor < 0 {
-        return Err(std::io::Error::last_os_error()).context("open private Bujamentor file");
+        return Err(std::io::Error::last_os_error()).context("open private AutoReply file");
     }
     // SAFETY: openat returned a newly owned descriptor on success.
     let file = unsafe { std::fs::File::from_raw_fd(descriptor) };
@@ -2092,7 +2144,7 @@ fn validate_private_auto_reply_file_at(
     };
     if entry_descriptor < 0 {
         return Err(std::io::Error::last_os_error())
-            .context("inspect private Bujamentor file entry");
+            .context("inspect private AutoReply file entry");
     }
     // SAFETY: openat returned a newly owned descriptor on success.
     let entry = unsafe { std::fs::File::from_raw_fd(entry_descriptor) };
@@ -2108,7 +2160,7 @@ fn validate_private_auto_reply_file_at(
         || (metadata.dev(), metadata.ino()) != (entry_metadata.dev(), entry_metadata.ino())
         || expected_identity.is_some_and(|identity| identity != (metadata.dev(), metadata.ino()))
     {
-        anyhow::bail!("unsafe private Bujamentor file");
+        anyhow::bail!("unsafe private AutoReply file");
     }
     Ok(file)
 }
@@ -2137,11 +2189,11 @@ fn write_private_auto_reply_enrollment(root: &Path, bytes: &[u8]) -> Result<()> 
         let existing = unsafe { std::fs::File::from_raw_fd(existing_descriptor) };
         drop(existing);
         validate_private_auto_reply_file_at(&directory, &final_name, None)
-            .context("existing Bujamentor enrollment authority is unsafe")?;
+            .context("existing AutoReply enrollment authority is unsafe")?;
     } else {
         let error = std::io::Error::last_os_error();
         if error.raw_os_error() != Some(libc::ENOENT) {
-            return Err(error).context("inspect existing Bujamentor enrollment authority");
+            return Err(error).context("inspect existing AutoReply enrollment authority");
         }
     }
 
@@ -2162,14 +2214,14 @@ fn write_private_auto_reply_enrollment(root: &Path, bytes: &[u8]) -> Result<()> 
     };
     if descriptor < 0 {
         return Err(std::io::Error::last_os_error())
-            .context("create private Bujamentor enrollment temporary file");
+            .context("create private AutoReply enrollment temporary file");
     }
     // SAFETY: openat returned a newly owned descriptor on success.
     let mut output = unsafe { std::fs::File::from_raw_fd(descriptor) };
     let result = (|| -> Result<()> {
         if unsafe { libc::fchmod(output.as_raw_fd(), 0o600) } != 0 {
             return Err(std::io::Error::last_os_error())
-                .context("privatize Bujamentor enrollment temporary file");
+                .context("privatize AutoReply enrollment temporary file");
         }
         let metadata = output.metadata()?;
         let uid = unsafe { libc::geteuid() };
@@ -2178,7 +2230,7 @@ fn write_private_auto_reply_enrollment(root: &Path, bytes: &[u8]) -> Result<()> 
             || metadata.nlink() != 1
             || metadata.mode() & 0o777 != 0o600
         {
-            anyhow::bail!("Bujamentor enrollment temporary file is unsafe");
+            anyhow::bail!("AutoReply enrollment temporary file is unsafe");
         }
         let identity = (metadata.dev(), metadata.ino());
         output.write_all(bytes)?;
@@ -2194,7 +2246,7 @@ fn write_private_auto_reply_enrollment(root: &Path, bytes: &[u8]) -> Result<()> 
         } != 0
         {
             return Err(std::io::Error::last_os_error())
-                .context("install private Bujamentor enrollment authority");
+                .context("install private AutoReply enrollment authority");
         }
         validate_private_auto_reply_file_at(&directory, &final_name, Some(identity))?;
         directory.sync_all()?;
@@ -2316,14 +2368,14 @@ fn is_empty_json_array(value: Option<&serde_json::Value>) -> bool {
 }
 
 fn validate_private_regular_file(path: &Path, max_bytes: u64) -> Result<()> {
-    bujamentor_host::validate_private_regular_file(path, max_bytes)
+    auto_reply_runtime::validate_private_regular_file(path, max_bytes)
 }
 
-const BUJAMENTOR_QUEUE_LEGACY_USER_VERSION: i64 = 0;
-const BUJAMENTOR_QUEUE_JOURNAL_USER_VERSION: i64 = 2;
-const BUJAMENTOR_QUEUE_JOURNAL_MAX_ROWS: i64 = 4096;
+const AUTO_REPLY_QUEUE_LEGACY_USER_VERSION: i64 = 0;
+const AUTO_REPLY_QUEUE_JOURNAL_USER_VERSION: i64 = 2;
+const AUTO_REPLY_QUEUE_JOURNAL_MAX_ROWS: i64 = 4096;
 
-const BUJAMENTOR_REPLY_JOBS_TABLE_SQL: &str = r#"
+const AUTO_REPLY_REPLY_JOBS_TABLE_SQL: &str = r#"
 CREATE TABLE reply_jobs(
     event_id TEXT PRIMARY KEY,
     event_json TEXT NOT NULL,
@@ -2339,7 +2391,7 @@ CREATE TABLE reply_jobs(
     updated_at REAL NOT NULL
 );
 "#;
-const BUJAMENTOR_REPLY_JOBS_V2_TABLE_SQL: &str = r#"
+const AUTO_REPLY_REPLY_JOBS_V2_TABLE_SQL: &str = r#"
 CREATE TABLE reply_jobs(
     event_id TEXT PRIMARY KEY,
     event_json TEXT NOT NULL,
@@ -2356,16 +2408,16 @@ CREATE TABLE reply_jobs(
     attempt_no INTEGER NOT NULL DEFAULT 0 CHECK(attempt_no BETWEEN 0 AND 1000000)
 );
 "#;
-const BUJAMENTOR_REPLY_JOBS_STATUS_INDEX_SQL: &str =
+const AUTO_REPLY_REPLY_JOBS_STATUS_INDEX_SQL: &str =
     "CREATE INDEX idx_reply_jobs_status_due ON reply_jobs(status, due_at);";
-const BUJAMENTOR_REPLY_JOB_TOMBSTONES_TABLE_SQL: &str = r#"
+const AUTO_REPLY_REPLY_JOB_TOMBSTONES_TABLE_SQL: &str = r#"
 CREATE TABLE reply_job_tombstones(
     event_id TEXT PRIMARY KEY,
     status TEXT NOT NULL,
     archived_at REAL NOT NULL
 );
 "#;
-const BUJAMENTOR_REPLY_JOB_SUPERSESSIONS_TABLE_SQL: &str = r#"
+const AUTO_REPLY_REPLY_JOB_SUPERSESSIONS_TABLE_SQL: &str = r#"
 CREATE TABLE reply_job_supersessions(
     event_id TEXT PRIMARY KEY,
     superseded_by_event_id TEXT NOT NULL,
@@ -2373,7 +2425,7 @@ CREATE TABLE reply_job_supersessions(
     CHECK(event_id <> superseded_by_event_id)
 );
 "#;
-const BUJAMENTOR_MODEL_CIRCUIT_BREAKER_TABLE_SQL: &str = r#"
+const AUTO_REPLY_MODEL_CIRCUIT_BREAKER_TABLE_SQL: &str = r#"
 CREATE TABLE model_circuit_breaker(
     model_key TEXT PRIMARY KEY,
     state TEXT NOT NULL,
@@ -2385,7 +2437,7 @@ CREATE TABLE model_circuit_breaker(
 );
 "#;
 
-const BUJAMENTOR_PIPELINE_TRANSITIONS_TABLE_SQL: &str = r#"
+const AUTO_REPLY_PIPELINE_TRANSITIONS_TABLE_SQL: &str = r#"
 CREATE TABLE pipeline_transitions(
     seq INTEGER PRIMARY KEY,
     schema_version INTEGER NOT NULL CHECK(schema_version = 1),
@@ -2431,10 +2483,10 @@ CREATE TABLE pipeline_transitions(
 );
 "#;
 
-const BUJAMENTOR_PIPELINE_TRANSITIONS_INDEX_SQL: &str =
+const AUTO_REPLY_PIPELINE_TRANSITIONS_INDEX_SQL: &str =
     "CREATE INDEX idx_pipeline_transitions_event_seq ON pipeline_transitions(event_id, seq);";
 
-const BUJAMENTOR_PIPELINE_TRANSITIONS_INSERT_TRIGGER_SQL: &str = r#"
+const AUTO_REPLY_PIPELINE_TRANSITIONS_INSERT_TRIGGER_SQL: &str = r#"
 CREATE TRIGGER trg_reply_jobs_transition_insert
 AFTER INSERT ON reply_jobs
 BEGIN
@@ -2448,7 +2500,7 @@ BEGIN
 END;
 "#;
 
-const BUJAMENTOR_PIPELINE_TRANSITIONS_UPDATE_TRIGGER_SQL: &str = r#"
+const AUTO_REPLY_PIPELINE_TRANSITIONS_UPDATE_TRIGGER_SQL: &str = r#"
 CREATE TRIGGER trg_reply_jobs_transition_update
 AFTER UPDATE OF status ON reply_jobs
 WHEN OLD.status IS NOT NEW.status
@@ -2469,7 +2521,7 @@ BEGIN
 END;
 "#;
 
-const BUJAMENTOR_PIPELINE_TRANSITIONS_CAP_TRIGGER_SQL: &str = r#"
+const AUTO_REPLY_PIPELINE_TRANSITIONS_CAP_TRIGGER_SQL: &str = r#"
 CREATE TRIGGER trg_pipeline_transitions_cap
 AFTER INSERT ON pipeline_transitions
 BEGIN
@@ -2553,7 +2605,7 @@ fn normalize_sqlite_schema_sql(sql: &str) -> String {
     normalized
 }
 
-fn parse_bujamentor_transition_event_id(value: &str) -> Option<(i64, i64)> {
+fn parse_auto_reply_transition_event_id(value: &str) -> Option<(i64, i64)> {
     if !(6..=80).contains(&value.len()) || !value.is_ascii() {
         return None;
     }
@@ -2582,8 +2634,8 @@ fn parse_bujamentor_transition_event_id(value: &str) -> Option<(i64, i64)> {
 }
 
 #[cfg(test)]
-fn is_valid_bujamentor_transition_event_id(value: &str) -> bool {
-    parse_bujamentor_transition_event_id(value).is_some()
+fn is_valid_auto_reply_transition_event_id(value: &str) -> bool {
+    parse_auto_reply_transition_event_id(value).is_some()
 }
 
 fn validate_stopped_clean_queue(queue_path: &Path, expected_chat_id: i64) -> Result<()> {
@@ -2596,7 +2648,7 @@ fn validate_stopped_clean_queue(queue_path: &Path, expected_chat_id: i64) -> Res
             .and_then(|value| value.to_str())
             != Some(expected_room_name.as_str())
     {
-        anyhow::bail!("Bujamentor stopped-clean queue room binding is invalid");
+        anyhow::bail!("AutoReply stopped-clean queue room binding is invalid");
     }
     validate_private_regular_file(queue_path, MAX_QUEUE_BYTES)?;
     let connection = rusqlite::Connection::open_with_flags(
@@ -2607,13 +2659,13 @@ fn validate_stopped_clean_queue(queue_path: &Path, expected_chat_id: i64) -> Res
     connection.execute_batch("PRAGMA query_only = ON; PRAGMA busy_timeout = 5000;")?;
     let quick_check: String = connection.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
     if quick_check != "ok" {
-        anyhow::bail!("Bujamentor stopped-clean queue quick_check failed");
+        anyhow::bail!("AutoReply stopped-clean queue quick_check failed");
     }
     let user_version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     let has_transition_journal = match user_version {
-        BUJAMENTOR_QUEUE_LEGACY_USER_VERSION => false,
-        BUJAMENTOR_QUEUE_JOURNAL_USER_VERSION => true,
-        _ => anyhow::bail!("Bujamentor stopped-clean queue version is unsupported"),
+        AUTO_REPLY_QUEUE_LEGACY_USER_VERSION => false,
+        AUTO_REPLY_QUEUE_JOURNAL_USER_VERSION => true,
+        _ => anyhow::bail!("AutoReply stopped-clean queue version is unsupported"),
     };
     let tables = connection
         .prepare(
@@ -2640,7 +2692,7 @@ fn validate_stopped_clean_queue(queue_path: &Path, expected_chat_id: i64) -> Res
     } else if tables == expected_tables_with_breaker {
         true
     } else {
-        anyhow::bail!("Bujamentor stopped-clean queue schema is invalid");
+        anyhow::bail!("AutoReply stopped-clean queue schema is invalid");
     };
     let validate_columns = |table: &str, expected: &[(&str, &str, i64, i64)]| -> Result<()> {
         let sql = format!("PRAGMA table_info({table})");
@@ -2667,7 +2719,7 @@ fn validate_stopped_clean_queue(queue_path: &Path, expected_chat_id: i64) -> Res
             })
             .collect::<Vec<_>>();
         if actual != expected {
-            anyhow::bail!("Bujamentor stopped-clean queue schema is invalid");
+            anyhow::bail!("AutoReply stopped-clean queue schema is invalid");
         }
         Ok(())
     };
@@ -2748,9 +2800,9 @@ fn validate_stopped_clean_queue(queue_path: &Path, expected_chat_id: i64) -> Res
             |row| row.get(0),
         )?;
         if normalize_sqlite_schema_sql(&table_sql)
-            != normalize_sqlite_schema_sql(BUJAMENTOR_PIPELINE_TRANSITIONS_TABLE_SQL)
+            != normalize_sqlite_schema_sql(AUTO_REPLY_PIPELINE_TRANSITIONS_TABLE_SQL)
         {
-            anyhow::bail!("Bujamentor stopped-clean journal table is invalid");
+            anyhow::bail!("AutoReply stopped-clean journal table is invalid");
         }
     }
 
@@ -2772,25 +2824,25 @@ fn validate_stopped_clean_queue(queue_path: &Path, expected_chat_id: i64) -> Res
         (
             "index",
             "idx_reply_jobs_status_due",
-            BUJAMENTOR_REPLY_JOBS_STATUS_INDEX_SQL,
+            AUTO_REPLY_REPLY_JOBS_STATUS_INDEX_SQL,
         ),
         (
             "table",
             "reply_job_supersessions",
-            BUJAMENTOR_REPLY_JOB_SUPERSESSIONS_TABLE_SQL,
+            AUTO_REPLY_REPLY_JOB_SUPERSESSIONS_TABLE_SQL,
         ),
         (
             "table",
             "reply_job_tombstones",
-            BUJAMENTOR_REPLY_JOB_TOMBSTONES_TABLE_SQL,
+            AUTO_REPLY_REPLY_JOB_TOMBSTONES_TABLE_SQL,
         ),
         (
             "table",
             "reply_jobs",
             if has_transition_journal {
-                BUJAMENTOR_REPLY_JOBS_V2_TABLE_SQL
+                AUTO_REPLY_REPLY_JOBS_V2_TABLE_SQL
             } else {
-                BUJAMENTOR_REPLY_JOBS_TABLE_SQL
+                AUTO_REPLY_REPLY_JOBS_TABLE_SQL
             },
         ),
     ];
@@ -2800,7 +2852,7 @@ fn validate_stopped_clean_queue(queue_path: &Path, expected_chat_id: i64) -> Res
             (
                 "table",
                 "model_circuit_breaker",
-                BUJAMENTOR_MODEL_CIRCUIT_BREAKER_TABLE_SQL,
+                AUTO_REPLY_MODEL_CIRCUIT_BREAKER_TABLE_SQL,
             ),
         );
     }
@@ -2809,27 +2861,27 @@ fn validate_stopped_clean_queue(queue_path: &Path, expected_chat_id: i64) -> Res
             (
                 "index",
                 "idx_pipeline_transitions_event_seq",
-                BUJAMENTOR_PIPELINE_TRANSITIONS_INDEX_SQL,
+                AUTO_REPLY_PIPELINE_TRANSITIONS_INDEX_SQL,
             ),
             (
                 "table",
                 "pipeline_transitions",
-                BUJAMENTOR_PIPELINE_TRANSITIONS_TABLE_SQL,
+                AUTO_REPLY_PIPELINE_TRANSITIONS_TABLE_SQL,
             ),
             (
                 "trigger",
                 "trg_pipeline_transitions_cap",
-                BUJAMENTOR_PIPELINE_TRANSITIONS_CAP_TRIGGER_SQL,
+                AUTO_REPLY_PIPELINE_TRANSITIONS_CAP_TRIGGER_SQL,
             ),
             (
                 "trigger",
                 "trg_reply_jobs_transition_insert",
-                BUJAMENTOR_PIPELINE_TRANSITIONS_INSERT_TRIGGER_SQL,
+                AUTO_REPLY_PIPELINE_TRANSITIONS_INSERT_TRIGGER_SQL,
             ),
             (
                 "trigger",
                 "trg_reply_jobs_transition_update",
-                BUJAMENTOR_PIPELINE_TRANSITIONS_UPDATE_TRIGGER_SQL,
+                AUTO_REPLY_PIPELINE_TRANSITIONS_UPDATE_TRIGGER_SQL,
             ),
         ]);
     }
@@ -2843,7 +2895,7 @@ fn validate_stopped_clean_queue(queue_path: &Path, expected_chat_id: i64) -> Res
             },
         )
     {
-        anyhow::bail!("Bujamentor stopped-clean queue schema SQL is invalid");
+        anyhow::bail!("AutoReply stopped-clean queue schema SQL is invalid");
     }
 
     let expected_index_names = if has_transition_journal {
@@ -2860,14 +2912,14 @@ fn validate_stopped_clean_queue(queue_path: &Path, expected_chat_id: i64) -> Res
         .map(|(_, name, _)| name.as_str())
         .collect::<Vec<_>>();
     if index_names != expected_index_names {
-        anyhow::bail!("Bujamentor stopped-clean queue index set is invalid");
+        anyhow::bail!("AutoReply stopped-clean queue index set is invalid");
     }
     let status_index_columns = connection
         .prepare("PRAGMA index_info(idx_reply_jobs_status_due)")?
         .query_map([], |row| row.get::<_, String>(2))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     if status_index_columns != ["status", "due_at"] {
-        anyhow::bail!("Bujamentor stopped-clean queue index is invalid");
+        anyhow::bail!("AutoReply stopped-clean queue index is invalid");
     }
     if has_transition_journal {
         let journal_index_columns = connection
@@ -2875,7 +2927,7 @@ fn validate_stopped_clean_queue(queue_path: &Path, expected_chat_id: i64) -> Res
             .query_map([], |row| row.get::<_, String>(2))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         if journal_index_columns != ["event_id", "seq"] {
-            anyhow::bail!("Bujamentor stopped-clean journal index is invalid");
+            anyhow::bail!("AutoReply stopped-clean journal index is invalid");
         }
     }
 
@@ -2897,17 +2949,17 @@ fn validate_stopped_clean_queue(queue_path: &Path, expected_chat_id: i64) -> Res
             (
                 "trg_pipeline_transitions_cap",
                 "pipeline_transitions",
-                BUJAMENTOR_PIPELINE_TRANSITIONS_CAP_TRIGGER_SQL,
+                AUTO_REPLY_PIPELINE_TRANSITIONS_CAP_TRIGGER_SQL,
             ),
             (
                 "trg_reply_jobs_transition_insert",
                 "reply_jobs",
-                BUJAMENTOR_PIPELINE_TRANSITIONS_INSERT_TRIGGER_SQL,
+                AUTO_REPLY_PIPELINE_TRANSITIONS_INSERT_TRIGGER_SQL,
             ),
             (
                 "trg_reply_jobs_transition_update",
                 "reply_jobs",
-                BUJAMENTOR_PIPELINE_TRANSITIONS_UPDATE_TRIGGER_SQL,
+                AUTO_REPLY_PIPELINE_TRANSITIONS_UPDATE_TRIGGER_SQL,
             ),
         ];
         if triggers.len() != expected_triggers.len()
@@ -2920,24 +2972,24 @@ fn validate_stopped_clean_queue(queue_path: &Path, expected_chat_id: i64) -> Res
                 },
             )
         {
-            anyhow::bail!("Bujamentor stopped-clean journal triggers are invalid");
+            anyhow::bail!("AutoReply stopped-clean journal triggers are invalid");
         }
         let journal_rows: i64 =
             connection.query_row("SELECT COUNT(*) FROM pipeline_transitions", [], |row| {
                 row.get(0)
             })?;
-        if !(0..=BUJAMENTOR_QUEUE_JOURNAL_MAX_ROWS).contains(&journal_rows) {
-            anyhow::bail!("Bujamentor stopped-clean journal row cap is invalid");
+        if !(0..=AUTO_REPLY_QUEUE_JOURNAL_MAX_ROWS).contains(&journal_rows) {
+            anyhow::bail!("AutoReply stopped-clean journal row cap is invalid");
         }
         let journal_event_ids = connection
             .prepare("SELECT event_id FROM pipeline_transitions ORDER BY seq")?
             .query_map([], |row| row.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         if journal_event_ids.iter().any(|event_id| {
-            parse_bujamentor_transition_event_id(event_id)
+            parse_auto_reply_transition_event_id(event_id)
                 .is_none_or(|(chat_id, _)| chat_id != expected_chat_id)
         }) {
-            anyhow::bail!("Bujamentor stopped-clean journal identity is invalid");
+            anyhow::bail!("AutoReply stopped-clean journal identity is invalid");
         }
         let invalid_journal_rows: i64 = connection.query_row(
             "SELECT COUNT(*) FROM pipeline_transitions WHERE \
@@ -2953,10 +3005,10 @@ fn validate_stopped_clean_queue(queue_path: &Path, expected_chat_id: i64) -> Res
             |row| row.get(0),
         )?;
         if invalid_journal_rows != 0 {
-            anyhow::bail!("Bujamentor stopped-clean journal metadata is invalid");
+            anyhow::bail!("AutoReply stopped-clean journal metadata is invalid");
         }
     } else if !triggers.is_empty() {
-        anyhow::bail!("Bujamentor stopped-clean legacy queue has triggers");
+        anyhow::bail!("AutoReply stopped-clean legacy queue has triggers");
     }
 
     let reply_identities = connection
@@ -2966,23 +3018,23 @@ fn validate_stopped_clean_queue(queue_path: &Path, expected_chat_id: i64) -> Res
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     for (event_id, event_json) in reply_identities {
-        let Some((chat_id, log_id)) = parse_bujamentor_transition_event_id(&event_id) else {
-            anyhow::bail!("Bujamentor stopped-clean queue event identity is invalid");
+        let Some((chat_id, log_id)) = parse_auto_reply_transition_event_id(&event_id) else {
+            anyhow::bail!("AutoReply stopped-clean queue event identity is invalid");
         };
         if chat_id != expected_chat_id {
-            anyhow::bail!("Bujamentor stopped-clean queue event belongs to another room");
+            anyhow::bail!("AutoReply stopped-clean queue event belongs to another room");
         }
         let event: serde_json::Value = serde_json::from_str(&event_json)
             .context("parse stopped-clean queue event identity")?;
         let event = event
             .as_object()
-            .context("Bujamentor stopped-clean queue event identity is malformed")?;
+            .context("AutoReply stopped-clean queue event identity is malformed")?;
         for key in ["event_id", "canonical_event_id"] {
             if event
                 .get(key)
                 .is_some_and(|value| value.as_str() != Some(event_id.as_str()))
             {
-                anyhow::bail!("Bujamentor stopped-clean queue event identity mismatches");
+                anyhow::bail!("AutoReply stopped-clean queue event identity mismatches");
             }
         }
         let event_log_id = event.get("log_id").and_then(serde_json::Value::as_i64);
@@ -2996,7 +3048,7 @@ fn validate_stopped_clean_queue(queue_path: &Path, expected_chat_id: i64) -> Res
                 event_log_id.is_some_and(|value| value != log_id)
             }
         {
-            anyhow::bail!("Bujamentor stopped-clean queue JSON identity mismatches");
+            anyhow::bail!("AutoReply stopped-clean queue JSON identity mismatches");
         }
     }
     let tombstone_identities = connection
@@ -3004,10 +3056,10 @@ fn validate_stopped_clean_queue(queue_path: &Path, expected_chat_id: i64) -> Res
         .query_map([], |row| row.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     if tombstone_identities.iter().any(|event_id| {
-        parse_bujamentor_transition_event_id(event_id)
+        parse_auto_reply_transition_event_id(event_id)
             .is_none_or(|(chat_id, _)| chat_id != expected_chat_id)
     }) {
-        anyhow::bail!("Bujamentor stopped-clean queue tombstone identity is invalid");
+        anyhow::bail!("AutoReply stopped-clean queue tombstone identity is invalid");
     }
     let supersession_identities = connection
         .prepare(
@@ -3022,12 +3074,12 @@ fn validate_stopped_clean_queue(queue_path: &Path, expected_chat_id: i64) -> Res
         .iter()
         .any(|(event_id, successor_id)| {
             [event_id, successor_id].into_iter().any(|value| {
-                parse_bujamentor_transition_event_id(value)
+                parse_auto_reply_transition_event_id(value)
                     .is_none_or(|(chat_id, _)| chat_id != expected_chat_id)
             })
         })
     {
-        anyhow::bail!("Bujamentor stopped-clean queue supersession identity is invalid");
+        anyhow::bail!("AutoReply stopped-clean queue supersession identity is invalid");
     }
     if has_transition_journal {
         let invalid_attempts: i64 = connection.query_row(
@@ -3037,7 +3089,7 @@ fn validate_stopped_clean_queue(queue_path: &Path, expected_chat_id: i64) -> Res
             |row| row.get(0),
         )?;
         if invalid_attempts != 0 {
-            anyhow::bail!("Bujamentor stopped-clean queue attempt authority is invalid");
+            anyhow::bail!("AutoReply stopped-clean queue attempt authority is invalid");
         }
     }
 
@@ -3048,34 +3100,52 @@ fn validate_stopped_clean_queue(queue_path: &Path, expected_chat_id: i64) -> Res
         );
         let nonterminal: i64 = connection.query_row(&sql, [], |row| row.get(0))?;
         if nonterminal != 0 {
-            anyhow::bail!("Bujamentor stopped-clean queue has nonterminal rows");
+            anyhow::bail!("AutoReply stopped-clean queue has nonterminal rows");
         }
     }
     Ok(())
 }
 
 fn leftover_queue_has_unknown_send(queue_path: &Path, expected_chat_id: i64) -> Result<()> {
-    bujamentor_host::leftover_queue_has_unknown_send(queue_path, expected_chat_id)
+    auto_reply_runtime::leftover_queue_has_unknown_send(queue_path, expected_chat_id)
 }
 
 fn leftover_supervisor_is_live(room_root: &Path, target: &local_db::LocalChat) -> Result<bool> {
     let status_path = room_root.join("supervisor-status.json");
-    validate_private_regular_file(&status_path, BUJAMENTOR_READINESS_MAX_BYTES)?;
+    validate_private_regular_file(&status_path, AUTO_REPLY_READINESS_MAX_BYTES)?;
     let status = read_bounded_json_file(&status_path)?;
     let state = status
         .get("state")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("");
-    Ok(status.get("schema_version") == Some(&serde_json::Value::from(1))
-        && status.get("mode")
-            == Some(&serde_json::Value::String(
-                "database_authoritative".to_string(),
-            ))
-        && status.get("target_chat_id") == Some(&serde_json::Value::from(target.chat_id))
-        && status.get("target_chat_name")
-            == Some(&serde_json::Value::String(target.chat_name.clone()))
-        && matches!(state, "running" | "starting" | "stopping")
-        && status.get("all_children_exited") != Some(&serde_json::Value::Bool(true)))
+    Ok(
+        status.get("schema_version") == Some(&serde_json::Value::from(1))
+            && status.get("mode")
+                == Some(&serde_json::Value::String(
+                    "database_authoritative".to_string(),
+                ))
+            && status.get("target_chat_id") == Some(&serde_json::Value::from(target.chat_id))
+            && status.get("target_chat_name")
+                == Some(&serde_json::Value::String(target.chat_name.clone()))
+            && matches!(state, "running" | "starting" | "stopping")
+            && status.get("all_children_exited") != Some(&serde_json::Value::Bool(true)),
+    )
+}
+
+fn leftover_in_flight_is_absent_or_orphaned(state: &serde_json::Value) -> bool {
+    match state.get("in_flight_candidate") {
+        None | Some(serde_json::Value::Null) => true,
+        Some(candidate) => {
+            let persisted_owner = state.get("owner_id").and_then(serde_json::Value::as_str);
+            let in_flight_owner = candidate
+                .get("owner_id")
+                .and_then(serde_json::Value::as_str);
+            match (persisted_owner, in_flight_owner) {
+                (Some(owner), Some(in_flight)) if !owner.is_empty() && owner == in_flight => true,
+                _ => false,
+            }
+        }
+    }
 }
 
 fn leftover_supervisor_is_terminal(
@@ -3084,22 +3154,22 @@ fn leftover_supervisor_is_terminal(
     state: &serde_json::Value,
 ) -> Result<()> {
     let status_path = room_root.join("supervisor-status.json");
-    validate_private_regular_file(&status_path, BUJAMENTOR_READINESS_MAX_BYTES)?;
+    validate_private_regular_file(&status_path, AUTO_REPLY_READINESS_MAX_BYTES)?;
     let status = read_bounded_json_file(&status_path)?;
     let _owner = state
         .get("owner_id")
         .and_then(serde_json::Value::as_str)
         .filter(|value| !value.is_empty())
-        .context("Bujamentor leftover owner is invalid")?;
+        .context("AutoReply leftover owner is invalid")?;
     let _epoch = state
         .get("source_epoch")
         .and_then(serde_json::Value::as_i64)
         .filter(|value| (1..MAX_INT64).contains(value))
-        .context("Bujamentor leftover epoch is invalid")?;
+        .context("AutoReply leftover epoch is invalid")?;
     let child_states = status
         .get("child_states")
         .and_then(serde_json::Value::as_object)
-        .context("Bujamentor leftover child states are missing")?;
+        .context("AutoReply leftover child states are missing")?;
     if status.get("schema_version") != Some(&serde_json::Value::from(1))
         || status.get("mode")
             != Some(&serde_json::Value::String(
@@ -3124,7 +3194,7 @@ fn leftover_supervisor_is_terminal(
             child_states.get(*role) != Some(&serde_json::Value::String("exited".to_string()))
         })
     {
-        anyhow::bail!("Bujamentor leftover supervisor proof is invalid");
+        anyhow::bail!("AutoReply leftover supervisor proof is invalid");
     }
     leftover_queue_has_unknown_send(&room_root.join("reply-queue.sqlite3"), target.chat_id)
 }
@@ -3135,23 +3205,23 @@ fn validate_stopped_clean_supervisor(
     state: &serde_json::Value,
 ) -> Result<()> {
     let status_path = room_root.join("supervisor-status.json");
-    validate_private_regular_file(&status_path, BUJAMENTOR_READINESS_MAX_BYTES)?;
+    validate_private_regular_file(&status_path, AUTO_REPLY_READINESS_MAX_BYTES)?;
     let status = read_bounded_json_file(&status_path)?;
     let owner = state
         .get("owner_id")
         .and_then(serde_json::Value::as_str)
         .filter(|value| !value.is_empty())
-        .context("Bujamentor stopped-clean owner is invalid")?;
+        .context("AutoReply stopped-clean owner is invalid")?;
     let epoch = state
         .get("source_epoch")
         .and_then(serde_json::Value::as_i64)
         .filter(|value| (1..MAX_INT64).contains(value))
-        .context("Bujamentor stopped-clean epoch is invalid")?;
+        .context("AutoReply stopped-clean epoch is invalid")?;
     let expected_roles = ["ax_watch", "db_watch", "reply_worker"];
     let child_states = status
         .get("child_states")
         .and_then(serde_json::Value::as_object)
-        .context("Bujamentor stopped-clean child states are missing")?;
+        .context("AutoReply stopped-clean child states are missing")?;
     if status.get("schema_version") != Some(&serde_json::Value::from(1))
         || status.get("mode")
             != Some(&serde_json::Value::String(
@@ -3174,7 +3244,7 @@ fn validate_stopped_clean_supervisor(
             child_states.get(*role) != Some(&serde_json::Value::String("exited".to_string()))
         })
     {
-        anyhow::bail!("Bujamentor stopped-clean supervisor proof is invalid");
+        anyhow::bail!("AutoReply stopped-clean supervisor proof is invalid");
     }
     validate_stopped_clean_queue(&room_root.join("reply-queue.sqlite3"), target.chat_id)
 }
@@ -3196,47 +3266,47 @@ fn enrollment_cursor_authority_for_target(
     if !(0..MAX_INT64).contains(&freshly_attested_watermark)
         || freshly_attested_watermark != target.last_log_id
     {
-        anyhow::bail!("Bujamentor fresh enrollment watermark is invalid");
+        anyhow::bail!("AutoReply fresh enrollment watermark is invalid");
     }
     let room_root = root.join("rooms").join(target.chat_id.to_string());
     let state_path = room_root.join("db-watch-state.json");
     if let Ok(metadata) = fs::symlink_metadata(&state_path) {
         if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
-            anyhow::bail!("Bujamentor room state is not a regular file");
+            anyhow::bail!("AutoReply room state is not a regular file");
         }
         let state = read_bounded_json_file(&state_path)?;
         let cursor_floor = state
             .get("cursor_floor")
             .and_then(serde_json::Value::as_i64)
             .filter(|value| 0 <= *value && *value < MAX_INT64)
-            .context("Bujamentor room cursor floor is invalid")?;
+            .context("AutoReply room cursor floor is invalid")?;
         let acked_watermark = state
             .get("acked_watermark")
             .and_then(serde_json::Value::as_i64)
             .filter(|value| 0 <= *value && *value < MAX_INT64)
-            .context("Bujamentor room ACK watermark is invalid")?;
+            .context("AutoReply room ACK watermark is invalid")?;
         let last_observed = state
             .get("last_observed_log_id")
             .and_then(serde_json::Value::as_i64)
             .filter(|value| 0 <= *value && *value < MAX_INT64)
-            .context("Bujamentor room observed watermark is invalid")?;
+            .context("AutoReply room observed watermark is invalid")?;
         let parse_ids = |key: &str| -> Result<std::collections::BTreeSet<i64>> {
             let values = state
                 .get(key)
                 .and_then(serde_json::Value::as_array)
                 .filter(|values| values.len() <= 500)
-                .with_context(|| format!("Bujamentor room {key} is invalid"))?;
+                .with_context(|| format!("AutoReply room {key} is invalid"))?;
             let parsed = values
                 .iter()
                 .map(|value| {
                     value
                         .as_i64()
                         .filter(|id| 0 < *id && *id < MAX_INT64)
-                        .with_context(|| format!("Bujamentor room {key} contains an invalid ID"))
+                        .with_context(|| format!("AutoReply room {key} contains an invalid ID"))
                 })
                 .collect::<Result<std::collections::BTreeSet<_>>>()?;
             if parsed.len() != values.len() {
-                anyhow::bail!("Bujamentor room {key} contains duplicate IDs");
+                anyhow::bail!("AutoReply room {key} contains duplicate IDs");
             }
             Ok(parsed)
         };
@@ -3252,10 +3322,16 @@ fn enrollment_cursor_authority_for_target(
             && state.get("target_chat_id") == Some(&serde_json::Value::from(target.chat_id))
             && state.get("target_chat_name")
                 == Some(&serde_json::Value::String(target.chat_name.clone()))
-            && state.get("capability_state") == Some(&serde_json::Value::String("fenced".to_string()))
+            && state.get("capability_state")
+                == Some(&serde_json::Value::String("fenced".to_string()))
             && state.get("delivery_enabled") == Some(&serde_json::Value::Bool(false))
-            && state.get("candidate_phase") == Some(&serde_json::Value::String("idle".to_string()))
-            && state.get("in_flight_candidate") == Some(&serde_json::Value::Null)
+            && matches!(
+                state
+                    .get("candidate_phase")
+                    .and_then(serde_json::Value::as_str),
+                Some("idle" | "hooking")
+            )
+            && leftover_in_flight_is_absent_or_orphaned(&state)
             && state
                 .get("owner_id")
                 .and_then(serde_json::Value::as_str)
@@ -3270,18 +3346,23 @@ fn enrollment_cursor_authority_for_target(
             && acked.is_subset(&observed)
             && acked_watermark > 0
             && acked_watermark <= freshly_attested_watermark;
-        let leftover_ready_idle = state.get("schema_version")
-            == Some(&serde_json::Value::from(3))
+        let leftover_ready_idle = state.get("schema_version") == Some(&serde_json::Value::from(3))
             && state.get("target_chat_id") == Some(&serde_json::Value::from(target.chat_id))
             && state.get("target_chat_name")
                 == Some(&serde_json::Value::String(target.chat_name.clone()))
-            && state.get("capability_state") == Some(&serde_json::Value::String("ready".to_string()))
+            && state.get("capability_state")
+                == Some(&serde_json::Value::String("ready".to_string()))
             && state.get("delivery_enabled") == Some(&serde_json::Value::Bool(true))
             && state.get("fence") == Some(&serde_json::Value::String("ready".to_string()))
-            && state.get("candidate_phase") == Some(&serde_json::Value::String("idle".to_string()))
-            && state.get("in_flight_candidate") == Some(&serde_json::Value::Null)
-            && is_empty_json_array(state.get("pending_log_ids"))
-            && is_empty_json_array(state.get("pending_gaps"))
+            && matches!(
+                state
+                    .get("candidate_phase")
+                    .and_then(serde_json::Value::as_str),
+                Some("idle" | "hooking")
+            )
+            && leftover_in_flight_is_absent_or_orphaned(&state)
+            && (is_empty_json_array(state.get("pending_gaps"))
+                || state.get("pending_gaps") == Some(&serde_json::json!(["reconcile_required"])))
             && state
                 .get("owner_id")
                 .and_then(serde_json::Value::as_str)
@@ -3313,10 +3394,13 @@ fn enrollment_cursor_authority_for_target(
             && acked_watermark > 0
             && acked_watermark <= freshly_attested_watermark
         {
-            leftover_queue_has_unknown_send(&room_root.join("reply-queue.sqlite3"), target.chat_id)?;
+            leftover_queue_has_unknown_send(
+                &room_root.join("reply-queue.sqlite3"),
+                target.chat_id,
+            )?;
             validate_private_regular_file(&state_path, 256 * 1024)?;
             return Ok(AutoReplyCursorAuthority {
-                kind: BUJAMENTOR_CURSOR_LEFTOVER_KIND,
+                kind: AUTO_REPLY_CURSOR_LEFTOVER_KIND,
                 cursor_floor: acked_watermark,
                 attested_db_last_log_id: freshly_attested_watermark,
                 prior_owner_id: state
@@ -3328,11 +3412,11 @@ fn enrollment_cursor_authority_for_target(
                     .and_then(serde_json::Value::as_i64),
             });
         }
-        if leftover_ready_idle {
-            leftover_queue_has_unknown_send(&room_root.join("reply-queue.sqlite3"), target.chat_id)?;
+        if leftover_ready_idle && !live_supervisor {
+            leftover_supervisor_is_terminal(&room_root, target, &state)?;
             validate_private_regular_file(&state_path, 256 * 1024)?;
             return Ok(AutoReplyCursorAuthority {
-                kind: BUJAMENTOR_CURSOR_LEFTOVER_KIND,
+                kind: AUTO_REPLY_CURSOR_LEFTOVER_KIND,
                 cursor_floor: acked_watermark,
                 attested_db_last_log_id: freshly_attested_watermark,
                 prior_owner_id: state
@@ -3348,7 +3432,7 @@ fn enrollment_cursor_authority_for_target(
             leftover_supervisor_is_terminal(&room_root, target, &state)?;
             validate_private_regular_file(&state_path, 256 * 1024)?;
             return Ok(AutoReplyCursorAuthority {
-                kind: BUJAMENTOR_CURSOR_LEFTOVER_KIND,
+                kind: AUTO_REPLY_CURSOR_LEFTOVER_KIND,
                 cursor_floor: acked_watermark,
                 attested_db_last_log_id: freshly_attested_watermark,
                 prior_owner_id: state
@@ -3383,7 +3467,7 @@ fn enrollment_cursor_authority_for_target(
             || last_observed != observed.iter().next_back().copied().unwrap_or(0)
         {
             anyhow::bail!(
-                "Bujamentor room {} requires reconciliation before restart",
+                "AutoReply room {} requires reconciliation before restart",
                 target.chat_name
             );
         }
@@ -3391,7 +3475,7 @@ fn enrollment_cursor_authority_for_target(
         validate_stopped_clean_supervisor(&room_root, target, &state)?;
         if acked_watermark > freshly_attested_watermark {
             anyhow::bail!(
-                "Bujamentor room {} database tail regressed below its authoritative ACK",
+                "AutoReply room {} database tail regressed below its authoritative ACK",
                 target.chat_name
             );
         }
@@ -3400,7 +3484,7 @@ fn enrollment_cursor_authority_for_target(
         // was stopped.  Resume a fully attested stopped-clean generation at
         // its durable ACK so local-poll can replay those intervening rows.
         return Ok(AutoReplyCursorAuthority {
-            kind: BUJAMENTOR_CURSOR_REPLAY_KIND,
+            kind: AUTO_REPLY_CURSOR_REPLAY_KIND,
             cursor_floor: acked_watermark,
             attested_db_last_log_id: freshly_attested_watermark,
             prior_owner_id: state
@@ -3414,7 +3498,7 @@ fn enrollment_cursor_authority_for_target(
     } else if let Err(error) = fs::symlink_metadata(&state_path) {
         if error.kind() != std::io::ErrorKind::NotFound {
             return Err(error).with_context(|| {
-                format!("inspect Bujamentor room state {}", state_path.display())
+                format!("inspect AutoReply room state {}", state_path.display())
             });
         }
     }
@@ -3429,38 +3513,38 @@ fn enrollment_cursor_authority_for_target(
     };
     if let Some(metadata) = enrollment_metadata {
         if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
-            anyhow::bail!("Bujamentor enrollment is not a regular file");
+            anyhow::bail!("AutoReply enrollment is not a regular file");
         }
         let enrollment = read_bounded_json_file(&enrollment_path)?;
         let targets = enrollment
             .get("targets")
             .and_then(serde_json::Value::as_array)
-            .context("Bujamentor enrollment targets are missing")?;
+            .context("AutoReply enrollment targets are missing")?;
         if enrollment.get("schema_version")
             != Some(&serde_json::Value::from(
-                BUJAMENTOR_ENROLLMENT_SCHEMA_VERSION,
+                AUTO_REPLY_ENROLLMENT_SCHEMA_VERSION,
             ))
             || targets.is_empty()
             || targets.len() > 32
         {
-            anyhow::bail!("Bujamentor enrollment authority is invalid");
+            anyhow::bail!("AutoReply enrollment authority is invalid");
         }
         let matches = targets
             .iter()
             .filter(|item| item.get("chat_id").and_then(readiness_integer) == Some(target.chat_id))
             .collect::<Vec<_>>();
         if matches.len() > 1 {
-            anyhow::bail!("Bujamentor enrollment target is duplicated");
+            anyhow::bail!("AutoReply enrollment target is duplicated");
         }
         if !matches.is_empty() {
             anyhow::bail!(
-                "Bujamentor room {} has enrollment authority but no clean v3 DB state",
+                "AutoReply room {} has enrollment authority but no clean v3 DB state",
                 target.chat_name
             );
         }
     }
     Ok(AutoReplyCursorAuthority {
-        kind: BUJAMENTOR_CURSOR_FRESH_KIND,
+        kind: AUTO_REPLY_CURSOR_FRESH_KIND,
         cursor_floor: freshly_attested_watermark,
         attested_db_last_log_id: freshly_attested_watermark,
         prior_owner_id: None,
@@ -3492,7 +3576,7 @@ fn write_auto_reply_enrollment(
             .get(&target.chat_id)
             .is_none_or(|bindings| bindings.is_empty())
     }) {
-        anyhow::bail!("Bujamentor numeric reply-author enrollment is incomplete");
+        anyhow::bail!("AutoReply numeric reply-author enrollment is incomplete");
     }
     let fresh_watermarks = targets
         .iter()
@@ -3516,17 +3600,16 @@ fn write_auto_reply_enrollment(
         .any(|(target, authority)| {
             matches!(
                 authority.kind,
-                BUJAMENTOR_CURSOR_REPLAY_KIND | BUJAMENTOR_CURSOR_LEFTOVER_KIND
-            )
-                && binding_evidence
-                    .iter()
-                    .all(|binding| binding.chat_id != target.chat_id)
+                AUTO_REPLY_CURSOR_REPLAY_KIND | AUTO_REPLY_CURSOR_LEFTOVER_KIND
+            ) && binding_evidence
+                .iter()
+                .all(|binding| binding.chat_id != target.chat_id)
         })
     {
-        anyhow::bail!("Bujamentor replay enrollment requires fresh AX transcript authority");
+        anyhow::bail!("AutoReply replay enrollment requires fresh AX transcript authority");
     }
     let payload = serde_json::json!({
-        "schema_version": BUJAMENTOR_ENROLLMENT_SCHEMA_VERSION,
+        "schema_version": AUTO_REPLY_ENROLLMENT_SCHEMA_VERSION,
         "activation": "foreground",
         "selectors": selector_values,
         "runtime_root": runtime_root,
@@ -3560,7 +3643,7 @@ fn write_auto_reply_enrollment(
                 "room_state_root": root.join("rooms").join(target.chat_id.to_string()),
                 "identity": identity,
                 "cursor_authority": {
-                    "schema_version": BUJAMENTOR_CURSOR_AUTHORITY_SCHEMA_VERSION,
+                    "schema_version": AUTO_REPLY_CURSOR_AUTHORITY_SCHEMA_VERSION,
                     "kind": authority.kind,
                     "cursor_floor": authority.cursor_floor,
                     "attested_db_last_log_id": authority.attested_db_last_log_id,
@@ -3790,7 +3873,7 @@ fn auto_reply_bind_author_ids(
     for target in targets {
         let reply_authors = reply_authors_by_room
             .get(&target.chat_id)
-            .context("Bujamentor per-room reply-author allowlist is incomplete")?;
+            .context("AutoReply per-room reply-author allowlist is incomplete")?;
         let configured = reply_authors
             .iter()
             .map(|nickname| nickname.trim().to_string())
@@ -3804,16 +3887,36 @@ fn auto_reply_bind_author_ids(
             })
         {
             anyhow::bail!(
-                "Bujamentor reply-author allowlist for room {} is invalid or duplicated",
+                "AutoReply reply-author allowlist for room {} is invalid or duplicated",
                 target.chat_id
             );
         }
         let identities = reader.room_author_identities(target.chat_id)?;
+        let present = identities
+            .iter()
+            .map(|identity| identity.nickname.trim().to_string())
+            .filter(|nickname| configured.contains(nickname))
+            .collect::<std::collections::BTreeSet<_>>();
+        let effective = if present.is_empty() {
+            identities
+                .iter()
+                .filter(|identity| !identity.is_self && !identity.nickname.trim().is_empty())
+                .map(|identity| identity.nickname.trim().to_string())
+                .collect::<std::collections::BTreeSet<_>>()
+        } else {
+            present
+        };
+        if effective.is_empty() {
+            anyhow::bail!(
+                "AutoReply reply author allowlist for room {:?} has no bindable members",
+                target.chat_name
+            );
+        }
         let bindings = resolve_auto_reply_author_bindings(
             &target.chat_name,
             reader.account_user_id(),
             &identities,
-            &configured,
+            &effective,
         )?;
         by_chat.insert(target.chat_id, bindings);
     }
@@ -3835,7 +3938,7 @@ fn configure_auto_reply_supervisor_author_policy(
 
 fn configure_auto_reply_supervisor_shared_state(command: &mut Command, root: &Path) {
     command
-        .env("OPENKAKAO_BUJAMENTOR_SEND_LOCK", root.join(".ax-send.lock"))
+        .env("OPENKAKAO_AUTO_REPLY_SEND_LOCK", root.join(".ax-send.lock"))
         .env(
             "OPENKAKAO_MODEL_CIRCUIT_DB",
             root.join("model-circuit.sqlite3"),
@@ -3857,7 +3960,7 @@ fn resolve_auto_reply_author_bindings(
             || identity.author_id == MAX_INT64
             || identity.is_self != (identity.author_id == account_user_id)
         {
-            anyhow::bail!("Bujamentor room author identity proof is inconsistent");
+            anyhow::bail!("AutoReply room author identity proof is inconsistent");
         }
         nicknames_by_id
             .entry(identity.author_id)
@@ -3870,41 +3973,37 @@ fn resolve_auto_reply_author_bindings(
                 .insert(identity.author_id);
         }
     }
-    let mut bindings = Vec::with_capacity(configured.len());
+    let mut bindings = Vec::new();
     let mut bound_ids = std::collections::BTreeSet::new();
     for nickname in configured {
         let ids = ids_by_nickname.get(nickname).cloned().unwrap_or_default();
         if ids.len() != 1 {
-            anyhow::bail!(
-                    "Bujamentor reply author {nickname:?} in room {:?} is missing or ambiguous; re-enroll after resolving nickname identity",
-                    room_name
-                );
+            continue;
         }
         let author_id = *ids.iter().next().expect("one author ID");
         if nicknames_by_id
             .get(&author_id)
-            .is_none_or(|names| names.len() != 1 || !names.contains(nickname))
+            .is_none_or(|names| !names.contains(nickname))
         {
-            anyhow::bail!(
-                "Bujamentor reply author {nickname:?} has ambiguous nickname rows; re-enrollment is required"
-            );
+            continue;
         }
         if author_id == account_user_id {
-            anyhow::bail!(
-                    "Bujamentor reply author {nickname:?} resolves to the local account; re-enroll with a non-self author"
-                );
+            continue;
         }
         if !bound_ids.insert(author_id) {
-            anyhow::bail!(
-                    "Bujamentor reply-author bindings reuse one numeric author ID; re-enroll after resolving identity drift"
-                );
+            continue;
         }
         bindings.push(AutoReplyAuthorBinding {
             nickname: nickname.clone(),
             author_id,
         });
     }
-    Ok(bindings)
+    if bindings.is_empty() {
+        anyhow::bail!(
+            "AutoReply reply author allowlist for room {room_name:?} has no bindable members"
+        );
+    }
+    return Ok(bindings);
 }
 
 fn auto_reply_attest_explicit_bindings(
@@ -3941,9 +4040,9 @@ fn auto_reply_attest_explicit_bindings(
         let local_pairs = ax_send::normalize_local_binding_suffix(&local_messages);
         let local_texts = local_pairs
             .iter()
-            .map(|(_, text)| text.clone())
+            .map(|(_, token)| token.text.clone())
             .collect::<Vec<_>>();
-        let suffix_match = ax_send::match_transcript_suffix(&ax_texts, &local_texts);
+        let suffix_match = ax_send::match_local_binding_suffix(&ax_texts, &local_pairs);
         let matched_pairs = local_pairs
             .iter()
             .rev()
@@ -3952,17 +4051,19 @@ fn auto_reply_attest_explicit_bindings(
             .collect::<Vec<_>>();
         let matched_texts = matched_pairs
             .iter()
-            .map(|(_, text)| text.clone())
+            .map(|(_, token)| token.text.clone())
             .collect::<Vec<_>>();
         if !suffix_match.is_strong() {
             anyhow::bail!(
                 "explicit chat binding {id}:{name} failed read-only AX/local transcript attestation \
-                 (matched={}, distinct={}, utf8_bytes={}, ax_rows={}, local_rows={})",
+                 (matched={}, distinct={}, utf8_bytes={}, ax_rows={}, local_rows={}, ax_tail={}, local_tail={})",
                 suffix_match.matched_count,
                 suffix_match.matched_distinct,
                 suffix_match.matched_utf8_bytes,
                 ax_texts.len(),
-                local_texts.len()
+                local_texts.len(),
+                ax_send::binding_kind_tail(&ax_texts, 4),
+                ax_send::binding_kind_tail(&local_texts, 4)
             );
         }
         let matched_log_ids = matched_pairs
@@ -4006,12 +4107,7 @@ fn validate_auto_reply_context(
                 target.chat_name
             )
         })?;
-        if state.chat_id != target.chat_id
-            || state.chat != target.chat_name
-            || !state.authoritative
-            || state.summary_dirty
-            || state.sync_status != "ready"
-        {
+        if !state.allows_auto_reply_startup(target.chat_id, &target.chat_name) {
             anyhow::bail!(
                 "authoritative live context is not ready for {:?}",
                 target.chat_name
@@ -4043,7 +4139,7 @@ fn validate_auto_reply_context(
             )
         })?;
         if timing.source != state.source
-            || timing.sample_count < 32
+            || timing.sample_count == 0
             || !timing.average_seconds.is_finite()
             || !timing.median_seconds.is_finite()
             || !timing.p90_seconds.is_finite()
@@ -4052,10 +4148,17 @@ fn validate_auto_reply_context(
             || timing.median_seconds < 0.0
             || timing.p90_seconds < 0.0
             || timing.stddev_seconds < 0.0
-            || (timing.stddev_seconds == 0.0
-                && timing.p90_seconds <= timing.average_seconds
-                && timing.median_seconds == timing.average_seconds)
-            || timing.distribution.is_none()
+        {
+            anyhow::bail!(
+                "response-time distribution is invalid for {:?}",
+                target.chat_name
+            );
+        }
+        if timing.sample_count >= 32
+            && (timing.distribution.is_none()
+                || (timing.stddev_seconds == 0.0
+                    && timing.p90_seconds <= timing.average_seconds
+                    && timing.median_seconds == timing.average_seconds))
         {
             anyhow::bail!(
                 "response-time distribution is invalid for {:?}",
@@ -4097,10 +4200,10 @@ fn run_auto_reply(
     }
     let reply_author_override_active = !reply_author_overrides.is_empty();
     if self_nickname_override.is_some() {
-        effective_config.bujamentor.self_nickname = self_nickname_override;
+        effective_config.auto_reply.self_nickname = self_nickname_override;
     }
     if reply_author_override_active {
-        effective_config.bujamentor.reply_authors = reply_author_overrides.clone();
+        effective_config.auto_reply.reply_authors = reply_author_overrides.clone();
     }
     let config = &effective_config;
     if !interval.is_finite() || !(0.2..=60.0).contains(&interval) {
@@ -4112,36 +4215,6 @@ fn run_auto_reply(
     let root = auto_reply_state_root(config)?;
     let (canonical_config_path, config_digest) = match config::verify_config_attestation(config) {
         Ok(attestation) => attestation,
-        Err(error) => {
-            emit_auto_reply_preflight(
-                json_output,
-                check,
-                &[],
-                &root,
-                false,
-                Some(&error.to_string()),
-                false,
-            );
-            return Err(error);
-        }
-    };
-    let selector_values = match auto_reply_selector_values(config, selector_values) {
-        Ok(values) => values,
-        Err(error) => {
-            emit_auto_reply_preflight(
-                json_output,
-                check,
-                &[],
-                &root,
-                false,
-                Some(&error.to_string()),
-                false,
-            );
-            return Err(error);
-        }
-    };
-    let selectors = match local_db::parse_chat_selectors(&selector_values) {
-        Ok(selectors) => selectors,
         Err(error) => {
             emit_auto_reply_preflight(
                 json_output,
@@ -4185,6 +4258,48 @@ fn run_auto_reply(
             return Err(error);
         }
     };
+    let group_titles = reader
+        .list_group_chats(10_000)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|chat| (chat.chat_id, chat.title))
+        .collect::<Vec<_>>();
+    let selector_values = match auto_reply_selector_values(
+        config,
+        selector_values,
+        &chats,
+        &root,
+        &group_titles,
+    ) {
+        Ok(values) => values,
+        Err(error) => {
+            emit_auto_reply_preflight(
+                json_output,
+                check,
+                &[],
+                &root,
+                false,
+                Some(&error.to_string()),
+                false,
+            );
+            return Err(error);
+        }
+    };
+    let selectors = match local_db::parse_chat_selectors(&selector_values) {
+        Ok(selectors) => selectors,
+        Err(error) => {
+            emit_auto_reply_preflight(
+                json_output,
+                check,
+                &[],
+                &root,
+                false,
+                Some(&error.to_string()),
+                false,
+            );
+            return Err(error);
+        }
+    };
     let targets = match local_db::resolve_chat_selectors(&chats, &selectors) {
         Ok(targets) => targets,
         Err(error) => {
@@ -4200,11 +4315,31 @@ fn run_auto_reply(
             return Err(error);
         }
     };
+    let group_titles = reader
+        .list_group_chats(10_000)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|chat| (chat.chat_id, chat.title))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut targets = targets;
+    for target in &mut targets {
+        if target.chat_name.trim().is_empty() {
+            if let Some(title) = group_titles.get(&target.chat_id) {
+                target.chat_name = title.clone();
+            } else if !target.display_name.trim().is_empty() {
+                target.chat_name = target.display_name.clone();
+            }
+        }
+    }
     let target_names = targets
         .iter()
         .map(|target| target.chat_name.clone())
         .collect::<Vec<_>>();
-    if let Err(error) = config::validate_bujamentor_startup(config, &target_names) {
+    let target_ids = targets
+        .iter()
+        .map(|target| target.chat_id)
+        .collect::<Vec<_>>();
+    if let Err(error) = config::validate_auto_reply_startup(config, &target_names, &target_ids) {
         emit_auto_reply_preflight(
             json_output,
             check,
@@ -4221,7 +4356,7 @@ fn run_auto_reply(
         .map(|target| target.chat_id)
         .collect::<Vec<_>>();
     let mut reply_authors_by_room =
-        match config::bujamentor_reply_authors_by_room(config, &target_ids) {
+        match config::auto_reply_reply_authors_by_room(config, &target_ids) {
             Ok(values) => values,
             Err(error) => {
                 emit_auto_reply_preflight(
@@ -4238,7 +4373,7 @@ fn run_auto_reply(
         };
     if reply_author_override_active {
         let override_authors =
-            match config::validate_bujamentor_reply_author_override(&reply_author_overrides) {
+            match config::validate_auto_reply_reply_author_override(&reply_author_overrides) {
                 Ok(values) => values,
                 Err(error) => {
                     emit_auto_reply_preflight(
@@ -4302,14 +4437,14 @@ fn run_auto_reply(
         return Err(error);
     }
     let binary = std::env::current_exe().context("resolve current openkakao binary")?;
-    let (supervisor, runtime_root) = resolve_bujamentor_supervisor(&binary)?;
-    let python = validate_bujamentor_executable(
-        config.bujamentor.python_interpreter.as_deref(),
-        "Bujamentor python_interpreter",
+    let (supervisor, runtime_root) = resolve_auto_reply_supervisor(&binary)?;
+    let python = validate_auto_reply_executable(
+        config.auto_reply.python_interpreter.as_deref(),
+        "AutoReply python_interpreter",
         "python3",
         !check,
     )?;
-    let runner = validate_bujamentor_runner(config)?;
+    let runner = validate_auto_reply_runner(config)?;
     if check {
         if let Err(error) = auto_reply_legacy_conflict(&root) {
             emit_auto_reply_preflight(
@@ -4347,8 +4482,8 @@ fn run_auto_reply(
 
     auto_reply_legacy_conflict(&root)?;
     let _owner_lock = acquire_auto_reply_owner_lock(&root)?;
-    let self_nickname = config::bujamentor_self_nickname(config)
-        .context("Bujamentor self nickname is not configured")?;
+    let self_nickname = config::auto_reply_self_nickname(config)
+        .context("AutoReply self nickname is not configured")?;
     let (enrollment_floors, enrollment_digest) = write_auto_reply_enrollment(
         &root,
         &selector_values,
@@ -4368,15 +4503,21 @@ fn run_auto_reply(
         let target_author_bindings = serde_json::to_string(
             author_bindings
                 .get(&target.chat_id)
-                .context("Bujamentor numeric reply-author enrollment is incomplete")?,
+                .context("AutoReply numeric reply-author enrollment is incomplete")?,
         )?;
-        let target_reply_authors = reply_authors_by_room
+        let target_reply_authors = author_bindings
             .get(&target.chat_id)
-            .context("Bujamentor per-room reply-author allowlist is incomplete")?;
+            .context("AutoReply numeric reply-author enrollment is incomplete")?
+            .iter()
+            .map(|binding| binding.nickname.clone())
+            .collect::<Vec<_>>();
+        let _ = reply_authors_by_room
+            .get(&target.chat_id)
+            .context("AutoReply per-room reply-author allowlist is incomplete")?;
         let mut command = Command::new(&python);
         command
             .current_dir(&runtime_root)
-            .args(BUJAMENTOR_PYTHON_ISOLATION_ARGS)
+            .args(AUTO_REPLY_PYTHON_ISOLATION_ARGS)
             .arg(&supervisor)
             .arg("--interval")
             .arg(interval.to_string())
@@ -4396,10 +4537,21 @@ fn run_auto_reply(
             .env("OPENKAKAO_TARGET_CHAT_ID", target.chat_id.to_string())
             .env("OPENKAKAO_TARGET_CHAT_NAME", &target.chat_name)
             .env("OPENKAKAO_INITIAL_CURSOR", enrollment_floor.to_string())
+            .env(
+                "OPENKAKAO_GEEKNEWS_ENABLED",
+                if room_catalog::catalog_geeknews_chat_ids(&root)
+                    .ok()
+                    .is_some_and(|ids| ids.contains(&target.chat_id))
+                {
+                    "1"
+                } else {
+                    "0"
+                },
+            )
             .env("OPENKAKAO_SELF_NICKNAME", &self_nickname)
             .env(
                 "OPENKAKAO_ALLOW_LINK_FETCH",
-                if config.bujamentor.allow_link_fetch {
+                if config.auto_reply.allow_link_fetch {
                     "1"
                 } else {
                     "0"
@@ -4407,7 +4559,7 @@ fn run_auto_reply(
             )
             .env(
                 "OPENKAKAO_ALLOW_IMAGE_ANALYSIS",
-                if config.bujamentor.allow_image_analysis {
+                if config.auto_reply.allow_image_analysis {
                     "1"
                 } else {
                     "0"
@@ -4416,7 +4568,7 @@ fn run_auto_reply(
             .env_remove(AUTO_REPLY_GUARDIAN_LIVENESS_ENV)
             .env("OPENKAKAO_BINARY", &binary)
             .env("OPENKAKAO_PYTHON", &python)
-            .env("OPENKAKAO_BUJAMENTOR_RUNTIME_ROOT", &runtime_root)
+            .env("OPENKAKAO_AUTO_REPLY_RUNTIME_ROOT", &runtime_root)
             .stdout(if json_output {
                 Stdio::null()
             } else {
@@ -4430,7 +4582,7 @@ fn run_auto_reply(
         configure_auto_reply_supervisor_shared_state(&mut command, &root);
         configure_auto_reply_supervisor_author_policy(
             &mut command,
-            target_reply_authors,
+            &target_reply_authors,
             &target_author_bindings,
         );
         command
@@ -4447,7 +4599,7 @@ fn run_auto_reply(
         match command.spawn() {
             Ok(child) => children.children.push(child),
             Err(error) => {
-                anyhow::bail!("start Bujamentor worker for {}: {error}", target.chat_name);
+                anyhow::bail!("start AutoReply worker for {}: {error}", target.chat_name);
             }
         }
     }
@@ -4497,10 +4649,10 @@ fn run_auto_reply(
     write_auto_reply_aggregate(&root, &targets, &children.children, "stopped")?;
     children.disarm();
     if AUTO_REPLY_GUARDIAN_LOST.load(Ordering::Acquire) {
-        anyhow::bail!("session guardian liveness was lost; all Bujamentor workers were stopped");
+        anyhow::bail!("session guardian liveness was lost; all AutoReply workers were stopped");
     }
     if failed {
-        anyhow::bail!("one or more Bujamentor workers exited unsuccessfully");
+        anyhow::bail!("one or more AutoReply workers exited unsuccessfully");
     }
     Ok(())
 }
@@ -4520,18 +4672,18 @@ fn require_loco_write(config: &config::OpenKakaoConfig) -> Result<()> {
     Ok(())
 }
 
-const BUJAMENTOR_READINESS_MAX_AGE_SECONDS: f64 = 15.0;
-const BUJAMENTOR_READINESS_MAX_BYTES: u64 = 64 * 1024;
+const AUTO_REPLY_READINESS_MAX_AGE_SECONDS: f64 = 15.0;
+const AUTO_REPLY_READINESS_MAX_BYTES: u64 = 64 * 1024;
 const MAX_INT64: i64 = i64::MAX;
 
 fn read_bounded_file(path: &Path) -> Result<Vec<u8>> {
     let metadata = fs::symlink_metadata(path)
         .with_context(|| format!("read readiness metadata: {}", path.display()))?;
-    if !metadata.file_type().is_file() || metadata.len() > BUJAMENTOR_READINESS_MAX_BYTES {
+    if !metadata.file_type().is_file() || metadata.len() > AUTO_REPLY_READINESS_MAX_BYTES {
         anyhow::bail!("invalid readiness file");
     }
     let raw = fs::read(path).with_context(|| format!("read readiness file: {}", path.display()))?;
-    if raw.len() as u64 > BUJAMENTOR_READINESS_MAX_BYTES {
+    if raw.len() as u64 > AUTO_REPLY_READINESS_MAX_BYTES {
         anyhow::bail!("readiness file exceeds bound");
     }
     Ok(raw)
@@ -4631,7 +4783,7 @@ fn cli_enrollment_cursor_authority(
             .any(|key| !authority.contains_key(*key))
         || authority.get("schema_version")
             != Some(&serde_json::Value::from(
-                BUJAMENTOR_CURSOR_AUTHORITY_SCHEMA_VERSION,
+                AUTO_REPLY_CURSOR_AUTHORITY_SCHEMA_VERSION,
             ))
         || authority.get("cursor_floor").and_then(readiness_integer) != Some(cursor_floor)
     {
@@ -4649,7 +4801,7 @@ fn cli_enrollment_cursor_authority(
     let prior_owner = authority.get("prior_owner_id");
     let prior_epoch = authority.get("prior_source_epoch");
     match kind {
-        BUJAMENTOR_CURSOR_FRESH_KIND => {
+        AUTO_REPLY_CURSOR_FRESH_KIND => {
             if cursor_floor != attested_tail
                 || prior_owner != Some(&serde_json::Value::Null)
                 || prior_epoch != Some(&serde_json::Value::Null)
@@ -4657,7 +4809,7 @@ fn cli_enrollment_cursor_authority(
                 anyhow::bail!("CLI fresh cursor authority invalid");
             }
         }
-        BUJAMENTOR_CURSOR_REPLAY_KIND | BUJAMENTOR_CURSOR_LEFTOVER_KIND => {
+        AUTO_REPLY_CURSOR_REPLAY_KIND | AUTO_REPLY_CURSOR_LEFTOVER_KIND => {
             if cursor_floor > attested_tail
                 || prior_owner
                     .and_then(serde_json::Value::as_str)
@@ -4683,7 +4835,7 @@ fn validate_cli_enrollment_authority(
 ) -> Result<()> {
     if enrollment.get("schema_version")
         != Some(&serde_json::Value::from(
-            BUJAMENTOR_ENROLLMENT_SCHEMA_VERSION,
+            AUTO_REPLY_ENROLLMENT_SCHEMA_VERSION,
         ))
     {
         anyhow::bail!("CLI enrollment authority schema invalid");
@@ -4810,11 +4962,12 @@ fn validate_cli_enrollment_authority(
                 .unwrap_or("");
             if !local_name.is_empty()
                 || !json_object_has_exact_keys(identity, &expected_keys)
-                || !(3..=20).contains(&parsed_log_ids.len())
+                || !(2..=20).contains(&parsed_log_ids.len())
                 || unique_log_ids.len() != parsed_log_ids.len()
                 || identity.get("matched_count").and_then(readiness_integer)
                     != Some(parsed_log_ids.len() as i64)
-                || matched_utf8_bytes < 24
+                || matched_utf8_bytes < 0
+                || (parsed_log_ids.len() >= 3 && matched_utf8_bytes < 24)
                 || !(0 < attested_db_last_log_id && attested_db_last_log_id < MAX_INT64)
                 || attested_db_last_log_id != cursor_attested_tail
                 || attested_db_last_log_id
@@ -4828,7 +4981,7 @@ fn validate_cli_enrollment_authority(
     }
     if matches!(
         cursor_kind,
-        BUJAMENTOR_CURSOR_REPLAY_KIND | BUJAMENTOR_CURSOR_LEFTOVER_KIND
+        AUTO_REPLY_CURSOR_REPLAY_KIND | AUTO_REPLY_CURSOR_LEFTOVER_KIND
     ) && kind != "ax_transcript"
     {
         anyhow::bail!("CLI leftover or replay cursor requires transcript identity");
@@ -4870,11 +5023,11 @@ fn readiness_fresh(value: &serde_json::Value, now: f64) -> bool {
     stamp.is_some_and(|stamp| {
         stamp.is_finite()
             && -5.0 <= now - stamp
-            && now - stamp <= BUJAMENTOR_READINESS_MAX_AGE_SECONDS
+            && now - stamp <= AUTO_REPLY_READINESS_MAX_AGE_SECONDS
     })
 }
 
-fn require_persisted_bujamentor_readiness(
+fn require_persisted_auto_reply_readiness(
     expected_owner: Option<&str>,
     expected_epoch: Option<i64>,
     expected_target: Option<i64>,
@@ -4882,7 +5035,7 @@ fn require_persisted_bujamentor_readiness(
     expected_last_observed: Option<i64>,
 ) -> Result<()> {
     let home = dirs::home_dir().context("cannot resolve home directory")?;
-    let base = home.join("Library/Application Support/openkakao/bujamentor");
+    let base = auto_reply_service::default_state_root(&home);
     let supervisor_path = std::env::var_os("OPENKAKAO_SUPERVISOR_STATUS")
         .filter(|value| !value.is_empty())
         .map(std::path::PathBuf::from)
@@ -5090,8 +5243,8 @@ fn require_persisted_bujamentor_readiness(
         .and_then(readiness_integer)
         .filter(|value| watermark <= *value && *value < MAX_INT64)
         .context("DB observed watermark invalid")?;
-    if expected_last_observed.is_some_and(|expected| persisted_last_observed != expected) {
-        anyhow::bail!("conversation advanced beyond scheduled reply source");
+    if expected_last_observed.is_some_and(|expected| persisted_last_observed < expected) {
+        anyhow::bail!("scheduled reply source is not in the persisted watcher tail");
     }
     let observed = db_state
         .get("observed_log_ids")
@@ -5143,18 +5296,41 @@ fn require_expected_local_source_tail(
     source_fence: &local_db::LocalPollEnvelope,
 ) -> Result<()> {
     let completeness = &source_fence.completeness;
+    // Later room rows must not cancel an earlier unanswered inbound. The
+    // poll starts after the scheduled source; an empty page means the
+    // source is still the tail, and a complete later page is another
+    // per-message job, not a reason to drop this send.
     if source_fence.chat.chat_id != target_chat_id
         || completeness.after_log_id != expected_source_log_id
-        || completeness.chat_last_log_id != expected_source_log_id
-        || completeness.status != "empty"
         || completeness.has_gap
-        || completeness.has_more
-        || completeness.first_log_id.is_some()
-        || completeness.last_log_id.is_some()
-        || completeness.available_max_log_id.is_some()
-        || !source_fence.messages.is_empty()
+        || completeness.chat_last_log_id < expected_source_log_id
     {
-        anyhow::bail!("conversation advanced beyond scheduled reply source");
+        anyhow::bail!("scheduled reply source tail is unavailable");
+    }
+    if completeness.status == "empty" {
+        if completeness.has_more
+            || completeness.first_log_id.is_some()
+            || completeness.last_log_id.is_some()
+            || completeness.available_max_log_id.is_some()
+            || !source_fence.messages.is_empty()
+            || completeness.chat_last_log_id != expected_source_log_id
+        {
+            anyhow::bail!("scheduled reply source tail is unavailable");
+        }
+        return Ok(());
+    }
+    if completeness.status != "complete" && completeness.status != "partial" {
+        anyhow::bail!("scheduled reply source tail is unavailable");
+    }
+    if source_fence.messages.is_empty()
+        || completeness.first_log_id != source_fence.messages.first().map(|row| row.log_id)
+        || completeness.last_log_id != source_fence.messages.last().map(|row| row.log_id)
+        || source_fence
+            .messages
+            .iter()
+            .any(|row| row.log_id <= expected_source_log_id || row.chat_id != target_chat_id)
+    {
+        anyhow::bail!("scheduled reply source tail is unavailable");
     }
     Ok(())
 }
@@ -5197,28 +5373,28 @@ fn require_allowed_send_chat(config: &config::OpenKakaoConfig, chat_name: &str) 
     Ok(())
 }
 
-fn require_bujamentor_worker_preflight(preflight: bool, worker_identity: bool) -> Result<()> {
+fn require_auto_reply_worker_preflight(preflight: bool, worker_identity: bool) -> Result<()> {
     if preflight && !worker_identity {
         anyhow::bail!(
-            "local-send --preflight is only available to the database-authoritative Bujamentor worker"
+            "local-send --preflight is only available to the database-authoritative AutoReply worker"
         );
     }
     Ok(())
 }
 
 #[cfg(unix)]
-use bujamentor_host::acquire_worker_setup_lock;
+use auto_reply_runtime::acquire_worker_setup_lock;
 
 fn finish_worker_bound_local_send_setup<T>(
     setup: Result<T>,
-    is_bujamentor_worker: bool,
+    is_auto_reply_worker: bool,
     preflight: bool,
     chat_name: &str,
     json: bool,
 ) -> Result<Option<T>> {
     match setup {
         Ok(value) => Ok(Some(value)),
-        Err(_error) if is_bujamentor_worker && !preflight => {
+        Err(_error) if is_auto_reply_worker && !preflight => {
             commands::local_send::emit_pre_send_unavailable(chat_name, json)?;
             Ok(None)
         }
@@ -5233,7 +5409,7 @@ fn main() -> Result<()> {
         Ok(config) => config,
         Err(error) => {
             if let Some(status_path) = service_bootstrap_status_path {
-                let _ = bujamentor_service::write_config_invalid_status(status_path);
+                let _ = auto_reply_service::write_config_invalid_status(status_path);
             }
             return Err(error);
         }
@@ -5765,8 +5941,28 @@ fn main() -> Result<()> {
             eprintln!("[deprecated] 'loco-probe' is now hidden. Prefer 'probe'.");
             commands::probe::cmd_loco_probe(&method, body.as_deref(), json, false)?
         }
-        Commands::LocalChats { limit } => {
+        Commands::LocalChats { limit, groups } => {
             let reader = local_db::LocalDbReader::open()?;
+            if groups {
+                let chats = reader.list_group_chats(limit)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&chats)?);
+                } else if chats.is_empty() {
+                    println!("No group chats found in local database.");
+                } else {
+                    for c in &chats {
+                        println!(
+                            "  {} | {} | {} ({})",
+                            c.chat_id, c.chat_type, c.title, c.members,
+                        );
+                    }
+                    println!(
+                        "\n{} group chats (local DB, no server contact)",
+                        chats.len()
+                    );
+                }
+                return Ok(());
+            }
             let chats = reader.list_chats(limit)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&chats)?);
@@ -5859,9 +6055,13 @@ fn main() -> Result<()> {
                 std::thread::sleep(std::time::Duration::from_secs_f64(interval));
             }
         }
-        Commands::LocalSearch { query, count } => {
+        Commands::LocalSearch {
+            query,
+            count,
+            chat_id,
+        } => {
             let reader = local_db::LocalDbReader::open()?;
-            let results = reader.search_messages(&query, count)?;
+            let results = reader.search_messages(&query, count, chat_id)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&results)?);
             } else {
@@ -5936,7 +6136,12 @@ fn main() -> Result<()> {
                 );
             }
         }
-        Commands::ContextSyncLocal { chat_id, chat, db } => {
+        Commands::ContextSyncLocal {
+            chat_id,
+            chat,
+            db,
+            interest_only,
+        } => {
             if chat.trim().is_empty() || chat.len() > 512 || chat.chars().any(char::is_control) {
                 anyhow::bail!("context sync chat name is invalid");
             }
@@ -6045,6 +6250,9 @@ fn main() -> Result<()> {
                         auto_generated: classifications
                             .get(&message.log_id)
                             .is_some_and(|item| item.auto_generated),
+                        attachment: message.attachment.clone(),
+                        message_type: message.message_type,
+                        interest_only,
                     })
                     .collect::<Vec<_>>();
                 let complete = deferred_event.is_none()
@@ -6061,7 +6269,7 @@ fn main() -> Result<()> {
                     checkpoint,
                     &events,
                     complete,
-                    complete,
+                    complete && !interest_only,
                 )?;
                 pages += 1;
                 for (key, value) in [
@@ -6259,7 +6467,10 @@ fn main() -> Result<()> {
                     profile.profile.average_character_length
                 );
             } else {
-                println!("No recipient style profile for '{}' in '{}'.", recipient, chat);
+                println!(
+                    "No recipient style profile for '{}' in '{}'.",
+                    recipient, chat
+                );
             }
         }
         Commands::ContextResponseTime {
@@ -6403,21 +6614,23 @@ fn main() -> Result<()> {
             preflight,
         } => {
             let msg = format_outgoing_message(&message, no_prefix);
-            let worker_identity =
-                std::env::var("OPENKAKAO_BUJAMENTOR_WORKER").as_deref() == Ok("1");
-            require_bujamentor_worker_preflight(preflight, worker_identity)?;
-            let is_bujamentor_worker = !dry_run && worker_identity;
+            let worker_identity = std::env::var("OPENKAKAO_AUTO_REPLY_WORKER")
+                .or_else(|_| std::env::var("OPENKAKAO_BUJAMENTOR_WORKER"))
+                .as_deref()
+                == Ok("1");
+            require_auto_reply_worker_preflight(preflight, worker_identity)?;
+            let is_auto_reply_worker = !dry_run && worker_identity;
             let setup = (|| -> Result<_> {
-                let _generation_lock = if is_bujamentor_worker {
+                let _generation_lock = if is_auto_reply_worker && !preflight {
                     let home = dirs::home_dir().context("cannot resolve home directory")?;
-                    let lock_path = std::env::var_os("OPENKAKAO_BUJAMENTOR_GENERATION_LOCK")
+                    let lock_path = std::env::var_os("OPENKAKAO_AUTO_REPLY_GENERATION_LOCK")
+                    .or_else(|| std::env::var_os("OPENKAKAO_AUTO_REPLY_LOCK"))
+                    .or_else(|| std::env::var_os("OPENKAKAO_BUJAMENTOR_GENERATION_LOCK"))
                     .or_else(|| std::env::var_os("OPENKAKAO_BUJAMENTOR_LOCK"))
                     .filter(|value| !value.is_empty())
                     .map(std::path::PathBuf::from)
                     .unwrap_or_else(|| {
-                        home.join(
-                            "Library/Application Support/openkakao/bujamentor/.owner-generation.lock",
-                        )
+                        auto_reply_service::default_state_root(&home).join(".owner-generation.lock")
                     });
                     let lock = fs::OpenOptions::new()
                         .create(true)
@@ -6429,18 +6642,14 @@ fn main() -> Result<()> {
                     acquire_worker_setup_lock(
                         &lock,
                         "owner-generation lock",
-                        if preflight {
-                            std::time::Duration::from_millis(0)
-                        } else {
-                            std::time::Duration::from_millis(400)
-                        },
+                        std::time::Duration::from_millis(400),
                     )?;
                     Some(lock)
                 } else {
                     None
                 };
-                let _send_lock = if is_bujamentor_worker {
-                    if let Some(lock_path) = std::env::var_os("OPENKAKAO_BUJAMENTOR_SEND_LOCK")
+                let _send_lock = if is_auto_reply_worker && !preflight {
+                    if let Some(lock_path) = std::env::var_os("OPENKAKAO_AUTO_REPLY_SEND_LOCK")
                         .filter(|value| !value.is_empty())
                     {
                         let lock = fs::OpenOptions::new()
@@ -6453,11 +6662,7 @@ fn main() -> Result<()> {
                         acquire_worker_setup_lock(
                             &lock,
                             "AX send lock",
-                            if preflight {
-                                std::time::Duration::from_millis(0)
-                            } else {
-                                std::time::Duration::from_millis(400)
-                            },
+                            std::time::Duration::from_millis(400),
                         )?;
                         Some(lock)
                     } else {
@@ -6469,8 +6674,8 @@ fn main() -> Result<()> {
                 let mut bound_chat = None;
                 if !dry_run {
                     let mut worker_target = None;
-                    if is_bujamentor_worker {
-                        config::validate_bujamentor_auto_reply(&config)?;
+                    if is_auto_reply_worker {
+                        config::validate_auto_reply(&config)?;
                         let expected_owner = std::env::var("OPENKAKAO_SUPERVISOR_OWNER")
                             .ok()
                             .filter(|value| !value.trim().is_empty())
@@ -6510,7 +6715,7 @@ fn main() -> Result<()> {
                         let proactive_send = std::env::var("OPENKAKAO_PROACTIVE_SEND")
                             .ok()
                             .is_some_and(|value| value == "1");
-                        require_persisted_bujamentor_readiness(
+                        require_persisted_auto_reply_readiness(
                             Some(expected_owner.as_str()),
                             Some(expected_epoch),
                             Some(expected_target),
@@ -6593,7 +6798,7 @@ fn main() -> Result<()> {
                         messages.reverse();
                         let local_tail = ax_send::normalize_local_binding_suffix(&messages)
                             .into_iter()
-                            .map(|(_, text)| text)
+                            .map(|(_, token)| token)
                             .collect();
                         bound_chat = Some(commands::local_send::BoundLocalSend {
                             chat_id: target_chat_id,
@@ -6607,7 +6812,7 @@ fn main() -> Result<()> {
             let Some((_generation_lock, _send_lock, bound_chat)) =
                 finish_worker_bound_local_send_setup(
                     setup,
-                    is_bujamentor_worker,
+                    is_auto_reply_worker,
                     preflight,
                     &chat_name,
                     json,
@@ -6697,6 +6902,39 @@ fn main() -> Result<()> {
             model,
             json,
         )?,
+        Commands::AutoReplyHost {
+            bake,
+            status,
+            disable,
+            tick,
+            chat,
+            manifest,
+            state_root,
+        } => {
+            let action = match (bake, status, disable, tick) {
+                (true, false, false, false) => commands::auto_reply_host::AutoReplyHostAction::Bake,
+                (false, true, false, false) => {
+                    commands::auto_reply_host::AutoReplyHostAction::Status
+                }
+                (false, false, true, false) => {
+                    commands::auto_reply_host::AutoReplyHostAction::Disable
+                }
+                (false, false, false, true) => commands::auto_reply_host::AutoReplyHostAction::Tick,
+                (false, false, false, false) => {
+                    commands::auto_reply_host::AutoReplyHostAction::Status
+                }
+                _ => anyhow::bail!("choose one of --bake, --status, --disable, or --tick"),
+            };
+            commands::auto_reply_host::cmd_auto_reply_host(
+                commands::auto_reply_host::AutoReplyHostOptions {
+                    action,
+                    chats: chat,
+                    json,
+                    manifest,
+                    state_root,
+                },
+            )?
+        }
         Commands::WatchCache { interval } => commands::auth::cmd_watch_cache(interval)?,
         Commands::Doctor { loco } => commands::doctor::cmd_doctor(json, loco, &config)?,
     }
@@ -6762,6 +7000,8 @@ mod tests {
         ])
         .is_err());
     }
+    #[cfg(unix)]
+    use crate::auto_reply_runtime::acquire_worker_setup_lock_nonblocking;
     use crate::commands::members::LocoMemberProfile;
     use crate::commands::profile::{
         build_syncmainpf_candidate, collect_hint_chat_ids, local_graph_hint_summary,
@@ -6774,8 +7014,6 @@ mod tests {
     };
     use crate::loco_helpers::should_retry_loco_probe_error;
     use crate::util::{require_permission, validate_outbound_message};
-    #[cfg(unix)]
-    use crate::bujamentor_host::acquire_worker_setup_lock_nonblocking;
 
     #[cfg(unix)]
     #[test]
@@ -6788,20 +7026,20 @@ mod tests {
         fs::set_permissions(&source, fs::Permissions::from_mode(0o600))
             .expect("make auth fixture private");
         let uid = fs::symlink_metadata(&source).expect("auth metadata").uid();
-        validate_bujamentor_codex_auth(&source, uid)
+        validate_auto_reply_codex_auth(&source, uid)
             .expect("a private single-link regular credential must pass");
 
         let linked = root.path().join("auth-symlink.json");
         symlink(&source, &linked).expect("create symlink fixture");
-        assert!(validate_bujamentor_codex_auth(&linked, uid).is_err());
+        assert!(validate_auto_reply_codex_auth(&linked, uid).is_err());
 
         let hardlinked = root.path().join("auth-hardlink.json");
         fs::hard_link(&source, &hardlinked).expect("create hardlink fixture");
-        assert!(validate_bujamentor_codex_auth(&source, uid).is_err());
-        assert!(validate_bujamentor_codex_auth(&hardlinked, uid).is_err());
+        assert!(validate_auto_reply_codex_auth(&source, uid).is_err());
+        assert!(validate_auto_reply_codex_auth(&hardlinked, uid).is_err());
         fs::remove_file(&hardlinked).expect("remove hardlink");
         fs::write(&source, b"").expect("empty the auth fixture");
-        assert!(validate_bujamentor_codex_auth(&source, uid).is_err());
+        assert!(validate_auto_reply_codex_auth(&source, uid).is_err());
     }
 
     fn local_source_fence(
@@ -6994,21 +7232,26 @@ mod tests {
     }
 
     #[test]
-    fn final_local_source_fence_rejects_db_advance_before_watcher_state() {
+    fn final_local_source_fence_allows_later_rows_after_scheduled_source() {
         let watcher_last_observed = 100;
         let current = local_source_fence(42, watcher_last_observed, watcher_last_observed, &[]);
         require_expected_local_source_tail(42, watcher_last_observed, &current)
             .expect("an exact local source tail should remain eligible");
 
-        // KakaoTalk can advance its database while the generation lock keeps
-        // the watcher state at 100. The final source check must still reject.
+        // A later inbound is its own job. It must not cancel the earlier
+        // scheduled send once the source row itself is still present.
         let source_db_advanced = local_source_fence(42, watcher_last_observed, 101, &[101]);
-        let error =
-            require_expected_local_source_tail(42, watcher_last_observed, &source_db_advanced)
-                .expect_err("a newer source row must fence the scheduled reply");
+        require_expected_local_source_tail(42, watcher_last_observed, &source_db_advanced)
+            .expect("later room rows must not fence an earlier unanswered inbound");
+
+        let gap = local_source_fence(42, watcher_last_observed, 101, &[101]);
+        let mut gap = gap;
+        gap.completeness.has_gap = true;
+        let error = require_expected_local_source_tail(42, watcher_last_observed, &gap)
+            .expect_err("a gapped poll after the source remains fail-closed");
         assert!(error
             .to_string()
-            .contains("conversation advanced beyond scheduled reply source"));
+            .contains("scheduled reply source tail is unavailable"));
     }
 
     #[test]
@@ -7018,16 +7261,13 @@ mod tests {
         require_expected_local_source_tail(42, tail, &current)
             .expect("a quiet self tail remains an exact empty after-cursor");
         let advanced = local_source_fence(42, tail, tail + 1, &[tail + 1]);
-        let error = require_expected_local_source_tail(42, tail, &advanced)
-            .expect_err("a newer tail after a quiet self row still fences send");
-        assert!(error
-            .to_string()
-            .contains("conversation advanced beyond scheduled reply source"));
+        require_expected_local_source_tail(42, tail, &advanced)
+            .expect("a newer tail after a quiet self row still keeps the source eligible");
     }
 
     #[test]
-    fn bujamentor_supervisor_python_is_environment_and_site_isolated() {
-        assert_eq!(BUJAMENTOR_PYTHON_ISOLATION_ARGS, ["-E", "-B", "-S"]);
+    fn auto_reply_supervisor_python_is_environment_and_site_isolated() {
+        assert_eq!(AUTO_REPLY_PYTHON_ISOLATION_ARGS, ["-E", "-B", "-S"]);
     }
 
     #[test]
@@ -8027,7 +8267,10 @@ mod tests {
         let cli = Cli::try_parse_from(["openkakao-cli", "local-chats", "-n", "10"])
             .expect("local-chats should parse");
         match cli.command {
-            Commands::LocalChats { limit } => assert_eq!(limit, 10),
+            Commands::LocalChats { limit, groups } => {
+                assert_eq!(limit, 10);
+                assert!(!groups);
+            }
             other => panic!("expected local-chats, got {other:?}"),
         }
     }
@@ -8057,14 +8300,38 @@ mod tests {
             [local_db::ChatSelector::Name(name)] if name == "부자멘토멘티"
         ));
     }
+    #[test]
+    fn auto_reply_host_command_parses() {
+        let cli = Cli::try_parse_from(["openkakao-cli", "auto-reply-host", "--status"])
+            .expect("auto-reply-host should parse");
+        match cli.command {
+            Commands::AutoReplyHost {
+                bake,
+                status,
+                disable,
+                tick,
+                ref chat,
+                manifest: _,
+                state_root: _,
+            } => {
+                assert!(!bake);
+                assert!(status);
+                assert!(!disable);
+                assert!(!tick);
+                assert!(chat.is_empty());
+            }
+            other => panic!("expected auto-reply-host, got {other:?}"),
+        }
+        assert!(is_local_only_command(&cli.command));
+    }
 
     #[test]
     fn auto_reply_llm_aliases_map_to_attested_models() {
         assert_eq!(
-            AutoReplyLlmChoice::from_model("gemini-3.6-flash")
+            AutoReplyLlmChoice::from_model("gemini-3.7-flash")
                 .expect("gemini alias")
                 .model(),
-            "google-antigravity/gemini-3.6-flash-tiered"
+            "google-antigravity/gemini-3.7-flash-tiered"
         );
         assert_eq!(
             AutoReplyLlmChoice::from_model("gpt-5.6-luna")
@@ -8086,6 +8353,46 @@ mod tests {
             &["bind:417780809780519:부자멘토멘티".into()],
         );
         assert_eq!(untouched, vec!["name:다른방"]);
+    }
+
+    #[test]
+    fn catalog_merge_appends_auto_reply_rooms() {
+        let merged = room_catalog::merge_configured_and_catalog_selectors(
+            &["bind:42:부자멘토멘티".into()],
+            &[99],
+            &[
+                local_db::LocalChat {
+                    chat_id: 42,
+                    chat_type: 1,
+                    chat_name: "부자멘토멘티".into(),
+                    database_chat_name: None,
+                    active_members_count: 4,
+                    last_log_id: 1,
+                    last_updated_at: 0,
+                    unread_count: 0,
+                    display_name: "부자멘토멘티".into(),
+                },
+                local_db::LocalChat {
+                    chat_id: 99,
+                    chat_type: 1,
+                    chat_name: "kakao-test".into(),
+                    database_chat_name: None,
+                    active_members_count: 2,
+                    last_log_id: 2,
+                    last_updated_at: 0,
+                    unread_count: 0,
+                    display_name: "kakao-test".into(),
+                },
+            ],
+        )
+        .expect("merge");
+        assert_eq!(
+            merged,
+            vec![
+                "bind:42:부자멘토멘티".to_string(),
+                "bind:99:kakao-test".to_string()
+            ]
+        );
     }
 
     #[test]
@@ -8123,7 +8430,7 @@ mod tests {
 
     fn enrollment_fixture(room_root: &Path, identity: serde_json::Value) -> serde_json::Value {
         serde_json::json!({
-            "schema_version": BUJAMENTOR_ENROLLMENT_SCHEMA_VERSION,
+            "schema_version": AUTO_REPLY_ENROLLMENT_SCHEMA_VERSION,
             "activation": "foreground",
             "selectors": ["bind:42:부자멘토멘티"],
             "runtime_root": room_root.parent().and_then(Path::parent).unwrap(),
@@ -8135,8 +8442,8 @@ mod tests {
                 "room_state_root": room_root,
                 "identity": identity,
                 "cursor_authority": {
-                    "schema_version": BUJAMENTOR_CURSOR_AUTHORITY_SCHEMA_VERSION,
-                    "kind": BUJAMENTOR_CURSOR_FRESH_KIND,
+                    "schema_version": AUTO_REPLY_CURSOR_AUTHORITY_SCHEMA_VERSION,
+                    "kind": AUTO_REPLY_CURSOR_FRESH_KIND,
                     "cursor_floor": 100,
                     "attested_db_last_log_id": 100,
                     "prior_owner_id": null,
@@ -8191,6 +8498,41 @@ mod tests {
         validate_cli_enrollment_authority(&enrollment, 42, "부자멘토멘티", 100, &room_root)
             .expect("strict transcript enrollment should pass the final gate");
 
+        let two_row = enrollment_fixture(
+            &room_root,
+            serde_json::json!({
+                "schema_version": 1,
+                "kind": "ax_transcript",
+                "local_name": "",
+                "ax_name": "부자멘토멘티",
+                "matched_log_ids": [99, 100],
+                "matched_count": 2,
+                "matched_utf8_bytes": 19,
+                "transcript_sha256": "a".repeat(64),
+                "attested_db_last_log_id": 100,
+            }),
+        );
+        validate_cli_enrollment_authority(&two_row, 42, "부자멘토멘티", 100, &room_root)
+            .expect("two-row distinct suffix enrollment must match is_strong bind");
+        let one_row = enrollment_fixture(
+            &room_root,
+            serde_json::json!({
+                "schema_version": 1,
+                "kind": "ax_transcript",
+                "local_name": "",
+                "ax_name": "부자멘토멘티",
+                "matched_log_ids": [100],
+                "matched_count": 1,
+                "matched_utf8_bytes": 19,
+                "transcript_sha256": "a".repeat(64),
+                "attested_db_last_log_id": 100,
+            }),
+        );
+        assert!(
+            validate_cli_enrollment_authority(&one_row, 42, "부자멘토멘티", 100, &room_root)
+                .is_err()
+        );
+
         let mut malformed = enrollment_fixture(&room_root, identity);
         malformed["targets"][0]["identity"]["matched_count"] = serde_json::Value::from(2);
         assert!(
@@ -8220,8 +8562,8 @@ mod tests {
         );
         replay_floor["targets"][0]["last_log_id"] = serde_json::Value::from(100);
         replay_floor["targets"][0]["cursor_authority"] = serde_json::json!({
-            "schema_version": BUJAMENTOR_CURSOR_AUTHORITY_SCHEMA_VERSION,
-            "kind": BUJAMENTOR_CURSOR_REPLAY_KIND,
+            "schema_version": AUTO_REPLY_CURSOR_AUTHORITY_SCHEMA_VERSION,
+            "kind": AUTO_REPLY_CURSOR_REPLAY_KIND,
             "cursor_floor": 100,
             "attested_db_last_log_id": 101,
             "prior_owner_id": "prior-owner",
@@ -8232,8 +8574,8 @@ mod tests {
 
         let mut missing_replay_contract = replay_floor.clone();
         missing_replay_contract["targets"][0]["cursor_authority"] = serde_json::json!({
-            "schema_version": BUJAMENTOR_CURSOR_AUTHORITY_SCHEMA_VERSION,
-            "kind": BUJAMENTOR_CURSOR_FRESH_KIND,
+            "schema_version": AUTO_REPLY_CURSOR_AUTHORITY_SCHEMA_VERSION,
+            "kind": AUTO_REPLY_CURSOR_FRESH_KIND,
             "cursor_floor": 100,
             "attested_db_last_log_id": 101,
             "prior_owner_id": null,
@@ -8622,13 +8964,13 @@ mod tests {
         );
         assert_eq!(
             written_enrollment["schema_version"],
-            serde_json::Value::from(BUJAMENTOR_ENROLLMENT_SCHEMA_VERSION)
+            serde_json::Value::from(AUTO_REPLY_ENROLLMENT_SCHEMA_VERSION)
         );
         assert_eq!(
             written_enrollment["targets"][0]["cursor_authority"],
             serde_json::json!({
-                "schema_version": BUJAMENTOR_CURSOR_AUTHORITY_SCHEMA_VERSION,
-                "kind": BUJAMENTOR_CURSOR_FRESH_KIND,
+                "schema_version": AUTO_REPLY_CURSOR_AUTHORITY_SCHEMA_VERSION,
+                "kind": AUTO_REPLY_CURSOR_FRESH_KIND,
                 "cursor_floor": 120,
                 "attested_db_last_log_id": 120,
                 "prior_owner_id": null,
@@ -8754,7 +9096,7 @@ mod tests {
             )
             .expect("prepare reply_jobs v2 rebuild");
         connection
-            .execute_batch(BUJAMENTOR_REPLY_JOBS_V2_TABLE_SQL)
+            .execute_batch(AUTO_REPLY_REPLY_JOBS_V2_TABLE_SQL)
             .expect("create reply_jobs v2 table");
         connection
             .execute_batch(
@@ -8768,25 +9110,25 @@ mod tests {
             )
             .expect("copy reply_jobs v2 rows");
         connection
-            .execute_batch(BUJAMENTOR_REPLY_JOBS_STATUS_INDEX_SQL)
+            .execute_batch(AUTO_REPLY_REPLY_JOBS_STATUS_INDEX_SQL)
             .expect("recreate reply_jobs status index");
         connection
             .execute_batch(journal_table_sql)
             .expect("create transition journal table");
         connection
-            .execute_batch(BUJAMENTOR_PIPELINE_TRANSITIONS_INDEX_SQL)
+            .execute_batch(AUTO_REPLY_PIPELINE_TRANSITIONS_INDEX_SQL)
             .expect("create transition journal index");
         connection
-            .execute_batch(BUJAMENTOR_PIPELINE_TRANSITIONS_INSERT_TRIGGER_SQL)
+            .execute_batch(AUTO_REPLY_PIPELINE_TRANSITIONS_INSERT_TRIGGER_SQL)
             .expect("create transition insert trigger");
         connection
-            .execute_batch(BUJAMENTOR_PIPELINE_TRANSITIONS_UPDATE_TRIGGER_SQL)
+            .execute_batch(AUTO_REPLY_PIPELINE_TRANSITIONS_UPDATE_TRIGGER_SQL)
             .expect("create transition update trigger");
         connection
-            .execute_batch(BUJAMENTOR_PIPELINE_TRANSITIONS_CAP_TRIGGER_SQL)
+            .execute_batch(AUTO_REPLY_PIPELINE_TRANSITIONS_CAP_TRIGGER_SQL)
             .expect("create transition cap trigger");
         connection
-            .pragma_update(None, "user_version", BUJAMENTOR_QUEUE_JOURNAL_USER_VERSION)
+            .pragma_update(None, "user_version", AUTO_REPLY_QUEUE_JOURNAL_USER_VERSION)
             .expect("set v2 queue user_version");
     }
 
@@ -8794,7 +9136,7 @@ mod tests {
         stopped_clean_queue_v2_fixture_with_table(
             path,
             include_breaker,
-            BUJAMENTOR_PIPELINE_TRANSITIONS_TABLE_SQL,
+            AUTO_REPLY_PIPELINE_TRANSITIONS_TABLE_SQL,
         );
     }
 
@@ -8832,7 +9174,7 @@ mod tests {
             connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            BUJAMENTOR_QUEUE_LEGACY_USER_VERSION
+            AUTO_REPLY_QUEUE_LEGACY_USER_VERSION
         );
         drop(connection);
 
@@ -8854,7 +9196,7 @@ mod tests {
                 connection
                     .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                     .unwrap(),
-                BUJAMENTOR_QUEUE_JOURNAL_USER_VERSION
+                AUTO_REPLY_QUEUE_JOURNAL_USER_VERSION
             );
             assert_eq!(
                 connection
@@ -8905,7 +9247,7 @@ mod tests {
 import pathlib
 import sys
 sys.path.insert(0, sys.argv[1])
-import bujamentor_transition_journal as journal
+import auto_reply_transition_journal as journal
 queue = pathlib.Path(sys.argv[2])
 connection = journal.open_queue(queue, create=True, expected_chat_id=42)
 connection.execute(
@@ -9054,7 +9396,7 @@ connection.close()
     fn stopped_clean_queue_rejects_unknown_or_mismatched_user_versions() {
         let root = tempfile::tempdir().unwrap();
         let room = stopped_clean_queue_test_room(root.path());
-        for version in [1, BUJAMENTOR_QUEUE_JOURNAL_USER_VERSION, 3] {
+        for version in [1, AUTO_REPLY_QUEUE_JOURNAL_USER_VERSION, 3] {
             let queue = room.join(format!("legacy-version-{version}.sqlite3"));
             stopped_clean_queue_fixture(&queue, true, "", "", "sent");
             let connection = rusqlite::Connection::open(&queue).unwrap();
@@ -9065,7 +9407,7 @@ connection.close()
             assert!(validate_stopped_clean_queue(&queue, 42).is_err());
         }
 
-        for version in [BUJAMENTOR_QUEUE_LEGACY_USER_VERSION, 1, 3] {
+        for version in [AUTO_REPLY_QUEUE_LEGACY_USER_VERSION, 1, 3] {
             let queue = room.join(format!("v2-version-{version}.sqlite3"));
             stopped_clean_queue_v2_fixture(&queue, false);
             let connection = rusqlite::Connection::open(&queue).unwrap();
@@ -9083,7 +9425,7 @@ connection.close()
         let room = stopped_clean_queue_test_room(root.path());
 
         let table = room.join("table.sqlite3");
-        let tampered_table_sql = BUJAMENTOR_PIPELINE_TRANSITIONS_TABLE_SQL.replacen(
+        let tampered_table_sql = AUTO_REPLY_PIPELINE_TRANSITIONS_TABLE_SQL.replacen(
             "CHECK(schema_version = 1)",
             "CHECK(schema_version IN (1))",
             1,
@@ -9168,7 +9510,7 @@ connection.close()
                      ) VALUES(1,?1,0,'queue','none','pending','enqueued',NULL,?2)",
                 )
                 .unwrap();
-            for sequence in 1..=BUJAMENTOR_QUEUE_JOURNAL_MAX_ROWS + 1 {
+            for sequence in 1..=AUTO_REPLY_QUEUE_JOURNAL_MAX_ROWS + 1 {
                 insert
                     .execute(rusqlite::params![format!("db:42:{sequence}"), sequence])
                     .unwrap();
@@ -9176,7 +9518,7 @@ connection.close()
         }
         transaction.commit().unwrap();
         connection
-            .execute_batch(BUJAMENTOR_PIPELINE_TRANSITIONS_CAP_TRIGGER_SQL)
+            .execute_batch(AUTO_REPLY_PIPELINE_TRANSITIONS_CAP_TRIGGER_SQL)
             .unwrap();
         drop(connection);
         assert!(validate_stopped_clean_queue(&queue, 42).is_err());
@@ -9184,8 +9526,8 @@ connection.close()
 
     #[test]
     fn stopped_clean_queue_rejects_v2_invalid_journal_metadata() {
-        assert!(is_valid_bujamentor_transition_event_id("db:1:1"));
-        assert!(is_valid_bujamentor_transition_event_id(
+        assert!(is_valid_auto_reply_transition_event_id("db:1:1"));
+        assert!(is_valid_auto_reply_transition_event_id(
             "db:9223372036854775806:9223372036854775806"
         ));
         for invalid in [
@@ -9199,7 +9541,7 @@ connection.close()
             "db:9223372036854775807:1",
             "db:1:9223372036854775807",
         ] {
-            assert!(!is_valid_bujamentor_transition_event_id(invalid));
+            assert!(!is_valid_auto_reply_transition_event_id(invalid));
         }
         let root = tempfile::tempdir().unwrap();
         let room = stopped_clean_queue_test_room(root.path());
@@ -9383,7 +9725,7 @@ connection.close()
             enrollment_cursor_authority_for_target(root.path(), &target, 140)
                 .expect("stopped-clean replay authority must be explicit"),
             AutoReplyCursorAuthority {
-                kind: BUJAMENTOR_CURSOR_REPLAY_KIND,
+                kind: AUTO_REPLY_CURSOR_REPLAY_KIND,
                 cursor_floor: 130,
                 attested_db_last_log_id: 140,
                 prior_owner_id: Some("terminal-owner".to_string()),
@@ -9442,7 +9784,38 @@ connection.close()
             enrollment_cursor_authority_for_target(root.path(), &target, 140)
                 .expect("terminal leftover ACK resume must be accepted")
                 .kind,
-            BUJAMENTOR_CURSOR_LEFTOVER_KIND
+            AUTO_REPLY_CURSOR_LEFTOVER_KIND
+        );
+        raw_poll_fence["candidate_phase"] = serde_json::json!("hooking");
+        raw_poll_fence["in_flight_candidate"] = serde_json::json!({
+            "event_id": "db:1:130",
+            "log_id": 130,
+            "owner_id": raw_poll_fence.get("owner_id").cloned().unwrap_or(serde_json::json!("")),
+            "in_flight": true,
+            "pending": true
+        });
+        raw_poll_fence["pending_log_ids"] = serde_json::json!([130]);
+        fs::write(&state_path, serde_json::to_vec(&raw_poll_fence).unwrap()).unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&state_path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            enrollment_cursor_authority_for_target(root.path(), &target, 140)
+                .expect("orphaned hooking leftover ACK resume must be accepted")
+                .kind,
+            AUTO_REPLY_CURSOR_LEFTOVER_KIND
+        );
+        raw_poll_fence["capability_state"] = serde_json::json!("ready");
+        raw_poll_fence["delivery_enabled"] = serde_json::json!(true);
+        raw_poll_fence["fence"] = serde_json::json!("ready");
+        raw_poll_fence["fence_reason"] = serde_json::json!("");
+        fs::write(&state_path, serde_json::to_vec(&raw_poll_fence).unwrap()).unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&state_path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            enrollment_cursor_authority_for_target(root.path(), &target, 140)
+                .expect("ready hooking leftover ACK resume must be accepted")
+                .kind,
+            AUTO_REPLY_CURSOR_LEFTOVER_KIND
         );
         let leftover = read_bounded_json_file(&state_path).expect("leftover state remains");
         assert_eq!(leftover["acked_watermark"], 130);
@@ -9668,13 +10041,9 @@ connection.close()
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o700))
             .expect("set executable permissions");
         let configured = executable.to_str().expect("executable path");
-        let resolved = validate_bujamentor_executable(
-            Some(configured),
-            "test python",
-            "python3",
-            false,
-        )
-        .expect("static validation should not execute the interpreter");
+        let resolved =
+            validate_auto_reply_executable(Some(configured), "test python", "python3", false)
+                .expect("static validation should not execute the interpreter");
         assert_eq!(resolved, configured);
         assert!(!marker.exists());
     }
@@ -9685,14 +10054,16 @@ connection.close()
         let cellar = Path::new(
             "/opt/homebrew/Cellar/python@3.11/3.11.15_4/Frameworks/Python.framework/Versions/3.11/bin/python3.11",
         );
-        let error = validate_bujamentor_executable(
+        let error = validate_auto_reply_executable(
             Some(cellar.to_str().expect("cellar path")),
-            "Bujamentor python_interpreter",
+            "AutoReply python_interpreter",
             "python3",
             false,
         )
         .expect_err("Cellar version paths must be rejected");
-        assert!(error.to_string().contains("must not be a Homebrew Cellar version path"));
+        assert!(error
+            .to_string()
+            .contains("must not be a Homebrew Cellar version path"));
         assert!(is_homebrew_cellar_version_path(cellar));
         assert!(is_homebrew_opt_python_keg_path(Path::new(
             "/opt/homebrew/opt/python@3.11/bin/python3.11"
@@ -9709,7 +10080,7 @@ connection.close()
         fs::write(&empty, b"").expect("write empty auth");
         fs::set_permissions(&empty, fs::Permissions::from_mode(0o600)).expect("chmod auth");
         let uid = fs::symlink_metadata(&empty).expect("auth metadata").uid();
-        assert!(validate_bujamentor_codex_auth(&empty, uid).is_err());
+        assert!(validate_auto_reply_codex_auth(&empty, uid).is_err());
     }
 
     #[cfg(unix)]
@@ -9944,9 +10315,40 @@ connection.close()
         let cli = Cli::try_parse_from(["openkakao-cli", "local-search", "hello", "-n", "10"])
             .expect("local-search should parse");
         match cli.command {
-            Commands::LocalSearch { query, count } => {
+            Commands::LocalSearch {
+                query,
+                count,
+                chat_id,
+            } => {
                 assert_eq!(query, "hello");
                 assert_eq!(count, 10);
+                assert_eq!(chat_id, None);
+            }
+            other => panic!("expected local-search, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn local_search_command_parses_chat_id() {
+        let cli = Cli::try_parse_from([
+            "openkakao-cli",
+            "local-search",
+            "번호",
+            "-n",
+            "5",
+            "--chat-id",
+            "417780809780519",
+        ])
+        .expect("local-search should parse --chat-id");
+        match cli.command {
+            Commands::LocalSearch {
+                query,
+                count,
+                chat_id,
+            } => {
+                assert_eq!(query, "번호");
+                assert_eq!(count, 5);
+                assert_eq!(chat_id, Some(417780809780519));
             }
             other => panic!("expected local-search, got {other:?}"),
         }
@@ -10013,11 +10415,11 @@ connection.close()
     }
 
     #[test]
-    fn local_send_preflight_requires_bujamentor_worker_identity() {
-        assert!(require_bujamentor_worker_preflight(true, false).is_err());
-        require_bujamentor_worker_preflight(true, true)
-            .expect("the Bujamentor worker may run the read-only preflight");
-        require_bujamentor_worker_preflight(false, false)
+    fn local_send_preflight_requires_auto_reply_worker_identity() {
+        assert!(require_auto_reply_worker_preflight(true, false).is_err());
+        require_auto_reply_worker_preflight(true, true)
+            .expect("the AutoReply worker may run the read-only preflight");
+        require_auto_reply_worker_preflight(false, false)
             .expect("ordinary sends are governed by their existing gates");
     }
 

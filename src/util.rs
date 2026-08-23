@@ -338,7 +338,11 @@ pub fn select_with_arrows(title: &str, items: &[ArrowMenuItem], selected: usize)
         write!(out, "\r\x1b[{}A", items.len() + 2)?;
         match key {
             MenuKey::Up => {
-                index = if index == 0 { items.len() - 1 } else { index - 1 };
+                index = if index == 0 {
+                    items.len() - 1
+                } else {
+                    index - 1
+                };
             }
             MenuKey::Down => {
                 index = (index + 1) % items.len();

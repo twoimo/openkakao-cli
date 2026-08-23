@@ -27,6 +27,16 @@ pub struct LocalChat {
     pub display_name: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct LocalGroupChat {
+    pub chat_id: i64,
+    pub chat_type: i32,
+    pub title: String,
+    pub members: i32,
+    pub last_updated_at: i64,
+    pub unread_count: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChatSelector {
     Id(i64),
@@ -38,6 +48,186 @@ const MAX_CHAT_SELECTORS: usize = 64;
 const MAX_CHAT_TARGETS: usize = 32;
 const MAX_CHAT_NAME_BYTES: usize = 256;
 const MAX_CHAT_INDEX_ROWS: usize = 10_000;
+
+const GROUP_TITLE_KEYS: &[&str] = &[
+    "name",
+    "title",
+    "chatName",
+    "roomName",
+    "room_name",
+    "displayName",
+    "linkName",
+];
+
+fn closed_chat_title(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.len() > MAX_CHAT_NAME_BYTES {
+        return None;
+    }
+    if trimmed.chars().any(|ch| ch.is_control()) {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+fn collect_json_titles(value: &serde_json::Value, depth: usize, titles: &mut Vec<String>) {
+    if depth > 2 {
+        return;
+    }
+    let serde_json::Value::Object(map) = value else {
+        return;
+    };
+    for key in GROUP_TITLE_KEYS {
+        if let Some(serde_json::Value::String(text)) = map.get(*key) {
+            if let Some(title) = closed_chat_title(text) {
+                titles.push(title);
+            }
+        }
+    }
+    for nested in map.values() {
+        collect_json_titles(nested, depth + 1, titles);
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn json_title_from_value(value: &serde_json::Value, depth: usize) -> Option<String> {
+    let mut titles = Vec::new();
+    collect_json_titles(value, depth, &mut titles);
+    preferred_group_title(&titles)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn title_from_extra(extra: &str) -> Option<String> {
+    let trimmed = extra.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(trimmed).ok()?;
+    json_title_from_value(&value, 0)
+}
+
+fn plist_i64_values(value: &plist::Value) -> Vec<i64> {
+    match value {
+        plist::Value::Integer(number) => number
+            .as_signed()
+            .into_iter()
+            .filter(|id| *id > 0)
+            .collect(),
+        plist::Value::Array(items) => items.iter().flat_map(plist_i64_values).collect(),
+        plist::Value::Dictionary(map) => map.values().flat_map(plist_i64_values).collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn parse_display_member_ids(blob: &[u8]) -> Vec<i64> {
+    if blob.is_empty() {
+        return Vec::new();
+    }
+    if blob.starts_with(b"bplist") || blob.starts_with(b"<?xml") {
+        if let Ok(value) = plist::from_bytes::<plist::Value>(blob) {
+            let ids = plist_i64_values(&value);
+            if !ids.is_empty() {
+                return ids;
+            }
+        }
+    }
+    if blob[0] == b'[' || blob[0] == b'{' {
+        if let Ok(value) = serde_json::from_slice::<serde_json::Value>(blob) {
+            let mut ids = Vec::new();
+            let values = match &value {
+                serde_json::Value::Array(items) => items.clone(),
+                serde_json::Value::Object(map) => map
+                    .get("userIds")
+                    .or_else(|| map.get("ids"))
+                    .and_then(serde_json::Value::as_array)
+                    .cloned()
+                    .unwrap_or_default(),
+                _ => Vec::new(),
+            };
+            for item in values {
+                if let Some(id) = item.as_i64().filter(|id| *id > 0) {
+                    ids.push(id);
+                }
+            }
+            if !ids.is_empty() {
+                return ids;
+            }
+        }
+    }
+    if blob.len() % 8 == 0 && blob.len() <= 8 * 64 {
+        let mut ids = Vec::new();
+        for chunk in blob.chunks_exact(8) {
+            let id = i64::from_le_bytes(chunk.try_into().expect("8-byte chunk"));
+            if id > 0 {
+                ids.push(id);
+            }
+        }
+        if !ids.is_empty() {
+            return ids;
+        }
+    }
+    Vec::new()
+}
+
+fn join_member_titles(names: &[String]) -> Option<String> {
+    let cleaned: Vec<String> = names
+        .iter()
+        .filter_map(|name| closed_chat_title(name))
+        .take(5)
+        .collect();
+    if cleaned.is_empty() {
+        return None;
+    }
+    closed_chat_title(&cleaned.join(", "))
+}
+
+fn preferred_group_title(candidates: &[String]) -> Option<String> {
+    let mut uniq: Vec<String> = Vec::new();
+    for candidate in candidates {
+        let Some(title) = closed_chat_title(candidate) else {
+            continue;
+        };
+        if !uniq.iter().any(|existing| existing == &title) {
+            uniq.push(title);
+        }
+    }
+    let Some(mut best) = uniq.first().cloned() else {
+        return None;
+    };
+    for candidate in &uniq {
+        let best_compact: String = best.chars().filter(|ch| !ch.is_whitespace()).collect();
+        let cand_compact: String = candidate.chars().filter(|ch| !ch.is_whitespace()).collect();
+        if cand_compact.starts_with(&best_compact) && cand_compact.len() > best_compact.len() {
+            best = candidate.clone();
+        }
+    }
+    Some(best)
+}
+
+fn resolve_group_title(
+    chat_name: &str,
+    kakao_group_name: &str,
+    link_name: &str,
+    extra: &str,
+    member_names: &[String],
+) -> Option<String> {
+    let mut candidates = Vec::new();
+    for value in [chat_name, kakao_group_name, link_name] {
+        if let Some(title) = closed_chat_title(value) {
+            candidates.push(title);
+        }
+    }
+    if !extra.trim().is_empty() {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(extra.trim()) {
+            collect_json_titles(&value, 0, &mut candidates);
+        }
+    }
+    preferred_group_title(&candidates).or_else(|| join_member_titles(member_names))
+}
+
+fn is_group_directory_chat(chat_type: i32, members: i32) -> bool {
+    chat_type == 1 || (chat_type != 0 && members >= 3)
+}
 
 pub fn parse_chat_selectors(values: &[String]) -> Result<Vec<ChatSelector>> {
     let mut parts = Vec::new();
@@ -164,24 +354,9 @@ pub fn resolve_chat_selectors(
     for selector in selectors {
         let chat = match selector {
             ChatSelector::Id(id) => {
-                let chat = by_id
+                by_id
                     .get(id)
-                    .with_context(|| format!("chat ID {id} was not found"))?;
-                if chat.chat_name.is_empty() {
-                    anyhow::bail!(
-                        "chat ID {id} has no local AX name; use bind:{id}:<exact-name> for read-only transcript attestation"
-                    );
-                }
-                let ids = by_name
-                    .get(&chat.chat_name)
-                    .expect("every chat contributes a name index");
-                if ids.len() != 1 {
-                    anyhow::bail!(
-                        "chat ID {id} has an ambiguous AX name {:?} (candidate IDs: {ids:?})",
-                        chat.chat_name
-                    );
-                }
-                chat
+                    .with_context(|| format!("chat ID {id} was not found"))?
             }
             ChatSelector::Name(name) => {
                 let ids = by_name
@@ -1127,6 +1302,111 @@ impl LocalDbReader {
         Ok(rows)
     }
 
+    pub fn list_group_chats(&self, limit: usize) -> Result<Vec<LocalGroupChat>> {
+        self.ensure_database_identity()?;
+        let mut stmt = self.conn.prepare(
+            "SELECT r.chatId, r.type, IFNULL(r.chatName, ''), r.activeMembersCount,\n                    IFNULL(r.lastUpdatedAt, 0), IFNULL(r.countOfNewMessage, 0),\n                    IFNULL(r.extra, ''), IFNULL(r.linkId, 0), r.displayMemberIds,\n                    IFNULL((\n                        SELECT m.kakaoGroupName FROM NTChatMeta m\n                        WHERE m.chatId = r.chatId AND IFNULL(m.kakaoGroupName, '') != ''\n                        LIMIT 1\n                    ), ''),\n                    IFNULL((\n                        SELECT o.linkName FROM NTOpenLink o\n                        WHERE o.linkId = r.linkId AND IFNULL(o.linkName, '') != ''\n                        LIMIT 1\n                    ), ''),
+                    IFNULL((
+                        SELECT m.groupNickname FROM NTChatMeta m
+                        WHERE m.chatId = r.chatId AND IFNULL(m.groupNickname, '') != ''
+                        LIMIT 1
+                    ), ''),
+                    IFNULL((
+                        SELECT m.content FROM NTChatMeta m
+                        WHERE m.chatId = r.chatId
+                          AND IFNULL(m.content, '') != ''
+                          AND (m.content LIKE '{%' OR m.content LIKE '[%')
+                        ORDER BY m.updatedAt DESC
+                        LIMIT 1
+                    ), '')\n             FROM NTChatRoom r\n             WHERE r.chatId > 0 AND r.hidden = 0\n             ORDER BY r.lastUpdatedAt DESC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i32>(1).unwrap_or(0),
+                row.get::<_, String>(2).unwrap_or_default(),
+                row.get::<_, i32>(3).unwrap_or(0),
+                row.get::<_, i64>(4).unwrap_or(0),
+                row.get::<_, i64>(5).unwrap_or(0),
+                row.get::<_, String>(6).unwrap_or_default(),
+                row.get::<_, Option<Vec<u8>>>(8).ok().flatten(),
+                row.get::<_, String>(9).unwrap_or_default(),
+                row.get::<_, String>(10).unwrap_or_default(),
+                row.get::<_, String>(11).unwrap_or_default(),
+                row.get::<_, String>(12).unwrap_or_default(),
+            ))
+        })?;
+        let mut user_stmt = self.conn.prepare(
+            "SELECT COALESCE(NULLIF(displayName, ''), NULLIF(friendNickName, ''), NULLIF(nickName, ''), '')\n             FROM NTUser WHERE userId = ? ORDER BY CASE WHEN linkId = 0 THEN 0 ELSE 1 END LIMIT 1",
+        )?;
+        let mut chats = Vec::new();
+        let cap = limit.min(MAX_CHAT_INDEX_ROWS);
+        for row in rows {
+            let (
+                chat_id,
+                chat_type,
+                chat_name,
+                members,
+                last_updated_at,
+                unread_count,
+                extra,
+                blob,
+                kakao_group_name,
+                link_name,
+                group_nickname,
+                meta_content,
+            ) = row?;
+            if !is_group_directory_chat(chat_type, members) {
+                continue;
+            }
+            let mut member_names = Vec::new();
+            if let Some(blob_bytes) = blob.as_ref() {
+                for user_id in parse_display_member_ids(blob_bytes) {
+                    let name: String = user_stmt
+                        .query_row([user_id], |user_row| user_row.get(0))
+                        .unwrap_or_default();
+                    if !name.is_empty() {
+                        member_names.push(name);
+                    }
+                }
+            }
+            let kakao_title = if kakao_group_name.trim().is_empty() {
+                group_nickname
+            } else {
+                kakao_group_name
+            };
+            let extra_title_source = if extra.trim().is_empty() {
+                meta_content
+            } else if meta_content.trim().is_empty() {
+                extra
+            } else {
+                format!("{{\"extra\":{extra},\"meta\":{meta_content}}}")
+            };
+            let Some(title) = resolve_group_title(
+                &chat_name,
+                &kakao_title,
+                &link_name,
+                &extra_title_source,
+                &member_names,
+            ) else {
+                continue;
+            };
+            chats.push(LocalGroupChat {
+                chat_id,
+                chat_type,
+                title,
+                members,
+                last_updated_at,
+                unread_count,
+            });
+            if chats.len() >= cap {
+                break;
+            }
+        }
+        self.ensure_database_identity()?;
+        Ok(chats)
+    }
+
     pub fn list_all_chats(&self) -> Result<Vec<LocalChat>> {
         self.ensure_database_identity()?;
         self.conn.execute_batch("BEGIN")?;
@@ -1267,9 +1547,28 @@ impl LocalDbReader {
         Ok(attachment)
     }
 
-    pub fn search_messages(&self, query: &str, limit: usize) -> Result<Vec<LocalMessage>> {
+    pub fn search_messages(
+        &self,
+        query: &str,
+        limit: usize,
+        chat_id: Option<i64>,
+    ) -> Result<Vec<LocalMessage>> {
         self.ensure_database_identity()?;
-        let mut stmt = self.conn.prepare(
+        if let Some(chat_id) = chat_id {
+            if chat_id <= 0 || chat_id == LOCAL_POLL_MAX_INT64 {
+                anyhow::bail!("search chat ID must be positive");
+            }
+        }
+        let sql = if chat_id.is_some() {
+            "SELECT m.logId, m.chatId, m.authorId,
+                    COALESCE(u.displayName, u.friendNickName, u.nickName, '') as senderName,
+                    COALESCE(m.message, '') as message, m.type, m.sentAt
+             FROM NTChatMessage m
+             LEFT JOIN NTUser u ON m.authorId = u.userId AND u.linkId = 0
+             WHERE m.message LIKE ? AND m.chatId = ?
+             ORDER BY m.sentAt DESC
+             LIMIT ?"
+        } else {
             "SELECT m.logId, m.chatId, m.authorId,
                     COALESCE(u.displayName, u.friendNickName, u.nickName, '') as senderName,
                     COALESCE(m.message, '') as message, m.type, m.sentAt
@@ -1277,27 +1576,33 @@ impl LocalDbReader {
              LEFT JOIN NTUser u ON m.authorId = u.userId AND u.linkId = 0
              WHERE m.message LIKE ?
              ORDER BY m.sentAt DESC
-             LIMIT ?",
-        )?;
+             LIMIT ?"
+        };
+        let mut stmt = self.conn.prepare(sql)?;
 
         let pattern = format!("%{}%", query);
         let account_user_id = self.account_user_id;
-        let rows = stmt
-            .query_map(rusqlite::params![pattern, limit as i64], |row| {
-                let author_id = row.get(2).unwrap_or(0);
-                Ok(LocalMessage {
-                    log_id: row.get(0)?,
-                    chat_id: row.get(1)?,
-                    author_id,
-                    is_self: author_id == account_user_id,
-                    sender_name: row.get(3).unwrap_or_default(),
-                    message: row.get(4).unwrap_or_default(),
-                    attachment: String::new(),
-                    message_type: row.get(5).unwrap_or(0),
-                    sent_at: row.get(6).unwrap_or(0),
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
+        let map_row = |row: &rusqlite::Row<'_>| {
+            let author_id = row.get(2).unwrap_or(0);
+            Ok(LocalMessage {
+                log_id: row.get(0)?,
+                chat_id: row.get(1)?,
+                author_id,
+                is_self: author_id == account_user_id,
+                sender_name: row.get(3).unwrap_or_default(),
+                message: row.get(4).unwrap_or_default(),
+                attachment: String::new(),
+                message_type: row.get(5).unwrap_or(0),
+                sent_at: row.get(6).unwrap_or(0),
+            })
+        };
+        let rows = if let Some(chat_id) = chat_id {
+            stmt.query_map(rusqlite::params![pattern, chat_id, limit as i64], map_row)?
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            stmt.query_map(rusqlite::params![pattern, limit as i64], map_row)?
+                .collect::<Result<Vec<_>, _>>()?
+        };
 
         self.ensure_database_identity()?;
         Ok(rows)
@@ -1804,6 +2109,87 @@ mod tests {
     fn unique_user_id_none_when_empty() {
         let s: Vec<String> = vec![];
         assert_eq!(unique_user_id(&s), None);
+    }
+
+    #[test]
+    fn group_title_prefers_explicit_chat_name() {
+        assert_eq!(
+            resolve_group_title(
+                "Ops West",
+                "Kakao Group",
+                "Open Link",
+                "{\"name\":\"Extra\"}",
+                &["A".to_string(), "B".to_string()]
+            ),
+            Some("Ops West".to_string()),
+        );
+    }
+
+    #[test]
+    fn group_title_prefers_extended_kakao_or_extra_name() {
+        assert_eq!(
+            resolve_group_title(
+                "NIMDA 인수인계",
+                "NIMDA 인수인계 임원방",
+                "",
+                "",
+                &[]
+            ),
+            Some("NIMDA 인수인계 임원방".to_string()),
+        );
+        assert_eq!(
+            resolve_group_title(
+                "NIMDA 인수인계",
+                "",
+                "",
+                "{\"name\":\"NIMDA 인수인계\",\"title\":\"NIMDA 인수인계 임원방\"}",
+                &[]
+            ),
+            Some("NIMDA 인수인계 임원방".to_string()),
+        );
+    }
+
+    #[test]
+    fn group_title_uses_extra_json_when_chat_name_is_empty() {
+        assert_eq!(
+            resolve_group_title("", "", "", "{\"name\":\"부자멘토멘티\"}", &[]),
+            Some("부자멘토멘티".to_string()),
+        );
+        assert_eq!(
+            title_from_extra("{\"name\":\"부자멘토멘티\"}"),
+            Some("부자멘토멘티".to_string()),
+        );
+    }
+
+    #[test]
+    fn group_title_joins_member_names() {
+        assert_eq!(
+            resolve_group_title("", "", "", "", &["민수".to_string(), "지현".to_string()]),
+            Some("민수, 지현".to_string()),
+        );
+    }
+
+    #[test]
+    fn group_directory_includes_multi_chat_and_excludes_dm() {
+        assert!(is_group_directory_chat(1, 5));
+        assert!(is_group_directory_chat(4, 12));
+        assert!(!is_group_directory_chat(0, 2));
+        assert!(!is_group_directory_chat(2, 2));
+    }
+
+    #[test]
+    fn parse_display_member_ids_reads_little_endian_user_ids() {
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&7_i64.to_le_bytes());
+        blob.extend_from_slice(&9_i64.to_le_bytes());
+        assert_eq!(parse_display_member_ids(&blob), vec![7, 9]);
+    }
+
+    #[test]
+    fn parse_display_member_ids_reads_binary_plist_integers() {
+        let blob = hex::decode("62706c6973743030a20102100b100d080b0d000000000000010100000000000000030000000000000000000000000000000f")
+            .expect("plist hex");
+        assert_eq!(parse_display_member_ids(&blob), vec![11, 13]);
     }
 
     #[test]

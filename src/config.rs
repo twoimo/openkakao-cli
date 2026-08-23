@@ -20,14 +20,14 @@ pub struct OpenKakaoConfig {
     pub safety: SafetyConfig,
     #[serde(default)]
     pub model: ModelConfig,
-    #[serde(default)]
-    pub bujamentor: BujamentorConfig,
+    #[serde(default, alias = "bujamentor", alias = "auto-reply")]
+    pub auto_reply: AutoReplyConfig,
     #[serde(skip)]
     pub(crate) source_path: Option<PathBuf>,
     #[serde(skip)]
     pub(crate) source_sha256: Option<String>,
     #[serde(skip)]
-    pub(crate) obsolete_bujamentor_target_chat_id: bool,
+    pub(crate) obsolete_auto_reply_target_chat_id: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -54,7 +54,7 @@ pub struct ModelConfig {
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
-pub struct BujamentorConfig {
+pub struct AutoReplyConfig {
     /// Exact chat selectors used when `auto-reply` starts without CLI
     /// selectors. CLI selectors take precedence over this list.
     #[serde(default)]
@@ -143,9 +143,9 @@ pub struct SafetyConfig {
     /// allowed to send.
     #[serde(default)]
     pub allowed_send_chats: Vec<String>,
-    /// Independent opt-in required by unattended Bujamentor workers.
-    #[serde(default)]
-    pub allow_bujamentor_auto_reply: bool,
+    /// Independent opt-in required by unattended AutoReply workers.
+    #[serde(default, alias = "allow_bujamentor_auto_reply")]
+    pub allow_auto_reply: bool,
 }
 
 impl Default for SafetyConfig {
@@ -159,7 +159,7 @@ impl Default for SafetyConfig {
             allow_insecure_webhooks: false,
             allow_loco_write: false,
             allow_ax_send: false,
-            allow_bujamentor_auto_reply: false,
+            allow_auto_reply: false,
             allowed_send_chats: Vec::new(),
         }
     }
@@ -189,10 +189,11 @@ pub fn load_config() -> Result<OpenKakaoConfig> {
         .with_context(|| format!("Failed to parse {}", path.display()))?;
     let document: toml::Value =
         toml::from_str(&text).with_context(|| format!("Failed to parse {}", path.display()))?;
-    let obsolete_bujamentor_target_chat_id = document
-        .get("bujamentor")
-        .and_then(toml::Value::as_table)
-        .is_some_and(|table| table.contains_key("target_chat_id"));
+    let obsolete_auto_reply_target_chat_id = ["auto_reply", "auto-reply", "bujamentor"]
+        .into_iter()
+        .filter_map(|key| document.get(key))
+        .filter_map(toml::Value::as_table)
+        .any(|table| table.contains_key("target_chat_id"));
     let mut config: OpenKakaoConfig = document
         .try_into()
         .with_context(|| format!("Failed to parse {}", path.display()))?;
@@ -200,7 +201,7 @@ pub fn load_config() -> Result<OpenKakaoConfig> {
     // but room policy keys are durable numeric identities. Reject aliases
     // here so two textual keys can never name the same Kakao room.
     let mut room_policy_ids = BTreeSet::new();
-    for raw_id in config.bujamentor.room_reply_authors.keys() {
+    for raw_id in config.auto_reply.room_reply_authors.keys() {
         let chat_id = raw_id
             .parse::<i64>()
             .ok()
@@ -208,40 +209,40 @@ pub fn load_config() -> Result<OpenKakaoConfig> {
             .filter(|value| value.to_string() == *raw_id)
             .with_context(|| {
                 format!(
-                    "[bujamentor.room_reply_authors] key {raw_id:?} is not a canonical positive chat ID"
+                    "[auto_reply.room_reply_authors] key {raw_id:?} is not a canonical positive chat ID"
                 )
             })?;
         if !room_policy_ids.insert(chat_id) {
-            anyhow::bail!("[bujamentor.room_reply_authors] contains an aliased chat ID");
+            anyhow::bail!("[auto_reply.room_reply_authors] contains an aliased chat ID");
         }
     }
     let source_path = fs::canonicalize(&path)
         .with_context(|| format!("Resolve config path {}", path.display()))?;
     config.source_path = Some(source_path);
     config.source_sha256 = Some(hex::encode(Sha256::digest(&data)));
-    config.obsolete_bujamentor_target_chat_id = obsolete_bujamentor_target_chat_id;
+    config.obsolete_auto_reply_target_chat_id = obsolete_auto_reply_target_chat_id;
     Ok(config)
 }
 
 pub fn verify_config_attestation(config: &OpenKakaoConfig) -> Result<(PathBuf, String)> {
-    if config.obsolete_bujamentor_target_chat_id {
+    if config.obsolete_auto_reply_target_chat_id {
         anyhow::bail!(
-            "[bujamentor].target_chat_id is obsolete; use repeated --chat or [bujamentor].chats"
+            "[auto_reply].target_chat_id is obsolete; use repeated --chat or [auto_reply].chats"
         );
     }
     let path = config
         .source_path
         .clone()
-        .context("Bujamentor config source path is not attested")?;
+        .context("AutoReply config source path is not attested")?;
     let expected = config
         .source_sha256
         .clone()
-        .context("Bujamentor config digest is not attested")?;
+        .context("AutoReply config digest is not attested")?;
     let data = fs::read(&path).with_context(|| format!("Read config {}", path.display()))?;
     let actual = hex::encode(Sha256::digest(&data));
     if actual != expected {
         anyhow::bail!(
-            "Bujamentor config changed after load; expected {expected}, observed {actual}"
+            "AutoReply config changed after load; expected {expected}, observed {actual}"
         );
     }
     Ok((path, expected))
@@ -274,12 +275,12 @@ pub fn validate_model_privacy(config: &OpenKakaoConfig) -> Result<()> {
 }
 
 pub fn unattended_auto_reply_enabled(config: &OpenKakaoConfig) -> bool {
-    config.safety.allow_bujamentor_auto_reply
+    config.safety.allow_auto_reply
 }
 
-pub fn bujamentor_self_nickname(config: &OpenKakaoConfig) -> Option<String> {
+pub fn auto_reply_self_nickname(config: &OpenKakaoConfig) -> Option<String> {
     config
-        .bujamentor
+        .auto_reply
         .self_nickname
         .clone()
         .or_else(|| std::env::var("OPENKAKAO_SELF_NICKNAME").ok())
@@ -287,8 +288,8 @@ pub fn bujamentor_self_nickname(config: &OpenKakaoConfig) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-pub fn bujamentor_reply_authors(config: &OpenKakaoConfig) -> Vec<String> {
-    let configured = config.bujamentor.reply_authors.clone();
+pub fn auto_reply_reply_authors(config: &OpenKakaoConfig) -> Vec<String> {
+    let configured = config.auto_reply.reply_authors.clone();
     let mut authors = Vec::new();
     let values = if configured.is_empty() {
         std::env::var("OPENKAKAO_REPLY_AUTHORS")
@@ -331,8 +332,8 @@ fn validate_reply_author_list(values: &[String], label: &str) -> Result<Vec<Stri
     Ok(normalized)
 }
 
-pub fn validate_bujamentor_reply_author_override(values: &[String]) -> Result<Vec<String>> {
-    validate_reply_author_list(values, "Bujamentor CLI reply-author override")
+pub fn validate_auto_reply_reply_author_override(values: &[String]) -> Result<Vec<String>> {
+    validate_reply_author_list(values, "AutoReply CLI reply-author override")
 }
 
 /// Resolve an independent author policy for every selected numeric room.
@@ -340,12 +341,12 @@ pub fn validate_bujamentor_reply_author_override(values: &[String]) -> Result<Ve
 /// Exact per-room entries take precedence over the legacy global allowlist.
 /// Configuration for an unselected room is rejected during activation so a
 /// typo or stale room policy cannot silently wait to become active later.
-pub fn bujamentor_reply_authors_by_room(
+pub fn auto_reply_reply_authors_by_room(
     config: &OpenKakaoConfig,
     target_ids: &[i64],
 ) -> Result<BTreeMap<i64, Vec<String>>> {
     if target_ids.is_empty() {
-        anyhow::bail!("Bujamentor selected-room set is empty");
+        anyhow::bail!("AutoReply selected-room set is empty");
     }
     let selected = target_ids.iter().copied().collect::<BTreeSet<_>>();
     if selected.len() != target_ids.len()
@@ -353,39 +354,39 @@ pub fn bujamentor_reply_authors_by_room(
             .iter()
             .any(|chat_id| *chat_id <= 0 || *chat_id == i64::MAX)
     {
-        anyhow::bail!("Bujamentor selected-room identity set is invalid");
+        anyhow::bail!("AutoReply selected-room identity set is invalid");
     }
-    if config.bujamentor.room_reply_authors.len() > 32 {
-        anyhow::bail!("Bujamentor room reply-author policy is too large");
+    if config.auto_reply.room_reply_authors.len() > 32 {
+        anyhow::bail!("AutoReply room reply-author policy is too large");
     }
     let mut configured_by_id = BTreeMap::new();
-    for (raw_id, values) in &config.bujamentor.room_reply_authors {
+    for (raw_id, values) in &config.auto_reply.room_reply_authors {
         let chat_id = raw_id
             .parse::<i64>()
             .ok()
             .filter(|value| *value > 0 && *value != i64::MAX)
             .filter(|value| value.to_string() == *raw_id)
             .context(
-                "Bujamentor room_reply_authors keys must be canonical positive decimal chat IDs",
+                "AutoReply room_reply_authors keys must be canonical positive decimal chat IDs",
             )?;
         if !selected.contains(&chat_id) {
-            anyhow::bail!("Bujamentor room_reply_authors contains unselected chat ID {chat_id}");
+            anyhow::bail!("AutoReply room_reply_authors contains unselected chat ID {chat_id}");
         }
         configured_by_id.insert(
             chat_id,
             validate_reply_author_list(
                 values,
-                &format!("Bujamentor reply-author allowlist for room {chat_id}"),
+                &format!("AutoReply reply-author allowlist for room {chat_id}"),
             )?,
         );
     }
-    let global = bujamentor_reply_authors(config);
+    let global = auto_reply_reply_authors(config);
     let global = if global.is_empty() {
         None
     } else {
         Some(validate_reply_author_list(
             &global,
-            "Bujamentor global reply-author allowlist",
+            "AutoReply global reply-author allowlist",
         )?)
     };
     let mut result = BTreeMap::new();
@@ -395,25 +396,26 @@ pub fn bujamentor_reply_authors_by_room(
             .cloned()
             .or_else(|| global.clone())
             .with_context(|| {
-                format!("Bujamentor reply-author allowlist is missing for selected room {chat_id}")
+                format!("AutoReply reply-author allowlist is missing for selected room {chat_id}")
             })?;
         result.insert(*chat_id, authors);
     }
     Ok(result)
 }
 
-pub fn validate_bujamentor_startup(
+pub fn validate_auto_reply_startup(
     config: &OpenKakaoConfig,
     target_names: &[String],
+    target_ids: &[i64],
 ) -> Result<()> {
-    if !config.safety.allow_bujamentor_auto_reply {
-        anyhow::bail!("Bujamentor automatic replies are not enabled");
+    if !config.safety.allow_auto_reply {
+        anyhow::bail!("AutoReply automatic replies are not enabled");
     }
     if !config.safety.allow_ax_send {
         anyhow::bail!("AX sending is disabled; set safety.allow_ax_send = true");
     }
-    validate_model_privacy(config).context("Bujamentor model privacy attestation failed")?;
-    if config.bujamentor.reply_runner_kind.as_deref() == Some("codex") {
+    validate_model_privacy(config).context("AutoReply model privacy attestation failed")?;
+    if config.auto_reply.reply_runner_kind.as_deref() == Some("codex") {
         if config.model.privacy_mode.as_deref() != Some("remote_explicit")
             || config.model.provider.as_deref() != Some("openai-codex")
         {
@@ -421,16 +423,16 @@ pub fn validate_bujamentor_startup(
                 "Codex reply runner requires model.privacy_mode=remote_explicit and model.provider=openai-codex"
             );
         }
-        if config.bujamentor.reply_model.as_deref() != Some("gpt-5.6-luna")
-            || config.bujamentor.reply_reasoning_effort.as_deref() != Some("max")
-            || config.bujamentor.reply_service_tier.as_deref() != Some("priority")
+        if config.auto_reply.reply_model.as_deref() != Some("gpt-5.6-luna")
+            || config.auto_reply.reply_reasoning_effort.as_deref() != Some("max")
+            || config.auto_reply.reply_service_tier.as_deref() != Some("priority")
         {
             anyhow::bail!(
                 "Codex reply runner must explicitly attest reply_model=gpt-5.6-luna, reply_reasoning_effort=max, and reply_service_tier=priority"
             );
         }
     }
-    if config.bujamentor.reply_runner_kind.as_deref() == Some("gjc") {
+    if config.auto_reply.reply_runner_kind.as_deref() == Some("gjc") {
         if config.model.privacy_mode.as_deref() != Some("remote_explicit")
             || !matches!(
                 config.model.provider.as_deref(),
@@ -441,56 +443,62 @@ pub fn validate_bujamentor_startup(
                 "GJC reply runner requires model.privacy_mode=remote_explicit and model.provider=gjc or google-antigravity"
             );
         }
-        if config.bujamentor.reply_model.as_deref()
-            != Some("google-antigravity/gemini-3.6-flash-tiered")
-        {
+        if !matches!(
+            config.auto_reply.reply_model.as_deref(),
+            Some("google-antigravity/gemini-3.7-flash-tiered")
+                | Some("google-antigravity/gemini-3.6-flash-tiered"),
+        ) {
             anyhow::bail!(
-                "GJC reply runner must explicitly attest reply_model=google-antigravity/gemini-3.6-flash-tiered"
+                "GJC reply runner must explicitly attest reply_model=google-antigravity/gemini-3.7-flash-tiered or google-antigravity/gemini-3.6-flash-tiered"
             );
         }
     }
     let self_nickname =
-        bujamentor_self_nickname(config).context("Bujamentor self nickname is not configured")?;
+        auto_reply_self_nickname(config).context("AutoReply self nickname is not configured")?;
     if self_nickname.len() > 128 || self_nickname.chars().any(|char| char.is_control()) {
-        anyhow::bail!("Bujamentor self nickname is invalid");
+        anyhow::bail!("AutoReply self nickname is invalid");
     }
-    for name in target_names {
-        if !config
-            .safety
-            .allowed_send_chats
-            .iter()
-            .any(|allowed| allowed == name)
-        {
+    for (index, name) in target_names.iter().enumerate() {
+        let chat_id = target_ids.get(index).copied();
+        let allowed = config.safety.allowed_send_chats.iter().any(|allowed| {
+            allowed == name
+                || chat_id.is_some_and(|id| {
+                    *allowed == id.to_string()
+                        || *allowed == format!("id:{id}")
+                        || allowed.starts_with(&format!("bind:{id}:"))
+                })
+        });
+        if !allowed {
             anyhow::bail!("chat \"{name}\" is not present in safety.allowed_send_chats");
         }
     }
     Ok(())
 }
 
-pub fn validate_bujamentor_auto_reply(config: &OpenKakaoConfig) -> Result<()> {
+pub fn validate_auto_reply(config: &OpenKakaoConfig) -> Result<()> {
     if !unattended_auto_reply_enabled(config) {
-        anyhow::bail!("Bujamentor automatic replies are not enabled");
+        anyhow::bail!("AutoReply automatic replies are not enabled");
     }
-    validate_model_privacy(config).context("Bujamentor model privacy attestation failed")?;
+    validate_model_privacy(config).context("AutoReply model privacy attestation failed")?;
     if std::env::var("OPENKAKAO_DB_AUTHORITATIVE").as_deref() != Ok("1")
         || std::env::var("OPENKAKAO_AUTO_REPLY_ENABLED").as_deref() != Ok("1")
         || std::env::var("OPENKAKAO_DB_MODE").as_deref() != Ok("database_authoritative")
         || std::env::var("OPENKAKAO_DB_READY").as_deref() != Ok("1")
     {
-        anyhow::bail!("Bujamentor database readiness fence is not satisfied");
+        anyhow::bail!("AutoReply database readiness fence is not satisfied");
     }
     if std::env::var("OPENKAKAO_SUPERVISOR_OWNER")
         .ok()
         .is_none_or(|value| value.trim().is_empty())
     {
-        anyhow::bail!("Bujamentor supervisor owner marker is missing");
+        anyhow::bail!("AutoReply supervisor owner marker is missing");
     }
     let epoch = std::env::var("OPENKAKAO_DB_SOURCE_EPOCH")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|value| *value > 0);
     if epoch.is_none() {
-        anyhow::bail!("Bujamentor source epoch marker is invalid");
+        anyhow::bail!("AutoReply source epoch marker is invalid");
     }
     Ok(())
 }
@@ -514,11 +522,11 @@ mod tests {
         assert_eq!(config.safety.webhook_timeout_secs, Some(10));
         assert!(!config.safety.allow_insecure_webhooks);
         assert!(!config.safety.allow_loco_write);
-        assert!(!config.safety.allow_bujamentor_auto_reply);
-        assert!(config.bujamentor.chats.is_empty());
-        assert!(config.bujamentor.room_reply_authors.is_empty());
-        assert!(!config.bujamentor.allow_link_fetch);
-        assert!(!config.bujamentor.allow_image_analysis);
+        assert!(!config.safety.allow_auto_reply);
+        assert!(config.auto_reply.chats.is_empty());
+        assert!(config.auto_reply.room_reply_authors.is_empty());
+        assert!(!config.auto_reply.allow_link_fetch);
+        assert!(!config.auto_reply.allow_image_analysis);
         assert!(config.model.privacy_mode.is_none());
         assert!(!config.model.allow_egress);
     }
@@ -533,59 +541,59 @@ mod tests {
         assert!(validate_model_privacy(&config).is_err());
 
         config.model.privacy_mode = Some("local".into());
-        config.safety.allow_bujamentor_auto_reply = true;
+        config.safety.allow_auto_reply = true;
         assert!(validate_model_privacy(&config).is_ok());
         assert!(unattended_auto_reply_enabled(&config));
     }
 
     #[test]
-    fn bujamentor_startup_requires_independent_gates_and_allowlist() {
+    fn auto_reply_startup_requires_independent_gates_and_allowlist() {
         let mut config = OpenKakaoConfig::default();
-        config.safety.allow_bujamentor_auto_reply = true;
+        config.safety.allow_auto_reply = true;
         config.safety.allow_ax_send = true;
         config.model.privacy_mode = Some("local".into());
-        config.bujamentor.self_nickname = Some("self".into());
-        config.bujamentor.reply_authors = vec!["author".into()];
+        config.auto_reply.self_nickname = Some("self".into());
+        config.auto_reply.reply_authors = vec!["author".into()];
         config.safety.allowed_send_chats = vec!["room".into()];
-        assert!(validate_bujamentor_startup(&config, &["room".into()]).is_ok());
-        assert!(validate_bujamentor_startup(&config, &["other".into()]).is_err());
+        assert!(validate_auto_reply_startup(&config, &["room".into()], &[1]).is_ok());
+        assert!(validate_auto_reply_startup(&config, &["other".into()], &[2]).is_err());
         config.safety.allow_ax_send = false;
-        assert!(validate_bujamentor_startup(&config, &["room".into()]).is_err());
+        assert!(validate_auto_reply_startup(&config, &["room".into()], &[1]).is_err());
     }
 
     #[test]
     fn room_reply_author_policy_is_exact_isolated_and_legacy_compatible() {
         let mut config = OpenKakaoConfig::default();
-        config.bujamentor.reply_authors = vec!["legacy".into()];
+        config.auto_reply.reply_authors = vec!["legacy".into()];
         config
-            .bujamentor
+            .auto_reply
             .room_reply_authors
             .insert("42".into(), vec!["alice".into(), "bob".into()]);
-        let policies = bujamentor_reply_authors_by_room(&config, &[42, 84])
+        let policies = auto_reply_reply_authors_by_room(&config, &[42, 84])
             .expect("per-room policy with global fallback");
         assert_eq!(policies[&42], ["alice", "bob"]);
         assert_eq!(policies[&84], ["legacy"]);
 
-        config.bujamentor.reply_authors.clear();
-        assert!(bujamentor_reply_authors_by_room(&config, &[42, 84]).is_err());
+        config.auto_reply.reply_authors.clear();
+        assert!(auto_reply_reply_authors_by_room(&config, &[42, 84]).is_err());
         assert_eq!(
-            bujamentor_reply_authors_by_room(&config, &[42])
+            auto_reply_reply_authors_by_room(&config, &[42])
                 .expect("fully covered exact room policy")[&42],
             ["alice", "bob"]
         );
 
-        config.bujamentor.reply_authors = vec!["legacy".into(), "legacy".into()];
-        assert!(bujamentor_reply_authors_by_room(&config, &[42]).is_err());
+        config.auto_reply.reply_authors = vec!["legacy".into(), "legacy".into()];
+        assert!(auto_reply_reply_authors_by_room(&config, &[42]).is_err());
     }
 
     #[test]
     fn room_reply_author_policy_rejects_cross_room_and_malformed_entries() {
         let mut config = OpenKakaoConfig::default();
         config
-            .bujamentor
+            .auto_reply
             .room_reply_authors
             .insert("84".into(), vec!["mallory".into()]);
-        assert!(bujamentor_reply_authors_by_room(&config, &[42]).is_err());
+        assert!(auto_reply_reply_authors_by_room(&config, &[42]).is_err());
 
         for (key, values) in [
             ("042", vec!["alice"]),
@@ -597,52 +605,109 @@ mod tests {
         ] {
             let mut malformed = OpenKakaoConfig::default();
             malformed
-                .bujamentor
+                .auto_reply
                 .room_reply_authors
                 .insert(key.into(), values.into_iter().map(str::to_owned).collect());
-            assert!(bujamentor_reply_authors_by_room(&malformed, &[42]).is_err());
+            assert!(auto_reply_reply_authors_by_room(&malformed, &[42]).is_err());
         }
     }
 
     #[test]
     fn codex_runner_requires_exact_model_effort_tier_and_provider() {
         let mut config = OpenKakaoConfig::default();
-        config.safety.allow_bujamentor_auto_reply = true;
+        config.safety.allow_auto_reply = true;
         config.safety.allow_ax_send = true;
         config.safety.allowed_send_chats = vec!["room".into()];
         config.model.privacy_mode = Some("remote_explicit".into());
         config.model.allow_egress = true;
         config.model.provider = Some("openai-codex".into());
         config.model.retention = Some("provider-policy".into());
-        config.bujamentor.self_nickname = Some("self".into());
-        config.bujamentor.reply_authors = vec!["author".into()];
-        config.bujamentor.reply_runner_kind = Some("codex".into());
-        config.bujamentor.reply_model = Some("gpt-5.6-luna".into());
-        config.bujamentor.reply_reasoning_effort = Some("max".into());
-        config.bujamentor.reply_service_tier = Some("priority".into());
-        assert!(validate_bujamentor_startup(&config, &["room".into()]).is_ok());
+        config.auto_reply.self_nickname = Some("self".into());
+        config.auto_reply.reply_authors = vec!["author".into()];
+        config.auto_reply.reply_runner_kind = Some("codex".into());
+        config.auto_reply.reply_model = Some("gpt-5.6-luna".into());
+        config.auto_reply.reply_reasoning_effort = Some("max".into());
+        config.auto_reply.reply_service_tier = Some("priority".into());
+        assert!(validate_auto_reply_startup(&config, &["room".into()], &[1]).is_ok());
 
-        config.bujamentor.reply_service_tier = Some("default".into());
-        assert!(validate_bujamentor_startup(&config, &["room".into()]).is_err());
-        config.bujamentor.reply_service_tier = Some("priority".into());
+        config.auto_reply.reply_service_tier = Some("default".into());
+        assert!(validate_auto_reply_startup(&config, &["room".into()], &[1]).is_err());
+        config.auto_reply.reply_service_tier = Some("priority".into());
         config.model.provider = Some("gjc".into());
-        assert!(validate_bujamentor_startup(&config, &["room".into()]).is_err());
-        config.bujamentor.reply_runner_kind = Some("gjc".into());
-        config.bujamentor.reply_model =
-            Some("google-antigravity/gemini-3.6-flash-tiered".into());
-        config.bujamentor.reply_reasoning_effort = Some("medium".into());
-        config.bujamentor.reply_service_tier = Some("default".into());
-        assert!(validate_bujamentor_startup(&config, &["room".into()]).is_ok());
-        config.bujamentor.reply_model = Some("gpt-5.6-luna".into());
-        assert!(validate_bujamentor_startup(&config, &["room".into()]).is_err());
+        assert!(validate_auto_reply_startup(&config, &["room".into()], &[1]).is_err());
+        config.auto_reply.reply_runner_kind = Some("gjc".into());
+        config.auto_reply.reply_model = Some("google-antigravity/gemini-3.7-flash-tiered".into());
+        config.auto_reply.reply_reasoning_effort = Some("high".into());
+        config.auto_reply.reply_service_tier = Some("default".into());
+        assert!(validate_auto_reply_startup(&config, &["room".into()], &[1]).is_ok());
+        config.auto_reply.reply_model = Some("gpt-5.6-luna".into());
+        assert!(validate_auto_reply_startup(&config, &["room".into()], &[1]).is_err());
     }
 
     #[test]
     fn auto_reply_rejects_obsolete_scalar_attestation() {
         let config = OpenKakaoConfig {
-            obsolete_bujamentor_target_chat_id: true,
+            obsolete_auto_reply_target_chat_id: true,
             ..OpenKakaoConfig::default()
         };
         assert!(verify_config_attestation(&config).is_err());
+    }
+
+    fn parse_config(text: &str) -> OpenKakaoConfig {
+        let document: toml::Value = toml::from_str(text).expect("toml");
+        document.try_into().expect("config")
+    }
+
+    #[test]
+    fn loads_canonical_auto_reply_table() {
+        let config = parse_config(
+            r#"
+[safety]
+allow_auto_reply = true
+[auto_reply]
+chats = ["id:42"]
+self_nickname = "self"
+"#,
+        );
+        assert!(config.safety.allow_auto_reply);
+        assert_eq!(config.auto_reply.chats, ["id:42"]);
+        assert_eq!(config.auto_reply.self_nickname.as_deref(), Some("self"));
+    }
+
+    #[test]
+    fn loads_legacy_bujamentor_table_and_opt_in() {
+        let config = parse_config(
+            r#"
+[safety]
+allow_bujamentor_auto_reply = true
+[bujamentor]
+chats = ["bind:417780809780519:room"]
+self_nickname = "self"
+reply_authors = ["author"]
+allow_link_fetch = true
+"#,
+        );
+        assert!(config.safety.allow_auto_reply);
+        assert!(unattended_auto_reply_enabled(&config));
+        assert_eq!(
+            config.auto_reply.chats,
+            ["bind:417780809780519:room"]
+        );
+        assert_eq!(config.auto_reply.self_nickname.as_deref(), Some("self"));
+        assert_eq!(config.auto_reply.reply_authors, ["author"]);
+        assert!(config.auto_reply.allow_link_fetch);
+    }
+
+    #[test]
+    fn loads_hyphenated_auto_reply_table() {
+        let config = parse_config(
+            r#"
+[safety]
+allow_auto_reply = true
+[auto-reply]
+chats = ["id:77"]
+"#,
+        );
+        assert_eq!(config.auto_reply.chats, ["id:77"]);
     }
 }

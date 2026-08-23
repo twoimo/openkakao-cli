@@ -221,7 +221,7 @@ eligibility and do not prove AX-window visibility. A
 previous scalar supervisor is never adopted: an existing stopped state must
 carry `legacy_drained=true` with only terminal `sent`/`skipped` queue rows;
 uncertain or interrupted legacy state is rejected for manual reconciliation. Activation
-also requires explicit trusted paths in `[bujamentor]`: CPython 3.11, 3.12, or
+also requires explicit trusted paths in `[auto_reply]`: CPython 3.11, 3.12, or
 3.13 via `python_interpreter`, and a pinned native Codex executable via
 `reply_runner`.
 
@@ -248,7 +248,7 @@ to six) so a short burst does not receive one reply per line.
 The worker prioritizes a recipient-specific profile for honorific/casual
 register, length, endings, and punctuation. It falls back explicitly to the
 room-wide profile until it has at least three direct samples with a confidence
-sum of at least two. A direct question such as “is this AI/a bot/an automatic
+sum of at least two. Replies to 현준 are always casual honorific 해요체 (`요`/`죠`/`여`/`효`); informal drafts such as `그럼 딱 맞겠네` are dropped by the style-evidence filter and draft gate. A direct question such as “is this AI/a bot/an automatic
 reply?” is recorded as `identity_question_requires_owner` and skipped so the
 account owner can answer personally; the worker does not make a human identity
 claim.
@@ -257,7 +257,7 @@ claim.
 [safety]
 allow_ax_send = true
 allowed_send_chats = ["부자멘토멘티"]
-allow_bujamentor_auto_reply = true
+allow_auto_reply = true
 
 [model]
 privacy_mode = "remote_explicit"
@@ -265,7 +265,7 @@ allow_egress = true
 provider = "openai-codex"
 retention = "provider-policy"
 
-[bujamentor]
+[auto_reply]
 chats = ["bind:417780809780519:부자멘토멘티"]
 self_nickname = "your nickname"
 reply_authors = ["allowed participant"]
@@ -275,15 +275,15 @@ reply_runner_kind = "codex"
 reply_model = "gpt-5.6-luna"
 reply_reasoning_effort = "max"
 reply_service_tier = "priority" # Codex Fast mode
-reply_codex_home = "/Users/me/Library/Application Support/openkakao/bujamentor/codex-home"
+reply_codex_home = "/Users/me/Library/Application Support/openkakao/auto-reply/codex-home"
 allow_image_analysis = true # Separate opt-in for authorized-room image egress to Luna
 
-[bujamentor.room_reply_authors]
+[auto_reply.room_reply_authors]
 "417780809780519" = ["allowed participant", "second participant"]
 "123456789" = ["other-room participant"]
 ```
 
-Keys in `[bujamentor.room_reply_authors]` must be canonical positive chat IDs.
+Keys in `[auto_reply.room_reply_authors]` must be canonical positive chat IDs.
 An exact room entry takes precedence over the legacy global `reply_authors`
 list; the global list is used only for a selected room without an exact entry.
 Startup rejects keys for unselected rooms and any selected room that has no
@@ -310,7 +310,7 @@ combination. Model generation is explicit remote egress even though context
 storage and retrieval are local.
 
 The single authority for Luna call state is the private mode-`0600`
-`model-circuit.sqlite3` under the Bujamentor state root. Every room worker for
+`model-circuit.sqlite3` under the AutoReply state root. Every room worker for
 the same account/state root shares a durable lease and cooldown keyed by runner
 kind, model, reasoning effort, and service tier. Multi-room operation therefore
 observes one room's in-flight call, rate limit, usage limit, or exhausted quota
@@ -337,10 +337,10 @@ lock and performs a fresh read-only preflight before every child start. A
 separate guardian then owns the foreground worker under `caffeinate -i`; EOF on
 its liveness pipes tears down every worker group before restart if either the
 watchdog or guardian dies. See the
-[Bujamentor launchd runbook](docs/bujamentor-launchd-supervision.md#persistent-auto-reply-launchagent)
+[AutoReply launchd runbook](docs/auto-reply-launchd-supervision.md#persistent-auto-reply-launchagent)
 for the trust boundary and status checks.
 
-The current unattended host is session-monitor only: LaunchAgent → Terminal → immutable bake → `auto-reply`. Do not use `install-bujamentor-auto-reply-service.sh` or the watch/health LaunchAgent as a reply owner. A running watchdog window is miniaturized; a finished `.command` window (`busy=false`) is closed. The user's existing Terminal is never hidden. GeekNews posts at most three times per KST day from the official Atom feed (`https://news.hada.io/rss/news`): morning 08:40±20m, lunch 12:35±15m, evening 19:50±25m, each a 30-minute window, only after 10 minutes of room quiet. Format is `GeekNews TOP5 · {time}`, a blank line, then numbered `1.`–`5.`. Seen IDs and `posted_slots` are written only after a locally confirmed send.
+The current unattended host is session-monitor only: LaunchAgent → Terminal → immutable bake → `auto-reply`. Do not use `install-auto-reply-service.sh` or the watch/health LaunchAgent as a reply owner. A running watchdog window is miniaturized; a finished `.command` window (`busy=false`) is closed. The user's existing Terminal is never hidden. GeekNews posts at most three times per KST day from the official Atom feed (`https://news.hada.io/rss/news`): morning 08:40±20m, lunch 12:35±15m, evening 19:50±25m, each a 30-minute window, only after 10 minutes of room quiet. Format is `GeekNews TOP5 · {time}`, a blank line, then numbered `1.`–`5.` with a blank line between items. Seen IDs and `posted_slots` are written only after a locally confirmed send.
 
 This provides recovery after the same user logs back in and Aqua, Terminal,
 the existing TCC authorization, logged-in KakaoTalk, and the exact window are
@@ -351,7 +351,7 @@ is the long-term option for removing the Terminal dependency.
 
 #### Read-only real-time dashboard
 
-`python3 scripts/bujamentor-tui.py` displays service state, per-room
+`python3 scripts/auto-reply-tui.py` displays service state, per-room
 supervisor/DB/AX/worker heartbeats, the account-global model circuit, and the
 queue without making any change. Each room retains up to 4,096 metadata-only
 durable transitions, so detection, authorization, media, context, model,
@@ -374,8 +374,12 @@ to refresh immediately, `p` to pause, and `?` for help. Each refresh validates
 and loads all 4,096 or fewer retained entries per room, while the screen
 displays eight at once. `history_truncated=true` means older history was pruned
 at the retention boundary or a sequence gap exists; it never means retained
-entries are hidden. The offline packager's `open-bujamentor-tui.command` opens
+entries are hidden. The offline packager's `open-auto-reply-tui.command` opens
 the same redacted dashboard without opting in to content.
+
+#### Read-only menu bar status
+
+`scripts/start-auto-reply-menubar.command` puts a read-only extra on the right side of the menu bar. **답변 모델** loads the Gajae-Code `gjc --list-models` catalog so the operator can switch the reply LLM; the choice is stored in state-root `reply-model.json` and used on the next generation without editing the live bake. **프로바이더 등록** mirrors Gajae-Code `/provider add` via `gjc setup provider` presets or OpenAI/Anthropic-compatible custom fields, accepts only an API-key environment variable name (never the raw key), and opens OAuth in a browser with `gjc auth-broker login` from **OAuth browser login**. Green means a completed idle loop (healthy, no open jobs). Yellow means a reply is in flight, or a missing window / temporary model outage / leftover occupancy. Red means an error (fence, open `delivery_unknown`, dead worker, bake digest mismatch). Gray means off (auto-reply disabled or the watchdog is stopped). Pipeline ticks are per-stage: idle stages stay gray, active is blue, done is green, skipped is yellow, and only a real failure on that stage is red. The dropdown status dot and service lamps still show overall health. The dropdown is a graphical panel of status, a compact top-right memory count, count tiles, service lamps, and GeekNews capsules rather than a key=value dump. The menu and **채팅방…** (Rooms) window show that pipeline graphically. Menu logs stay closed-vocabulary (numeric `id:` and status codes only). **채팅방…** is catalog CRUD for per-room auto-reply and GeekNews flags. It writes only `menubar-room-catalog.json` and never sends, focuses KakaoTalk, retransmits leftovers, bakes a runtime, or restarts LaunchAgents. Instant auto-reply / GeekNews panel buttons only expire already-scheduled jobs and write a room `operator-request.json` for the existing worker; the extra itself does not AX-send. Notifications fire only for `ax_window_missing`, `leftover_occupancy`, and `worker_unhealthy`. Instant auto-reply and instant GeekNews are buttons on the graphical dropdown panel. Menu actions are refresh, the log window (plain-language recent events, never chat bodies), rooms, Doctor, and **대화 기억** (local vector/context memory). `python3 scripts/auto-reply-menubar.py --state-root "$HOME/Library/Application Support/openkakao/auto-reply"` prints the same redacted JSON. It is not part of the session-monitor bake; add the `.command` as a login item if you want it after Aqua comes back. The **자가 점검…** (Doctor) window runs the same closed-code self-check and can clear a stale leftover occupancy flag or nudge already-scheduled jobs. It never sends, retransmits leftovers, focuses KakaoTalk, or restarts LaunchAgents. The **대화 기억…** window searches, adds, edits, and deletes rows in the local hashed vector SQLite (`~/Library/Application Support/openkakao/context.sqlite3`) used for retrieval. **설명 자료** (`references`) jointly analyzes lecture-style explanations (image plus teaching text to several people) into who/what/how/why plus claims and image evidence; raw dumps are not embedded. Only `lecture-pack-v2` packs that pass the quality gate are stored, and those rows are read-only. Live-synced rows may reappear after the next context-sync.
 
 Read-only operations are always available:
 

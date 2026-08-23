@@ -36,12 +36,13 @@ const CONTEXT_REPLY_BUNDLE_DECISION_LIMIT: usize = 6;
 const CONTEXT_REPLY_BUNDLE_MAX_JSON_BYTES: usize = 64 * 1024;
 const CONTEXT_KEYWORD_CANDIDATE_CAP: usize = 256;
 const CONTEXT_VECTOR_CANDIDATE_CAP: usize = 256;
+const CONTEXT_TOPIC_CANDIDATE_CAP: usize = 64;
 const STYLE_VECTOR_CANDIDATE_CAP: usize = 256;
 const REPLY_DECISION_CANDIDATE_CAP: usize = 128;
 const MAX_REPLY_EVIDENCE_IDS: usize = 64;
 const MAX_REPLY_EVIDENCE_ID_BYTES: usize = 256;
 const MAX_CONTEXT_RETRIEVAL_SCORE: f32 = 2.0;
-const LIVE_CONTEXT_SCHEMA_VERSION: &str = "1";
+const LIVE_CONTEXT_SCHEMA_VERSION: &str = "2";
 const LIVE_CONTEXT_BATCH_MAX_ROWS: usize = 200;
 const LIVE_CONTEXT_MAX_FIELD_BYTES: usize = 256 * 1024;
 const LIVE_CONTEXT_MAX_PENDING_RECIPIENTS: usize = 64;
@@ -78,6 +79,12 @@ pub struct LiveContextEvent {
     pub exclude_from_learning: bool,
     #[serde(default)]
     pub auto_generated: bool,
+    #[serde(default)]
+    pub attachment: String,
+    #[serde(default)]
+    pub message_type: i32,
+    #[serde(default)]
+    pub interest_only: bool,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -89,6 +96,21 @@ pub struct LiveContextSyncState {
     pub authoritative: bool,
     pub summary_dirty: bool,
     pub sync_status: String,
+}
+
+impl LiveContextSyncState {
+    /// Startup and `--check` may proceed while summaries are dirty.
+    ///
+    /// `summary_dirty` means a pending burst still needs a summary refresh. The
+    /// reply path already runs `context-sync-local` before grounded drafts, so
+    /// blocking the whole worker on that flag leaves authorized inbound stuck
+    /// behind a fence the worker itself is supposed to clear.
+    pub fn allows_auto_reply_startup(&self, chat_id: i64, chat_name: &str) -> bool {
+        self.chat_id == chat_id
+            && self.chat == chat_name
+            && self.authoritative
+            && matches!(self.sync_status.as_str(), "ready" | "partial")
+    }
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -621,6 +643,49 @@ fn is_emoji(ch: char) -> bool {
     )
 }
 
+fn is_generic_ack_style(message: &str) -> bool {
+    let remainder: String = message
+        .chars()
+        .filter(|ch| {
+            !ch.is_whitespace()
+                && !matches!(
+                    *ch,
+                    'ㅋ' | 'ㅎ' | 'ㄷ' | ',' | '.' | '!' | '?' | '？' | '～' | '~' | ';'
+                )
+        })
+        .collect();
+    matches!(
+        remainder.as_str(),
+        "" | "ㅇㅇ" | "응" | "네" | "맞아" | "ㅇ" | "음" | "어" | "웅"
+    )
+}
+
+fn is_assistant_tell_style(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    const TELLS: &[&str] = &[
+        "답할 수 있어",
+        "답할 수 있습니다",
+        "도와드릴",
+        "무엇을 도와",
+        "맥락에 맞게 답",
+        "i can help",
+        "as an ai",
+        "i'm an ai",
+        "i am an ai",
+    ];
+    TELLS
+        .iter()
+        .any(|tell| message.contains(tell) || lower.contains(&tell.to_ascii_lowercase()))
+}
+
+fn is_spectator_narration_style(message: &str) -> bool {
+    let compact: String = message.chars().filter(|ch| !ch.is_whitespace()).collect();
+    compact.ends_with("알아보나보네")
+        || compact.ends_with("하나보네")
+        || compact.ends_with("인가보네")
+        || compact.ends_with("쪽인가보네")
+}
+
 fn classify_style_message(message: &str) -> StyleMessageFeatures {
     let normalized = message.trim();
     let char_count = normalized.chars().count();
@@ -703,6 +768,12 @@ fn classify_style_message(message: &str) -> StyleMessageFeatures {
             .any(|marker| normalized.contains(marker))
         {
             (false, "pasted_information")
+        } else if is_generic_ack_style(normalized) {
+            (false, "generic_ack")
+        } else if is_assistant_tell_style(normalized) {
+            (false, "assistant_tell")
+        } else if is_spectator_narration_style(normalized) {
+            (false, "spectator_narration")
         } else {
             (true, "ordinary_conversation")
         };
@@ -743,6 +814,392 @@ fn classify_style_message(message: &str) -> StyleMessageFeatures {
         punctuation_count,
         features_json,
     }
+}
+
+const TOPIC_LEXICON: &[(&str, &[&str])] = &[
+    (
+        "contact",
+        &[
+            "번호",
+            "연락처",
+            "전화번호",
+            "폰번호",
+            "핸드폰",
+            "휴대폰",
+            "전화",
+        ],
+    ),
+    (
+        "ax_macos",
+        &[
+            "ax api",
+            "axapi",
+            "손쉬운 사용",
+            "accessibility",
+            "axui",
+            "axtextarea",
+            "axshowmenu",
+        ],
+    ),
+    (
+        "computer_use",
+        &[
+            "컴퓨터 유즈",
+            "computer use",
+            "computer-use",
+            "스크린샷",
+            "픽셀",
+            "마우스",
+        ],
+    ),
+    (
+        "llm_tools",
+        &[
+            "토큰",
+            "cursor",
+            "grok",
+            "gemini",
+            "claude",
+            "chatgpt",
+            "가재코드",
+            "모델",
+        ],
+    ),
+    (
+        "kakao_auto",
+        &["자동답", "local-send", "reply-to", "카톡 답", "워커"],
+    ),
+    (
+        "business",
+        &[
+            "사업자",
+            "지원",
+            "세금",
+            "신청서",
+            "사업",
+            "창업",
+            "매출",
+            "영업",
+            "법인",
+            "스타트업",
+        ],
+    ),
+    ("infra", &["리눅스", "linux", "가상머신"]),
+    ("news", &["긱뉴스", "geeknews", "hada.io"]),
+    ("identity", &["나임", "연우지", "사람이지"]),
+    (
+        "stocks",
+        &[
+            "주식",
+            "증권",
+            "코스피",
+            "코스닥",
+            "나스닥",
+            "다우",
+            "배당",
+            "상장",
+            "공모주",
+            "etf",
+            "양도세",
+            "매수",
+            "매도",
+            "주가",
+        ],
+    ),
+    (
+        "coins",
+        &[
+            "코인",
+            "비트코인",
+            "이더리움",
+            "알트",
+            "업비트",
+            "빗썸",
+            "바이낸스",
+            "김치프리미엄",
+            "김프",
+            "btc",
+            "eth",
+            "blockchain",
+            "블록체인",
+        ],
+    ),
+    (
+        "investing",
+        &[
+            "투자",
+            "수익률",
+            "포트폴리오",
+            "자산배분",
+            "적립",
+            "펀드",
+            "재테크",
+            "시드",
+        ],
+    ),
+    (
+        "real_estate",
+        &[
+            "부동산",
+            "아파트",
+            "전세",
+            "월세",
+            "매매",
+            "청약",
+            "분양",
+            "등기",
+            "전세사기",
+            "집값",
+        ],
+    ),
+    ("auction", &["경매", "공매", "낙찰", "입찰", "경매물건"]),
+    (
+        "ai",
+        &[
+            "인공지능",
+            "챗gpt",
+            "chatgpt",
+            "지피티",
+            "llm",
+            "그록",
+            "grok",
+            "클로드",
+            "claude",
+            "제미니",
+            "gemini",
+            "머신러닝",
+            "딥러닝",
+            "openai",
+            "anthropic",
+        ],
+    ),
+];
+
+const INTEREST_TOPICS: &[&str] = &[
+    "stocks",
+    "coins",
+    "investing",
+    "real_estate",
+    "auction",
+    "business",
+    "ai",
+];
+const TOPIC_LEXICON_VERSION: &str = "2";
+
+fn classify_message_topics(message: &str) -> Vec<&'static str> {
+    let text = message.trim();
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let lower = text.to_ascii_lowercase();
+    let mut topics = Vec::new();
+    for (topic, needles) in TOPIC_LEXICON {
+        let matched = needles.iter().any(|needle| {
+            if needle.bytes().all(|byte| byte.is_ascii()) {
+                lower.contains(&needle.to_ascii_lowercase())
+            } else {
+                text.contains(needle)
+            }
+        });
+        if matched {
+            topics.push(*topic);
+        }
+    }
+    topics
+}
+
+fn message_has_interest_topic(message: &str) -> bool {
+    classify_message_topics(message)
+        .iter()
+        .any(|topic| INTEREST_TOPICS.contains(topic))
+}
+
+fn push_unique_fragment(parts: &mut Vec<String>, value: &str) {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    if parts.iter().any(|part| part == trimmed) {
+        return;
+    }
+    parts.push(trimmed.to_string());
+}
+
+fn collect_attachment_fragments(value: &serde_json::Value, parts: &mut Vec<String>) {
+    match value {
+        serde_json::Value::String(text) => {
+            let trimmed = text.trim();
+            if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+                push_unique_fragment(parts, trimmed);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_attachment_fragments(item, parts);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for (key, child) in map {
+                let key_lower = key.to_ascii_lowercase();
+                if matches!(
+                    key_lower.as_str(),
+                    "urls"
+                        | "url"
+                        | "src_message"
+                        | "name"
+                        | "filename"
+                        | "title"
+                        | "t"
+                        | "d"
+                        | "description"
+                        | "text"
+                        | "message"
+                        | "content"
+                ) {
+                    match child {
+                        serde_json::Value::String(text) => push_unique_fragment(parts, text),
+                        serde_json::Value::Array(items) => {
+                            for item in items {
+                                if let Some(text) = item.as_str() {
+                                    push_unique_fragment(parts, text);
+                                } else {
+                                    collect_attachment_fragments(item, parts);
+                                }
+                            }
+                        }
+                        _ => collect_attachment_fragments(child, parts),
+                    }
+                } else {
+                    collect_attachment_fragments(child, parts);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn live_index_text(message: &str, attachment: &str, message_type: i32) -> String {
+    let mut parts = Vec::new();
+    push_unique_fragment(&mut parts, message);
+    match message_type {
+        2 => push_unique_fragment(&mut parts, "사진"),
+        3 => push_unique_fragment(&mut parts, "동영상"),
+        18 | 16 => push_unique_fragment(&mut parts, "파일"),
+        27 => push_unique_fragment(&mut parts, "이모티콘"),
+        71 => push_unique_fragment(&mut parts, "샵검색"),
+        _ => {}
+    }
+    let trimmed_attachment = attachment.trim();
+    if !trimmed_attachment.is_empty() {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed_attachment) {
+            collect_attachment_fragments(&value, &mut parts);
+        }
+    }
+    let mut text = parts.join("\n");
+    if text.len() > LIVE_CONTEXT_MAX_FIELD_BYTES {
+        text.truncate(LIVE_CONTEXT_MAX_FIELD_BYTES);
+    }
+    text
+}
+
+fn ensure_topic_lexicon(tx: &rusqlite::Transaction<'_>) -> Result<()> {
+    let current: Option<String> = tx
+        .query_row(
+            "SELECT value FROM context_retrieval_meta WHERE key = 'topic_lexicon_version'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if current.as_deref() == Some(TOPIC_LEXICON_VERSION) {
+        return Ok(());
+    }
+    backfill_message_topics(tx)?;
+    tx.execute(
+        "INSERT INTO context_retrieval_meta(key, value)
+         VALUES ('topic_lexicon_version', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        [TOPIC_LEXICON_VERSION],
+    )?;
+    Ok(())
+}
+
+fn insert_message_topics(
+    conn: &Connection,
+    message_id: i64,
+    chat: &str,
+    source: &str,
+    date: &str,
+    message: &str,
+) -> Result<()> {
+    if message_id <= 0 {
+        return Ok(());
+    }
+    for topic in classify_message_topics(message) {
+        let added = conn.execute(
+            "INSERT OR IGNORE INTO context_message_topics(message_id, topic)
+             VALUES (?1, ?2)",
+            params![message_id, topic],
+        )?;
+        if added == 0 {
+            continue;
+        }
+        conn.execute(
+            "INSERT INTO context_topic_stats(
+                chat, source, topic, message_count, last_date
+             ) VALUES (?1, ?2, ?3, 1, ?4)
+             ON CONFLICT(chat, source, topic) DO UPDATE SET
+                message_count = message_count + 1,
+                last_date = CASE
+                    WHEN excluded.last_date > last_date THEN excluded.last_date
+                    ELSE last_date
+                END",
+            params![chat, source, topic, date],
+        )?;
+    }
+    Ok(())
+}
+
+fn backfill_message_topics(conn: &Connection) -> Result<()> {
+    let mut last_id = 0_i64;
+    loop {
+        let mut stmt = conn.prepare(
+            "SELECT id, chat, source, date, message
+             FROM context_messages
+             WHERE id > ?1
+             ORDER BY id ASC
+             LIMIT 1000",
+        )?;
+        let batch = stmt
+            .query_map([last_id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+        if batch.is_empty() {
+            break;
+        }
+        for (id, chat, source, date, message) in batch {
+            last_id = id;
+            insert_message_topics(conn, id, &chat, &source, &date, &message)?;
+        }
+    }
+    Ok(())
+}
+
+fn context_topic_tables_ready(conn: &Connection) -> Result<bool> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master
+         WHERE type = 'table' AND name = 'context_message_topics'",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(count == 1)
 }
 
 #[cfg(test)]
@@ -1352,7 +1809,10 @@ pub fn ingest_live_context_events(
             disposition = "unknown_author";
             clear_pending_participant_burst(&mut source);
         } else {
-            if !message.is_empty() {
+            let index_text = live_index_text(message, &event.attachment, event.message_type);
+            let should_index = !index_text.is_empty()
+                && (!event.interest_only || message_has_interest_topic(&index_text));
+            if should_index {
                 tx.execute(
                     "INSERT INTO context_messages(
                         source, chat, date, user_name, message, vector
@@ -1362,17 +1822,31 @@ pub fn ingest_live_context_events(
                         chat,
                         date,
                         sender,
-                        message,
-                        vector_to_bytes(&encode_vector(&format!("{sender} {message}"))),
+                        index_text,
+                        vector_to_bytes(&encode_vector(&format!("{sender} {index_text}"))),
                     ],
                 )?;
                 context_message_id = Some(tx.last_insert_rowid());
+                insert_message_topics(
+                    &tx,
+                    context_message_id.unwrap_or(0),
+                    chat,
+                    &source_id,
+                    &date,
+                    &index_text,
+                )?;
                 indexed_messages += 1;
             }
 
             if event.is_self {
-                disposition = if message.is_empty() { "empty" } else { "style" };
-                if !message.is_empty() {
+                disposition = if !should_index {
+                    "filtered_noise"
+                } else if message.is_empty() {
+                    "empty"
+                } else {
+                    "style"
+                };
+                if should_index && !message.is_empty() {
                     let features = classify_style_message(message);
                     tx.execute(
                         "INSERT INTO choi_yeonwoo_style(
@@ -1656,6 +2130,7 @@ pub fn index_csv(db_path: &Path, chat: &str, input: &Path) -> Result<usize> {
         }
         let vector = encode_vector(&format!("{} {}", user, message));
         tx.execute("INSERT INTO context_messages(source, chat, date, user_name, message, vector) VALUES (?1, ?2, ?3, ?4, ?5, ?6)", params![source, chat, date, user, message, vector_to_bytes(&vector)])?;
+        insert_message_topics(&tx, tx.last_insert_rowid(), chat, &source, &date, &message)?;
         if user == STYLE_USER {
             let features = classify_style_message(&message);
             tx.execute(
@@ -2975,9 +3450,7 @@ fn style_search_with_connection(
     ensure_retrieval_index_current(conn)?;
     let preferred_source = preferred_context_source(conn, chat, source)?;
     let query_vector = encode_vector(query);
-    if query_vector.iter().all(|value| *value == 0.0) {
-        anyhow::bail!("vector query contains no searchable tokens");
-    }
+    let tokenless = query_vector.iter().all(|value| *value == 0.0);
     // Style retrieval intentionally uses a bounded eligible recency/diversity
     // pool. This keeps policy filtering ahead of vector scoring without an
     // unbounded fallback when no lexical style index is available.
@@ -3030,16 +3503,25 @@ fn style_search_with_connection(
         let (id, mut result, vector) = row?;
         crate::reply_policy::validate_auto_reply_laughter(&result.message)
             .context("style search contains disallowed laughter evidence")?;
-        result.score = cosine(&query_vector, &vector);
+        result.score = if tokenless {
+            0.0
+        } else {
+            cosine(&query_vector, &vector)
+        };
+        if tokenless {
+            result.mode = "recency_style".into();
+        }
         results.push(ContextCandidate { id, result });
     }
-    results.sort_by(|a, b| {
-        b.result
-            .score
-            .partial_cmp(&a.result.score)
-            .unwrap_or(Ordering::Equal)
-            .then_with(|| a.id.cmp(&b.id))
-    });
+    if !tokenless {
+        results.sort_by(|a, b| {
+            b.result
+                .score
+                .partial_cmp(&a.result.score)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+    }
     Ok(results
         .into_iter()
         .take(limit.min(STYLE_VECTOR_CANDIDATE_CAP))
@@ -3057,9 +3539,7 @@ fn recipient_style_search_with_connection(
 ) -> Result<Vec<ContextResult>> {
     ensure_retrieval_index_current(conn)?;
     let query_vector = encode_vector(query);
-    if query_vector.iter().all(|value| *value == 0.0) {
-        anyhow::bail!("vector query contains no searchable tokens");
-    }
+    let tokenless = query_vector.iter().all(|value| *value == 0.0);
     let mut stmt = conn.prepare(RECIPIENT_STYLE_SEARCH_SQL)?;
     let rows = stmt.query_map(
         params![
@@ -3108,17 +3588,26 @@ fn recipient_style_search_with_connection(
         let (id, mut result, vector, confidence) = row?;
         crate::reply_policy::validate_auto_reply_laughter(&result.message)
             .context("recipient style search contains disallowed laughter evidence")?;
-        result.score = cosine(&query_vector, &vector) * confidence;
+        result.score = if tokenless {
+            0.0
+        } else {
+            cosine(&query_vector, &vector) * confidence
+        };
+        if tokenless {
+            result.mode = "recency_style_recipient".into();
+        }
         results.push(ContextCandidate { id, result });
     }
-    results.sort_by(|left, right| {
-        right
-            .result
-            .score
-            .partial_cmp(&left.result.score)
-            .unwrap_or(Ordering::Equal)
-            .then_with(|| left.id.cmp(&right.id))
-    });
+    if !tokenless {
+        results.sort_by(|left, right| {
+            right
+                .result
+                .score
+                .partial_cmp(&left.result.score)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+    }
     Ok(results
         .into_iter()
         .take(limit.min(STYLE_VECTOR_CANDIDATE_CAP))
@@ -3269,7 +3758,7 @@ fn context_reply_bundle_internal(
         anyhow::bail!("chat name must not be empty");
     }
     if query.trim().is_empty() {
-        anyhow::bail!("query must not be empty");
+        // Punctuation-only or blank inbound still needs style/timing evidence.
     }
 
     let conn = open_db_readonly(db_path)?;
@@ -3387,7 +3876,7 @@ pub fn context_reply_bundle_for_recipient_excluding_live_events(
         anyhow::bail!("recipient context reply bundle chat and recipient must not be empty");
     }
     if query.trim().is_empty() {
-        anyhow::bail!("query must not be empty");
+        // Recipient bundles keep style/timing when the inbound has no tokens.
     }
     let exclusions = live_event_exclusions(chat_id, excluded_log_ids)?;
 
@@ -4304,7 +4793,48 @@ fn migrate_live_context_schema(conn: &Connection) -> Result<()> {
             PRIMARY KEY(source, chat_id, recipient)
         );
         CREATE INDEX IF NOT EXISTS idx_recipient_style_profile_lookup
-            ON choi_yeonwoo_recipient_style_profile(chat, recipient, sample_count);",
+            ON choi_yeonwoo_recipient_style_profile(chat, recipient, sample_count);
+        CREATE TABLE IF NOT EXISTS context_message_topics(
+            message_id INTEGER NOT NULL,
+            topic TEXT NOT NULL CHECK(length(topic) > 0),
+            PRIMARY KEY(message_id, topic)
+        );
+        CREATE INDEX IF NOT EXISTS idx_context_message_topics_topic
+            ON context_message_topics(topic, message_id);
+        CREATE TABLE IF NOT EXISTS context_topic_stats(
+            chat TEXT NOT NULL,
+            source TEXT NOT NULL,
+            topic TEXT NOT NULL,
+            message_count INTEGER NOT NULL CHECK(message_count >= 0),
+            last_date TEXT NOT NULL,
+            PRIMARY KEY(chat, source, topic)
+        );
+        CREATE TABLE IF NOT EXISTS context_reference_packs(
+            id INTEGER PRIMARY KEY,
+            pack_key TEXT NOT NULL UNIQUE,
+            source TEXT NOT NULL,
+            chat TEXT NOT NULL,
+            chat_id INTEGER NOT NULL,
+            user_name TEXT NOT NULL,
+            started_at TEXT NOT NULL,
+            ended_at TEXT NOT NULL,
+            start_log_id INTEGER NOT NULL,
+            end_log_id INTEGER NOT NULL,
+            message_count INTEGER NOT NULL,
+            image_count INTEGER NOT NULL,
+            quality_score INTEGER NOT NULL,
+            topics TEXT NOT NULL DEFAULT '',
+            what_text TEXT NOT NULL,
+            how_text TEXT NOT NULL,
+            why_text TEXT NOT NULL,
+            body TEXT NOT NULL,
+            vector BLOB NOT NULL,
+            context_message_id INTEGER,
+            policy_version TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_reference_packs_chat
+            ON context_reference_packs(chat, quality_score DESC, end_log_id DESC);",
     )?;
     tx.execute(
         "INSERT OR IGNORE INTO context_retrieval_meta(key, value)
@@ -4318,8 +4848,21 @@ fn migrate_live_context_schema(conn: &Connection) -> Result<()> {
             |row| row.get(0),
         )
         .optional()?;
-    if version.as_deref() != Some(LIVE_CONTEXT_SCHEMA_VERSION) {
-        anyhow::bail!("live context index migration required");
+    match version.as_deref() {
+        Some("1") => {
+            backfill_message_topics(&tx)?;
+            tx.execute(
+                "UPDATE context_retrieval_meta
+                 SET value = ?1
+                 WHERE key = 'live_context_schema'",
+                [LIVE_CONTEXT_SCHEMA_VERSION],
+            )?;
+            ensure_topic_lexicon(&tx)?;
+        }
+        Some(value) if value == LIVE_CONTEXT_SCHEMA_VERSION => {
+            ensure_topic_lexicon(&tx)?;
+        }
+        _ => anyhow::bail!("live context index migration required"),
     }
     tx.commit()?;
     Ok(())
@@ -4429,7 +4972,7 @@ fn vector_search_excluding(
 ) -> Result<Vec<ContextCandidate>> {
     let query_vector = encode_vector(query);
     if query_vector.iter().all(|value| *value == 0.0) {
-        anyhow::bail!("vector query contains no searchable tokens");
+        return Ok(Vec::new());
     }
 
     // Restrict semantic scoring to the bounded lexical candidate set. A
@@ -4502,6 +5045,65 @@ fn vector_search_excluding(
     Ok(candidates)
 }
 
+fn topic_search_excluding(
+    conn: &Connection,
+    chat: Option<&str>,
+    source: Option<&str>,
+    query: &str,
+    excluded_context_ids: &BTreeSet<i64>,
+) -> Result<Vec<ContextCandidate>> {
+    if !context_topic_tables_ready(conn)? {
+        return Ok(Vec::new());
+    }
+    let topics = classify_message_topics(query);
+    if topics.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn.prepare(
+        "SELECT m.id, m.chat, m.source, m.date, m.user_name, m.message
+         FROM context_message_topics t
+         JOIN context_messages m ON m.id = t.message_id
+         WHERE t.topic = ?1
+           AND (?2 IS NULL OR m.chat = ?2)
+           AND (?3 IS NULL OR m.source = ?3)
+         ORDER BY m.id DESC
+         LIMIT ?4",
+    )?;
+    let candidate_limit = CONTEXT_TOPIC_CANDIDATE_CAP.saturating_add(excluded_context_ids.len());
+    let mut results = Vec::new();
+    let mut seen = BTreeSet::new();
+    for topic in topics {
+        let rows = stmt.query_map(
+            params![topic, chat, source, candidate_limit as i64],
+            |row| {
+                Ok(ContextCandidate {
+                    id: row.get(0)?,
+                    result: ContextResult {
+                        chat: row.get(1)?,
+                        source: row.get(2)?,
+                        date: row.get(3)?,
+                        user: row.get(4)?,
+                        message: row.get(5)?,
+                        score: 1.0,
+                        mode: "topic".into(),
+                    },
+                })
+            },
+        )?;
+        for row in rows {
+            let row = row?;
+            if excluded_context_ids.contains(&row.id) || !seen.insert(row.id) {
+                continue;
+            }
+            results.push(row);
+            if results.len() == CONTEXT_TOPIC_CANDIDATE_CAP {
+                return Ok(results);
+            }
+        }
+    }
+    Ok(results)
+}
+
 fn hybrid_search_excluding(
     conn: &Connection,
     chat: Option<&str>,
@@ -4536,6 +5138,24 @@ fn hybrid_search_excluding(
             item.result.score = score;
             item.result.mode = "hybrid".into();
             merged.push(item);
+        }
+    }
+    let topics = topic_search_excluding(conn, chat, source, query, excluded_context_ids)?;
+    for (rank, item) in topics.into_iter().enumerate() {
+        let score = 1.0 / (rank as f32 + 1.0);
+        if let Some(existing) = merged.iter_mut().find(|existing| existing.id == item.id) {
+            existing.result.score += score;
+        } else {
+            let mut item = item;
+            item.result.score = score;
+            item.result.mode = "hybrid".into();
+            merged.push(item);
+        }
+    }
+    const REFERENCE_PREFIX: &str = "[설명자료]";
+    for item in &mut merged {
+        if item.result.message.starts_with(REFERENCE_PREFIX) {
+            item.result.score += 0.35;
         }
     }
     merged.sort_by(|a, b| {
@@ -4639,6 +5259,9 @@ mod tests {
             is_self: sender_name == STYLE_USER,
             exclude_from_learning: false,
             auto_generated: false,
+            attachment: String::new(),
+            message_type: 1,
+            interest_only: false,
         }
     }
 
@@ -4687,7 +5310,184 @@ mod tests {
         assert!(!is_conversational_style_message(
             "문승현님이 부방장이 되었습니다."
         ));
+        assert!(is_conversational_style_message("ㅇㅇ 저장해둘게"));
+        assert!(is_conversational_style_message(
+            "사용량 많으면 플러스가 낫긴 하지"
+        ));
+        assert!(!is_conversational_style_message("ㅇㅇ"));
+        assert!(!is_conversational_style_message("ㅇㅇㅋㅋㅋㅋ"));
+        assert!(!is_conversational_style_message(
+            "응, 사진 메시지도 확인해서 맥락에 맞게 답할 수 있어!"
+        ));
+        assert!(!is_conversational_style_message("대만 여행 알아보나 보네"));
+        assert!(!is_conversational_style_message(
+            "재정 관리 빡세게 하나보네"
+        ));
+        assert!(is_conversational_style_message(
+            "사용량 많으면 플러스가 낫긴 하지"
+        ));
     }
+    #[test]
+    fn classify_message_topics_assigns_contact_and_ax() {
+        assert_eq!(
+            classify_message_topics("연락처 저장함 010-1234-5678"),
+            vec!["contact"]
+        );
+        assert!(classify_message_topics("어제 번호 이야기해줫던거 머더라").contains(&"contact"));
+        assert!(
+            classify_message_topics("AX API가 손쉬운 사용으로 카톡 조작함").contains(&"ax_macos")
+        );
+        assert!(classify_message_topics("토큰 부자ㄷㄷ").contains(&"llm_tools"));
+        assert!(classify_message_topics("ㅋㅋㅋ").is_empty());
+        assert!(classify_message_topics("코스피 배당주 투자").contains(&"stocks"));
+        assert!(classify_message_topics("업비트 비트코인").contains(&"coins"));
+        assert!(classify_message_topics("전세 부동산 경매").contains(&"real_estate"));
+        assert!(classify_message_topics("전세 부동산 경매").contains(&"auction"));
+        assert!(classify_message_topics("그록 인공지능").contains(&"ai"));
+        assert!(message_has_interest_topic("공모주 넣었어요"));
+        assert!(!message_has_interest_topic("ㅋㅋㅋ"));
+        let indexed = live_index_text(
+            "사진",
+            r#"{"urls":["https://grok.com/supergrok"],"src_message":"67% 슈퍼그록"}"#,
+            2,
+        );
+        assert!(indexed.contains("https://grok.com/supergrok"));
+        assert!(indexed.contains("슈퍼그록"));
+        assert!(message_has_interest_topic(&indexed));
+    }
+
+    #[test]
+    fn interest_only_indexes_investing_and_skips_chatter() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("interest-only.sqlite3");
+        let chat_id = 415878504092105;
+        let chat = "변우중";
+        let mut keep = live_event(chat_id, 11, "변우중", "비트코인 지금 들어가도 됨?", 100);
+        keep.interest_only = true;
+        let mut skip = live_event(chat_id, 12, "변우중", "ㅋㅋㅋ", 110);
+        skip.interest_only = true;
+        let mut photo = live_event(chat_id, 13, "변우중", "사진", 120);
+        photo.interest_only = true;
+        photo.message_type = 2;
+        photo.attachment = r#"{"src_message":"강남 아파트 경매 보셈"}"#.into();
+        ingest_live_context_events(
+            &db,
+            TEST_ACCOUNT_FINGERPRINT,
+            chat_id,
+            chat,
+            0,
+            &[keep, skip, photo],
+            true,
+            false,
+        )
+        .unwrap();
+        let conn = open_db(&db).unwrap();
+        let messages: Vec<String> = conn
+            .prepare("SELECT message FROM context_messages ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(messages.len(), 2);
+        assert!(messages.iter().any(|row| row.contains("비트코인")));
+        assert!(messages.iter().any(|row| row.contains("경매")));
+        assert!(!messages.iter().any(|row| row == "ㅋㅋㅋ"));
+        let topics: Vec<String> = conn
+            .prepare("SELECT DISTINCT topic FROM context_message_topics ORDER BY topic")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(topics.iter().any(|topic| topic == "coins"));
+    }
+
+    #[test]
+    fn topic_overlay_recalls_contact_thread_without_shared_keyword() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("topics.sqlite3");
+        let path = dir.path().join("chat.csv");
+        fs::write(
+            &path,
+            "Date,User,Message\n\
+2026-01-01 10:00:00,문승현,연락처 저장함 010-1234-5678\n\
+2026-01-01 10:00:10,최연우,ㅇㅇ 저장해둘게\n\
+2026-01-01 12:00:00,문승현,AX API가 손쉬운 사용으로 카톡 조작함\n\
+2026-01-01 12:00:05,최연우,컴퓨터 유즈보다 AX가 나음\n\
+2026-01-01 13:00:00,문승현,토큰 부자ㄷㄷ\n",
+        )
+        .unwrap();
+        assert_eq!(index_csv(&db, "부자멘토멘티", &path).unwrap(), 5);
+
+        let recalled = search(
+            &db,
+            Some("부자멘토멘티"),
+            None,
+            "어제 번호 이야기해줫던거 머더라",
+            "hybrid",
+            5,
+        )
+        .unwrap();
+        assert!(
+            recalled
+                .iter()
+                .any(|row| row.message.contains("010-") || row.message.contains("연락처")),
+            "{recalled:?}"
+        );
+
+        let ax = search(
+            &db,
+            Some("부자멘토멘티"),
+            None,
+            "AX API 손쉬운 사용",
+            "hybrid",
+            5,
+        )
+        .unwrap();
+        assert!(
+            ax.iter()
+                .any(|row| row.message.contains("손쉬운 사용") || row.message.contains("AX")),
+            "{ax:?}"
+        );
+        assert!(!ax.iter().any(|row| row.message.contains("010-")), "{ax:?}");
+
+        let conn = open_db(&db).unwrap();
+        conn.execute("DELETE FROM context_message_topics", [])
+            .unwrap();
+        conn.execute("DELETE FROM context_topic_stats", []).unwrap();
+        conn.execute(
+            "UPDATE context_retrieval_meta SET value = '1' WHERE key = 'live_context_schema'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let conn = open_db(&db).unwrap();
+        let version: String = conn
+            .query_row(
+                "SELECT value FROM context_retrieval_meta WHERE key = 'live_context_schema'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, LIVE_CONTEXT_SCHEMA_VERSION);
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM context_message_topics", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(n >= 3, "backfill topics {n}");
+        let contact: i64 = conn
+            .query_row(
+                "SELECT message_count FROM context_topic_stats
+                 WHERE chat = '부자멘토멘티' AND topic = 'contact'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(contact >= 1, "contact stats {contact}");
+    }
+
     #[test]
     fn indexes_and_scopes_by_chat_and_source() {
         let dir = tempdir().unwrap();
@@ -5422,6 +6222,27 @@ mod tests {
     }
 
     #[test]
+    fn punctuation_only_query_keeps_style_and_timing() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("tokenless.sqlite3");
+        let path = dir.path().join("chat.csv");
+        fs::write(
+            &path,
+            "Date,User,Message\n\
+             2026-01-01 00:00:00,민수,세금 일정 알려줘\n\
+             2026-01-01 00:00:10,최연우,ㅋㅋㅋ 일정 확인해요\n",
+        )
+        .unwrap();
+        index_csv(&db, "부자멘토멘티", &path).unwrap();
+        let bundle = context_reply_bundle(&db, "부자멘토멘티", "???", None).unwrap();
+        assert!(bundle.context.is_empty());
+        assert!(!bundle.styles.is_empty());
+        assert!(bundle.styles.iter().all(|row| row.mode == "recency_style"));
+        assert!(bundle.style_profile.is_some());
+        assert!(bundle.response_time.is_some());
+    }
+
+    #[test]
     fn recipient_bundle_excludes_every_burst_row_and_decision() {
         let dir = tempdir().unwrap();
         let db = dir.path().join("burst-exclusion.sqlite3");
@@ -5732,6 +6553,9 @@ mod tests {
             "response_time_samples",
             "choi_yeonwoo_recipient_style_samples",
             "choi_yeonwoo_recipient_style_profile",
+            "context_message_topics",
+            "context_topic_stats",
+            "context_reference_packs",
         ] {
             assert_eq!(
                 conn.query_row(
@@ -5760,6 +6584,36 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn auto_reply_startup_allows_dirty_partial_authoritative_identity() {
+        let dirty_ok = LiveContextSyncState {
+            source: "local-db:test:42".to_string(),
+            chat_id: 42,
+            chat: "부자멘토멘티".to_string(),
+            checkpoint_log_id: 7,
+            authoritative: true,
+            summary_dirty: true,
+            sync_status: "partial".to_string(),
+        };
+        assert!(dirty_ok.allows_auto_reply_startup(42, "부자멘토멘티"));
+
+        let mut not_auth = dirty_ok.clone();
+        not_auth.authoritative = false;
+        assert!(!not_auth.allows_auto_reply_startup(42, "부자멘토멘티"));
+
+        let mut bad_sync = dirty_ok.clone();
+        bad_sync.sync_status = "stale".to_string();
+        assert!(!bad_sync.allows_auto_reply_startup(42, "부자멘토멘티"));
+
+        assert!(!dirty_ok.allows_auto_reply_startup(43, "부자멘토멘티"));
+        assert!(!dirty_ok.allows_auto_reply_startup(42, "다른방"));
+
+        let mut clean_ready = dirty_ok.clone();
+        clean_ready.summary_dirty = false;
+        clean_ready.sync_status = "ready".to_string();
+        assert!(clean_ready.allows_auto_reply_startup(42, "부자멘토멘티"));
     }
 
     #[test]

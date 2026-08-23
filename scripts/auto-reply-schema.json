@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "should_reply",
+    "reply",
+    "category",
+    "reason",
+    "evidence_ids"
+  ],
+  "properties": {
+    "should_reply": {
+      "type": "boolean"
+    },
+    "reply": {
+      "type": "string",
+      "maxLength": 220
+    },
+    "category": {
+      "type": "string",
+      "enum": [
+        "question",
+        "advice",
+        "information",
+        "social",
+        "reaction",
+        "duplicate",
+        "announcement",
+        "uncertain"
+      ]
+    },
+    "reason": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 80
+    },
+    "evidence_ids": {
+      "type": "array",
+      "maxItems": 64,
+      "items": {
+        "type": "string",
+        "maxLength": 256
+      }
+    },
+    "drafts": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 8,
+      "items": {
+        "type": "string",
+        "maxLength": 220
+      }
+    }
+  }
+}

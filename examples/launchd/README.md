@@ -4,9 +4,9 @@ Use these files as a starting point for long-running unattended OpenKakao jobs o
 
 Recommended shape:
 
-1. use `scripts/install-bujamentor-launchd.sh` for the supervised two-agent setup
+1. use `scripts/install-auto-reply-launchd.sh` for the supervised two-agent setup
 2. keep `openkakao-watch-wrapper.sh` and `com.openkakao.watch.plist` only for the legacy single-agent watch path
-3. read `docs/bujamentor-launchd-supervision.md` before promoting production mode after a binary change
+3. read `docs/auto-reply-launchd-supervision.md` before promoting production mode after a binary change
 
 Guardrails:
 
@@ -19,9 +19,9 @@ Guardrails:
 Operational checks:
 
 ```bash
-sh scripts/status-bujamentor-launchd.sh [--state-root /absolute/path/to/state-root]
-launchctl print gui/$(id -u)/com.openkakao.bujamentor.health
-launchctl print gui/$(id -u)/com.openkakao.bujamentor.watch
+sh scripts/status-auto-reply-launchd.sh [--state-root /absolute/path/to/state-root]
+launchctl print gui/$(id -u)/com.openkakao.auto-reply.health
+launchctl print gui/$(id -u)/com.openkakao.auto-reply.watch
 ```
 
 Legacy single-agent unload:

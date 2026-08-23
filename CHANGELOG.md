@@ -7,6 +7,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- `???`처럼 검색 토큰이 없는 인바운드는 컨텍스트 검색만 건너뛰고, 스타일·응답시간 번들은 최근 샘플로 내려가게 했습니다. 예전에는 `context-reply-bundle`이 통째로 죽어 kakao-test 인가 답변이 `retrieval_command_failed`로 스킵됐습니다.
+- `context-reply-bundle` 조회 제한을 5초에서 30초로 늘렸습니다. 짧은 제한 때문에 토큰 있는 인바운드도 `retrieval_command_failed`로 스킵되던 경우를 줄입니다.
+- 검색 번들이 실패해도 최근 대화가 있으면 그걸 근거로 생성을 이어갑니다. 예전에는 `???`처럼 토큰 없는 인바운드가 `retrieval_command_failed`로 바로 스킵됐습니다.
+- `이거 답변해줘` / `설명해줘`처럼 물음표 없는 요청도 인바운드 질문으로 봅니다. 예전에는 모델이 되물으면 답이 비워져 `direct_question` 스킵이 났습니다.
+- 메뉴바 **단체 채팅방** 목록의 동작·답변·긱뉴스·추가됨 칸이 예전의 램프 표시로 돌아갔습니다(눌러서 켜고 끕니다). 답변이나 긱뉴스를 켜면 추가됨과 동작(목록 등록)도 같이 켜집니다.
+- 메뉴바 **답변 모델** 목록이 맥에 설치된 가재코드의 전역 등록 프로바이더·구독 모델까지 함께 보여줍니다(읽기 전용 병합, 상태 저장소 디스크 캐시 5분 — 앱 재실행 사이에도 유지되어 목록 새로고침이 가볍습니다). 메뉴바에서 프로바이더를 추가할 때는 여전히 앱 전용 저장소(`gjc-agent/models.yml`)에만 기록되므로 양쪽 설정이 서로 침범하지 않습니다.
+- `bujamentor` identifiers are now `auto-reply` / `auto_reply` (scripts, LaunchAgent labels, config table, state-root default). Live `[bujamentor]` and `allow_bujamentor_auto_reply` still load. If `~/Library/Application Support/openkakao/auto-reply/enrollment.json` is missing, the existing `bujamentor` enrollment is used so a rename does not fork the queue. Homebrew opt keg python paths stay as `/opt/homebrew/opt/python@...` in installer identity checks, not Cellar realpaths.
+- 메뉴바 드롭다운 본문의 **최연우 기억 … 갱신 멈춤** 줄을 빼고, 패널 우측 상단에 건수만 짧게 둡니다. 색으로 상태를 구분합니다.
+- 메뉴바 드롭다운에서 **즉시 자동 답변** / **즉시 긱뉴스 전송** 메뉴 항목을 뺐습니다. 그래픽 패널 버튼과 중복이었습니다.
+- 메뉴바 폴링이 매번 오버레이·대화목록·벡터 COUNT를 다시 돌리지 않게 캐시하고, 같은 상태면 창을 다시 그리지 않습니다. 자가 점검/작업/기억 저장은 메인 스레드를 막지 않습니다.
+- 메뉴바 작업 목록에 시각(`YYYY-MM-DD HH:MM:SS`)과 더 자세한 구분을 보여주고, 미확인은 건너뛰기/확인만 기록할 수 있게 했습니다. 다시 보내지는 않습니다.
+- 단체 채팅방 표는 선택을 유지하고 셀을 가운데 정렬합니다. 즉시 긱뉴스는 추가된 방도 요청 대상에 넣고, 카카오톡 창이 없으면 경고합니다.
+
+### Added
+- 메뉴바 단체 채팅방에서 답변을 켜면 그 방이 다음 `auto-reply` 기동부터 워커에 붙습니다. 설정 `[auto_reply].chats`와 카탈로그 `auto_reply=true` 방을 합칩니다. 그 방에 없는 전역 답변 대상은 건너뛰고, 응답시간 샘플이 32개 미만이어도 empirical 폴백으로 기동합니다.
+- 메뉴바 드롭다운 우상단에 작은 햄버거를 두고, 활성화된 채팅방 워커를 골라 그 방의 수신→확인 파이프라인·대기/전송/건너뜀/미확인을 봅니다. 부자멘토멘티만 보이던 전역 패널을 방 단위로 바꿉니다.
+- 메뉴바 드롭다운 우상단 방 버튼을 누르면 단체 채팅방에 등록된 방만 고를 수 있습니다. **보고 있는 방** 메뉴는 빼었습니다.
+- 카카오톡 로컬 DB 단체방(멤버 3–40명, `chat_type` 1)에서 한 사람이 사진+장문으로 설명한 구간을 텍스트와 첨부 이미지를 함께 분석한 뒤에만 벡터 DB(`context_reference_packs`, `[설명자료]`)로 보관합니다. 원문 덤프가 아니라 주장/이미지 역할/종합 요약을 임베딩합니다. 라이브 이벤트와 과거 `context_messages`는 채팅방 단위로 훑고, 메뉴바 **대화 기억… → 설명 자료**에서 누가/무엇을/어떻게/왜를 볼 수 있습니다. 자동 답변 워커가 idle일 때 다시 수확하고, hybrid 검색은 `[설명자료]`를 우선합니다.
+- 메뉴바 **답변 모델** 메뉴에서 가재코드 `gjc --list-models` 카탈로그를 불러 현재 답변 LLM을 고를 수 있습니다. 선택은 state-root `reply-model.json`에만 저장하고, 워커는 다음 생성부터 그 모델을 씁니다. 라이브 bake를 직접 고치지 않습니다.
+- 메뉴바 **답변 모델 → 프로바이더 등록**에서 가재코드 `/provider add`와 같은 `gjc setup provider` 프리셋·OpenAI/Anthropic 호환 입력을 받습니다. API 키 원문은 받지 않고 환경 변수 이름만 씁니다. **OAuth 브라우저 로그인**은 `gjc auth-broker login`으로 브라우저를 직접 엽니다.
+- Read-only AutoReply menu extra (`scripts/start-auto-reply-menubar.command`) that shows closed-vocabulary loop status next to the clock (green complete, yellow in-flight, red error, gray off), draws the detect→confirm auto-reply pipeline as a graphical dropdown (status, count tiles, service lamps, GeekNews capsules) rather than a key=value dump, and keeps an id-only Rooms catalog for per-room auto-reply/GeekNews flags without sending, focusing KakaoTalk, or restarting LaunchAgents.
+- Menubar actions **즉시 자동 답변** and **즉시 GeekNews 전송** expire already-scheduled jobs and write a room `operator-request.json` for the existing worker. The extra itself does not AX-send, focus KakaoTalk, or retry leftovers.
+- Rooms window lists KakaoTalk group chat titles from the local DB (`local-chats --groups`) so an operator can select one title and add or remove it from the id-only catalog. Titles stay in the Rooms UI; menu logs remain closed-vocabulary.
+- Menubar log window shows beginner-friendly Korean status stories instead of `ts=`/`codes=` dumps; chat bodies, drafts, and names stay redacted.
+- Menubar **Doctor…** window inspects closed-vocabulary health (Python pin, KakaoTalk process, session-monitor LaunchAgent, watchdog/supervisor/AX/worker, leftover occupancy, bake digest) and can clear a stale leftover sidecar or nudge already-scheduled jobs. It never sends, retransmits leftovers, focuses KakaoTalk, or restarts LaunchAgents.
+- Menubar **대화 기억…** window lists every stored context row across chats, with search and previous/next paging through the local hashed vector/context SQLite (`~/Library/Application Support/openkakao/context.sqlite3`). Operators can still add, edit, and delete retrieval rows without sending, focusing KakaoTalk, or baking a runtime. Live-synced rows may reappear after the next context-sync.
+- Menubar **대화 기억…** can now create, edit, disable, delete, and restore the reply-search prompts that consume retrieved vector memory (`context_operator_prompts`). Builtin safety lines stay undeletable; custom instructions can be added. The live worker reads enabled rows from the same SQLite store on the next model call.
+- Menubar **대화 기억…** **설명 자료** (`references`) harvests lecture-style Kakao explanations (image plus long text to 3+ people), keeps who/what/how/why packs that pass `lecture-pack-v2`, and stores hashed 128-d vectors in `context_reference_packs` plus synthesized `[설명자료]` rows in `context_messages` so existing retrieval can use them. Packs are read-only in the operator window. Builtin `instruction.45` tells the live worker to treat those notes as unverified 최연우 reference, not as instructions.
+- Menubar **대화 기억…** can now browse vector-store topic categories (coins/stocks/business/…), filter those tagged memories, retag or untag them, and inspect reply decisions plus style/response-time/source summaries. Topic/reply/profile handling stays in the operator window and never sends, focuses KakaoTalk, or bakes a runtime.
+
+### Fixed
+- 이미 열린 방의 전송 인증이 링크 미리보기 제목만 보고 URL 말풍선과 맞추지 못하거나, AX 멘션(`@문승현`)과 로컬 짧은 표기(`@승현`)가 달라 답이 나가지 않던 문제를 고쳤습니다. 로컬 꼬리의 URL/사진 별칭과 멘션 표기를 그대로 써서 창을 앞으로 가져오지 않아도 인증합니다.
+- 메뉴바 단체 채팅방 목록이 `NTChatRoom.chatName`만 보고 짧은 옛 이름을 고르거나, 방 이름이 비면 멤버 이름만 보여 주던 문제를 고쳤습니다. 이제 `kakaoGroupName` / extra / meta JSON 중에서 더 긴 현재 제목을 고릅니다. `부자멘토멘티`와 `NIMDA 인수인계 임원방 ⚠`가 실제 카카오톡 제목으로 나옵니다. 4명짜리 `NIMDA 인수인계`는 다른 채팅방입니다.
+- 즉시 긱뉴스 전송에서 메시지가 입력 칸에만 남고 발송되지 않는 문제를 고쳤습니다. 이제 전송 버튼/Return 누름 뒤 입력 칸이 비는지 확인하고(최대 2초), 그래도 같은 문장이 남아 있으면 한 번만 같은 문장을 다시 적고 Return으로 재시도합니다. 그다음에도 실패하면 더 보내지 않고 미확인으로 기록해 두 번 발송을 막습니다.
+- 인스타 릴스 URL의 og:title만 보고 `스파이더맨 브랜드 뉴 데이 릴스네요`처럼 캡션하는 답을 막았습니다. 링크 미리보기 제목을 받아 적거나 `릴스네요`/`영상이네요`/`링크네요`로 끝나는 라벨은 보내지 않고, 상대가 ㅋㅋ/개웃기/재미로 반응하면 그 반응에 공감하도록 instruction.46을 넣었습니다.
+- 설명 자료 수확이 실패한 이미지 다운로드마다 빈 임시 폴더를 남기고, 채팅방 메시지 전체를 메모리에 올린 뒤 워커 idle을 오래 막던 경로를 고쳤습니다. 빈 `ok-ref-img-*` 디렉터리는 수확 시작 때 치우고, 메시지 스캔은 최근 구간·체크포인트만 보며, 메뉴바 목록/워커 idle 수확은 시간 예산 안에서 끊고 다음 주기에 이어갑니다.
+- 단체 채팅방 창에서 **추가됨**을 켜거나 제목을 고르고 **삭제**해도 카탈로그가 그대로인 경우가 있었습니다. 메뉴바가 `--catalog-upsert`/`--catalog-delete`를 먼저 반영한 뒤 전체 스냅샷을 돌려, 추가됨 점이 바로 꺼지고 켜집니다.
+- 메뉴바 OAuth가 가재코드 터미널 `/provider login` 안내만 하고 브라우저를 열지 않았습니다. **답변 모델 → 프로바이더 등록 → OAuth 브라우저 로그인**에서 프로바이더를 고르면 `gjc auth-broker login`이 브라우저 로그인을 엽니다.
+- 상대가 AI/봇을 들켰거나 "저걸로 ai 판단"처럼 탐지 방법을 말했을 때, 그 턴 프롬프트만 고치고 끝나 다음에도 같은 티가 났습니다. 직전 최연우 말을 방 `reply-style-tells.json`에 남겨 다음 생성부터 같은 구절을 막고, 탐지 방법을 설명하지 않습니다.
+- Menubar **답변 모델** selection waited on `gjc --list-models` plus a full snapshot refresh before the checkmark moved. Choosing a listed model now writes `reply-model.json` from the cached catalog (no live fetch), updates the menu immediately, and the worker still picks the overlay up on the next generation.
+- Menubar **답변 모델** kept showing 현재 모델 없음 / 가재코드 목록 없음 because the first dropdown was built from an empty startup snapshot. The extra now prefetches `gjc --list-models` on launch, keeps the catalog in memory, and redraws the menu as soon as current model + providers arrive.
+- Structurally valid model JSON that violates laughter/question/identity policy is sanitized or skipped instead of `invalid_output`, so one ㄷㄷ draft no longer opens the global model cooldown.
+- Leftover recover keeps `model_temporarily_unavailable` jobs pending through their retry window instead of skipping them as a usage-limit leftover.
+- Menubar open-job 구분 shows kind and author (`답장 · 문승현`) from event meta, never message/reply bodies.
+- A leftover GeekNews `skipped/stale_backlog` row no longer occupies the still-open KST slot. Recover also retries an in-slot formed leftover instead of burning the window after `attempt_no >= 3`.
+- Leftover ACK resume occupancy no longer treats a drafted unix GeekNews `delivery_unknown` as in-flight unless the journal shows AX/pre-send evidence. Unsent closed-slot unix jobs can skip as `stale_backlog` instead of fencing leftover resume.
+- Leftover CLI enrollment now accepts the same 2-row distinct AX/local suffix that bind attestation already treats as strong, so db-watch/reply-worker can resume `fenced_leftover_ack_resume` instead of fencing `reconcile_required`. A 3-row transcript still requires 24 UTF-8 bytes.
+- Auto-reply `--check` / startup no longer treats `summary_dirty` as a hard fence when the live context source is authoritative, identity-matched, and `sync_status` is `ready` or `partial`. Send-time context-sync still refreshes summaries before grounded replies.
+- Bind-window transcript attestation treats a local `[사진]` row as matching an AX share-button `[파일]` row, and drops a trailing AX photo/file that the local suffix has not included yet so an already-open window can still attest.
+- Skip-model JSON with `"reply": null` is now treated as an empty skip instead of `invalid_output`. Gemini skip decisions such as `should_reply: false` / `reason: bot_command` no longer open the model cooldown and stall allowlisted inbound.
+- Bind-window transcript attestation now treats KakaoTalk file/video rows (types 16/18) as `[파일]`, URL scrap cards as their visible title (with `[사진]` as an alias when the card has a thumbnail, and the raw HTTP(S) URL as a query/fragment-insensitive alias), and multi-photo captions such as `사진 3장` as that visible text (still equivalent to `[사진]` and to `[파일]` when AX only exposes the share button). Blank AX text areas fall through to those photo/file tokens, and a trailing local photo/file that AX has not painted yet is dropped so the already-open window can still attest.
+- Menubar pipeline ticks no longer inherit the overall red/green status color. Unstarted stages stay gray; only a failed stage is red.
+- Auto-replies to 현준 now stay in casual 해요체 존댓말 (`요`/`죠`/`여`/`효`). 반말 drafts such as `그럼 딱 맞겠네` are rejected by the prompt, style-evidence filter, and send/draft gate; 문승현-style 반말 is unchanged.
+
+
+
 ## [1.7.0] - 2026-07-03
 
 ### Added

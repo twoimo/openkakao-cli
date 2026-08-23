@@ -58,11 +58,11 @@
 # allow_ax_send = false
 # allowed_send_chats = ["부자멘토멘티"]
 
-# Independent unattended Bujamentor opt-in.
-# allow_bujamentor_auto_reply = false
+# Independent unattended AutoReply opt-in.
+# allow_auto_reply = false
 
 [model]
-# Required for unattended Bujamentor replies: use "local", or explicitly
+# Required for unattended AutoReply replies: use "local", or explicitly
 # attest remote egress with allow_egress, provider, and retention.
 # The Codex configuration below requires these exact remote-explicit values.
 # privacy_mode = "remote_explicit"
@@ -70,7 +70,7 @@
 # provider = "openai-codex"
 # retention = "provider-policy"
 
-[bujamentor]
+[auto_reply]
 # Exact selectors used by `openkakao-cli auto-reply` when --chat is omitted.
 # CLI selectors replace this list. Repeat --chat or use escaped commas.
 # Managed multi-room service mode should declare the complete exact set here
@@ -100,20 +100,20 @@
 # Gajae-Code must point at a private user-owned regular file, not a symlink.
 # reply_runner = "/Users/me/.local/lib/openkakao/gjc.js"
 # reply_runner_kind = "gjc"
-# These exact values select the Gajae-Code Antigravity Gemini 3.6 Flash
-# tiered model. Startup fails closed if they drift.
-# reply_model = "google-antigravity/gemini-3.6-flash-tiered"
-# reply_reasoning_effort = "medium"
+# These exact values select the Gajae-Code Antigravity Gemini 3.7 Flash
+# high-thinking (tiered) model. Startup fails closed if they drift.
+# reply_model = "google-antigravity/gemini-3.7-flash-tiered"
+# reply_reasoning_effort = "high"
 # reply_service_tier = "default"
 # Dedicated private (0700) Codex home is only required for reply_runner_kind=codex.
-# reply_codex_home = "/Users/me/Library/Application Support/openkakao/bujamentor/codex-home"
-# state_root = "/Users/me/Library/Application Support/openkakao/bujamentor"
+# reply_codex_home = "/Users/me/Library/Application Support/openkakao/auto-reply/codex-home"
+# state_root = "/Users/me/Library/Application Support/openkakao/auto-reply"
 
-# Optional per-room allowlists. Keep this subtable after all [bujamentor]
+# Optional per-room allowlists. Keep this subtable after all [auto_reply]
 # scalar settings. Keys are canonical positive Kakao chat IDs; exact room
 # policy prevents participant names from leaking across rooms. Every configured
 # key must be part of the current auto-reply selection. Commas are not allowed
 # in author nicknames because workers receive a bounded comma-delimited value.
-# [bujamentor.room_reply_authors]
+# [auto_reply.room_reply_authors]
 # "417780809780519" = ["참여자A", "참여자B"]
 # "123456789" = ["다른방참여자"]

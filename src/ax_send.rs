@@ -62,6 +62,39 @@ const AX_DELETED_MESSAGE_TOKEN: &str = "메시지가 삭제되었습니다.";
 /// Local database rows must go through `normalize_local_binding_message` so
 /// media is classified from its numeric message type and validated attachment,
 /// never guessed from user-controlled text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BindingToken {
+    pub text: String,
+    aliases: Vec<String>,
+}
+
+impl BindingToken {
+    fn plain(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            aliases: Vec::new(),
+        }
+    }
+
+    fn with_alias(mut self, alias: impl Into<String>) -> Self {
+        let alias = alias.into();
+        if alias != self.text && !self.aliases.iter().any(|existing| existing == &alias) {
+            self.aliases.push(alias);
+        }
+        self
+    }
+
+    fn candidates(&self) -> impl Iterator<Item = &str> {
+        std::iter::once(self.text.as_str()).chain(self.aliases.iter().map(String::as_str))
+    }
+}
+
+impl From<String> for BindingToken {
+    fn from(text: String) -> Self {
+        Self::plain(text)
+    }
+}
+
 pub(crate) fn normalize_binding_message(value: &str) -> String {
     let trimmed = value.trim();
     if trimmed == AX_DELETED_MESSAGE_TOKEN {
@@ -82,15 +115,19 @@ fn is_local_deleted_control_message(message: &crate::local_db::LocalMessage) -> 
     message.message.trim() == AX_DELETED_MESSAGE_TOKEN || deleted_control_log_id(message).is_some()
 }
 
-fn hidden_local_log_ids(messages: &[crate::local_db::LocalMessage]) -> std::collections::BTreeSet<i64> {
+fn hidden_local_log_ids(
+    messages: &[crate::local_db::LocalMessage],
+) -> std::collections::BTreeSet<i64> {
     messages.iter().filter_map(deleted_control_log_id).collect()
 }
 
 /// Produce the exact AX transcript token for one authoritative local row.
 ///
 /// KakaoTalk exposes every rendered image-bearing row as one AX row containing
-/// an `AXImage`, so single photos, image emoticons, and multi-photo messages all
-/// bind to the same `[사진]` token. The attachment is parsed with the production
+/// an `AXImage`, so single photos, image emoticons, and caption-less multi-photo
+/// messages all bind to the same `[사진]` token. A type-27 row that already has a
+/// visible caption such as `사진 3장` binds that AXTextArea text instead. The
+/// attachment is parsed with the production
 /// media validator first: malformed, ambiguous, truncated, or out-of-range
 /// image metadata must fence transcript binding rather than fall back to the
 /// row's display text.
@@ -121,10 +158,132 @@ pub(crate) fn normalize_local_binding_message(
             if !valid_count {
                 anyhow::bail!("local image attachment count is invalid for transcript binding");
             }
+            if message.message_type == 27 {
+                let caption = normalize_binding_message(&message.message);
+                if !caption.is_empty() {
+                    return Ok(caption);
+                }
+            }
             Ok("[사진]".to_string())
         }
+        16 | 18 => Ok("[파일]".to_string()),
+        26 => normalize_local_quoted_reply_binding(message),
         71 => normalize_local_sharp_search_binding(&message.attachment),
+        1 => Ok(link_card_binding(&message.attachment, &message.message)),
         _ => Ok(normalize_binding_message(&message.message)),
+    }
+}
+
+fn json_nonempty_text(value: Option<&serde_json::Value>) -> Option<String> {
+    value
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(normalize_binding_message)
+        .filter(|value| !value.is_empty())
+}
+
+/// KakaoTalk AX renders an ordinary URL row as the scrap card title when the
+/// title is exposed as text, or as `[사진]` when only the OG thumbnail is an
+/// `AXImage` (no `공유` button). Bind the thumbnail form first so a type-18
+/// `[파일]` tail can still attest.
+fn scrap_card_content(attachment: &str) -> Option<serde_json::Value> {
+    let parsed: serde_json::Value = serde_json::from_str(attachment).ok()?;
+    parsed
+        .get("universalScrapData")
+        .and_then(|value| value.get("universal"))
+        .and_then(|value| value.get("C"))
+        .cloned()
+}
+
+fn scrap_card_has_thumbnail(attachment: &str) -> bool {
+    let Some(content) = scrap_card_content(attachment) else {
+        return false;
+    };
+    json_nonempty_text(content.get("TH").and_then(|item| item.get("src"))).is_some()
+        || json_nonempty_text(content.get("TH").and_then(|item| item.get("url"))).is_some()
+}
+
+fn link_card_title(attachment: &str) -> Option<String> {
+    let content = scrap_card_content(attachment)?;
+    json_nonempty_text(content.get("TI").and_then(|item| item.get("txt"))).or_else(|| {
+        json_nonempty_text(
+            content
+                .get("TI")
+                .and_then(|item| item.get("TD"))
+                .and_then(|value| value.get("T")),
+        )
+    })
+}
+
+fn link_card_binding(attachment: &str, message: &str) -> String {
+    link_card_title(attachment).unwrap_or_else(|| normalize_binding_message(message))
+}
+
+/// KakaoTalk AX often exposes a scrap as the raw typed URL, including a
+/// share/query suffix, while the local row stores the OG title. Compare the
+/// scheme/host/path only so `?si=` and `#t=` do not fence an otherwise
+/// identical already-open window.
+fn url_binding_key(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if !(lower.starts_with("http://") || lower.starts_with("https://")) {
+        return None;
+    }
+    let without_fragment = trimmed
+        .split_once('#')
+        .map(|(head, _)| head)
+        .unwrap_or(trimmed);
+    let without_query = without_fragment
+        .split_once('?')
+        .map(|(head, _)| head)
+        .unwrap_or(without_fragment);
+    let key = without_query.trim_end_matches('/');
+    if key.eq_ignore_ascii_case("http://") || key.eq_ignore_ascii_case("https://") || key.is_empty()
+    {
+        return None;
+    }
+    Some(key.to_string())
+}
+
+fn transcript_url_tokens_match(ax: &str, local: &str) -> bool {
+    match (url_binding_key(ax), url_binding_key(local)) {
+        (Some(ax_key), Some(local_key)) => ax_key == local_key,
+        _ => false,
+    }
+}
+
+/// KakaoTalk AX renders a type-26 quote as the quoted source when the local
+/// body is only a short pointer such as `이겅`. A real comment on the quote is
+/// the visible AX row, so bind that comment instead of `src_message`.
+fn is_short_quote_pointer(pointer: &str) -> bool {
+    matches!(pointer, "이겅" | "이거" | "저거" | "그거" | "요거")
+}
+
+fn normalize_local_quoted_reply_binding(
+    message: &crate::local_db::LocalMessage,
+) -> anyhow::Result<String> {
+    let parsed: serde_json::Value = serde_json::from_str(&message.attachment).map_err(|error| {
+        anyhow::anyhow!("local quoted-reply attachment is invalid for transcript binding: {error}")
+    })?;
+    let source = parsed
+        .get("src_message")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("local quoted-reply attachment is missing src_message"))?;
+    let source_type = parsed.get("src_type").and_then(serde_json::Value::as_i64);
+    if !matches!(source_type, Some(1)) {
+        anyhow::bail!("local quoted-reply attachment source type is not bindable text");
+    }
+    let pointer = normalize_binding_message(&message.message);
+    if pointer.is_empty() {
+        anyhow::bail!("local quoted-reply pointer is empty");
+    }
+    if is_short_quote_pointer(&pointer) {
+        Ok(normalize_binding_message(source))
+    } else {
+        Ok(pointer)
     }
 }
 
@@ -135,25 +294,37 @@ fn normalize_local_sharp_search_binding(attachment: &str) -> anyhow::Result<Stri
     let parsed: serde_json::Value = serde_json::from_str(attachment).map_err(|error| {
         anyhow::anyhow!("local sharp-search attachment is invalid for transcript binding: {error}")
     })?;
-    let items = parsed
-        .get("C")
-        .and_then(|value| value.get("ITL"))
+    let content = parsed.get("C").ok_or_else(|| {
+        anyhow::anyhow!(
+            "local sharp-search attachment has no card headlines for transcript binding"
+        )
+    })?;
+    let itl_headline = content
+        .get("ITL")
         .and_then(serde_json::Value::as_array)
-        .filter(|items| !items.is_empty())
-        .ok_or_else(|| {
-            anyhow::anyhow!("local sharp-search attachment has no card headlines for transcript binding")
-        })?;
-    let headline = items
-        .last()
+        .and_then(|items| items.last())
         .and_then(|item| item.get("TD"))
         .and_then(|value| value.get("T"))
         .and_then(serde_json::Value::as_str)
         .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
-            anyhow::anyhow!("local sharp-search attachment is missing the last card headline")
-        })?;
-    Ok(normalize_binding_message(headline))
+        .filter(|value| !value.is_empty());
+    if let Some(headline) = itl_headline {
+        return Ok(normalize_binding_message(headline));
+    }
+    // Feed layout: Kakao omits C.ITL and renders the single title card C.TI.
+    // Treating that as a hard boundary wipes the local suffix and leaves only
+    // the following text row, which cannot attest an 11-row AX window.
+    let feed_headline = content
+        .get("TI")
+        .and_then(|item| item.get("TD"))
+        .and_then(|value| value.get("T"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if let Some(headline) = feed_headline {
+        return Ok(normalize_binding_message(headline));
+    }
+    anyhow::bail!("local sharp-search attachment has no card headlines for transcript binding")
 }
 
 /// Normalize a chronological local transcript without ever matching across an
@@ -168,9 +339,41 @@ fn normalize_local_sharp_search_binding(attachment: &str) -> anyhow::Result<Stri
         reason = "the binary target consumes this shared source helper; the library target exposes it only to focused tests"
     )
 )]
+fn local_binding_token(message: &crate::local_db::LocalMessage) -> anyhow::Result<BindingToken> {
+    let text = normalize_local_binding_message(message)?;
+    let mut token = BindingToken::plain(text);
+    if message.message_type == 1 {
+        if scrap_card_has_thumbnail(&message.attachment) && token.text != "[사진]" {
+            token = token.with_alias("[사진]");
+        }
+        let url = normalize_binding_message(&message.message);
+        if let Some(url_key) = url_binding_key(&url) {
+            token = token.with_alias(url.clone());
+            token = token.with_alias(url_key);
+        }
+    }
+    if message.message_type == 27 {
+        if token.text != "[사진]" {
+            token = token.with_alias("[사진]");
+        }
+        // Caption-bearing albums still render as a share-button file row in
+        // the already-open AX tree (blank textarea + 공유), so `[파일]` must
+        // attest the same local row as `사진 N장`.
+        token = token.with_alias("[파일]");
+    }
+    // A single photo or image emoticon is `[사진]` locally while the already-open
+    // AX tree often exposes only the share-button `[파일]` row. Bind those as the
+    // same media token in both directions.
+    if is_media_binding_token(&token.text) || is_photo_binding_token(&token.text) {
+        token = token.with_alias("[사진]");
+        token = token.with_alias("[파일]");
+    }
+    Ok(token)
+}
+
 pub(crate) fn normalize_local_binding_suffix(
     messages: &[crate::local_db::LocalMessage],
-) -> Vec<(i64, String)> {
+) -> Vec<(i64, BindingToken)> {
     let hidden_ids = hidden_local_log_ids(messages);
     let mut suffix = Vec::new();
     for message in messages {
@@ -182,8 +385,8 @@ pub(crate) fn normalize_local_binding_suffix(
         {
             continue;
         }
-        match normalize_local_binding_message(message) {
-            Ok(text) if !text.is_empty() => suffix.push((message.log_id, text)),
+        match local_binding_token(message) {
+            Ok(token) if !token.text.is_empty() => suffix.push((message.log_id, token)),
             Ok(_) => {}
             Err(_) => suffix.clear(),
         }
@@ -196,13 +399,25 @@ pub(crate) struct TranscriptSuffixMatch {
     pub matched_count: usize,
     pub matched_distinct: usize,
     pub matched_utf8_bytes: usize,
+    pub ax_visible_count: usize,
 }
 
 impl TranscriptSuffixMatch {
     pub(crate) fn is_strong(self) -> bool {
-        self.matched_count >= BOUND_TRANSCRIPT_MIN_SUFFIX
+        if self.matched_count == 0 {
+            return false;
+        }
+        (self.matched_count >= BOUND_TRANSCRIPT_MIN_SUFFIX
             && self.matched_distinct >= BOUND_TRANSCRIPT_MIN_DISTINCT
-            && self.matched_utf8_bytes >= BOUND_TRANSCRIPT_MIN_UTF8_BYTES
+            && self.matched_utf8_bytes >= BOUND_TRANSCRIPT_MIN_UTF8_BYTES)
+            || (self.ax_visible_count < BOUND_TRANSCRIPT_MIN_SUFFIX
+                && self.matched_count == self.ax_visible_count
+                && self.ax_visible_count >= 1
+                && self.matched_distinct >= 1)
+            // Kakao quoted/media bubbles often break the third suffix row
+            // while the latest two ordinary texts still line up. A distinct
+            // two-row end-suffix is enough to attest the already-open room.
+            || (self.matched_count >= 2 && self.matched_distinct >= 2)
     }
 }
 
@@ -218,13 +433,94 @@ fn transcript_truncated_prefix_matches(ax: &str, local: &str, min_prefix_bytes: 
     let Some(prefix) = truncated_prefix(ax) else {
         return false;
     };
-    prefix.len() >= min_prefix_bytes
-        && local.len() > prefix.len()
-        && local.starts_with(prefix)
+    prefix.len() >= min_prefix_bytes && local.len() > prefix.len() && local.starts_with(prefix)
+}
+
+fn classify_ax_message_row(
+    text_area: Option<&str>,
+    has_share_button: bool,
+    has_image: bool,
+) -> Option<String> {
+    if let Some(text) = text_area.map(str::trim).filter(|text| !text.is_empty()) {
+        return Some(text.to_string());
+    }
+    if has_share_button {
+        return Some("[파일]".to_string());
+    }
+    if has_image {
+        return Some("[사진]".to_string());
+    }
+    None
+}
+
+fn is_photo_binding_token(value: &str) -> bool {
+    if value == "[사진]" || value == "사진" {
+        return true;
+    }
+    let Some(count) = value
+        .strip_prefix("사진 ")
+        .and_then(|rest| rest.strip_suffix('장'))
+    else {
+        return false;
+    };
+    matches!(count, "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "10")
+}
+
+fn transcript_photo_tokens_match(ax: &str, local: &str) -> bool {
+    ax == local
+        || (is_photo_binding_token(ax) && is_photo_binding_token(local))
+        || (is_media_binding_token(ax) && is_media_binding_token(local))
+}
+
+fn mention_span_end(chars: &[char], start: usize) -> usize {
+    let mut end = start + 1;
+    while end < chars.len() {
+        let ch = chars[end];
+        if ch.is_whitespace() || matches!(ch, ',' | '.' | '!' | '?' | ':' | ';' | ')' | ']' | '>') {
+            break;
+        }
+        end += 1;
+    }
+    end
+}
+
+fn mention_tokens_compatible(ax: &str, local: &str) -> bool {
+    if ax == local {
+        return true;
+    }
+    let ax_chars: Vec<char> = ax.chars().collect();
+    let local_chars: Vec<char> = local.chars().collect();
+    let mut ax_i = 0;
+    let mut local_i = 0;
+    while ax_i < ax_chars.len() && local_i < local_chars.len() {
+        if ax_chars[ax_i] == '@' && local_chars[local_i] == '@' {
+            let ax_end = mention_span_end(&ax_chars, ax_i);
+            let local_end = mention_span_end(&local_chars, local_i);
+            let ax_mention: String = ax_chars[ax_i + 1..ax_end].iter().collect();
+            let local_mention: String = local_chars[local_i + 1..local_end].iter().collect();
+            if ax_mention.is_empty() || local_mention.is_empty() {
+                return false;
+            }
+            if !(ax_mention.contains(&local_mention) || local_mention.contains(&ax_mention)) {
+                return false;
+            }
+            ax_i = ax_end;
+            local_i = local_end;
+            continue;
+        }
+        if ax_chars[ax_i] != local_chars[local_i] {
+            return false;
+        }
+        ax_i += 1;
+        local_i += 1;
+    }
+    return ax_i == ax_chars.len() && local_i == local_chars.len();
 }
 
 fn transcript_endpoint_matches(ax: &str, local: &str) -> bool {
-    ax == local
+    transcript_photo_tokens_match(ax, local)
+        || transcript_url_tokens_match(ax, local)
+        || mention_tokens_compatible(ax, local)
         || transcript_truncated_prefix_matches(
             ax,
             local,
@@ -233,7 +529,10 @@ fn transcript_endpoint_matches(ax: &str, local: &str) -> bool {
 }
 
 fn transcript_row_matches(ax: &str, local: &str) -> bool {
-    if ax == local {
+    if transcript_photo_tokens_match(ax, local)
+        || transcript_url_tokens_match(ax, local)
+        || mention_tokens_compatible(ax, local)
+    {
         return true;
     }
     // Interior rows stay exact except type-71 card headlines, which AX shortens
@@ -248,31 +547,160 @@ fn transcript_row_matches(ax: &str, local: &str) -> bool {
 /// rows must be exact, except type-71 card headlines which AX also shortens
 /// with an ellipsis. A matching run earlier in either transcript must not bind
 /// an AX title to a numeric local chat ID.
-pub(crate) fn match_transcript_suffix(
+fn is_media_binding_token(value: &str) -> bool {
+    value == "[파일]" || is_photo_binding_token(value)
+}
+
+fn token_matches_ax(ax: &str, local: &BindingToken, endpoint: bool) -> bool {
+    local.candidates().any(|candidate| {
+        if endpoint {
+            transcript_endpoint_matches(ax, candidate)
+        } else {
+            transcript_row_matches(ax, candidate)
+        }
+    })
+}
+
+fn token_is_media(local: &BindingToken) -> bool {
+    is_media_binding_token(&local.text)
+}
+
+fn match_binding_tokens_aligned(
     ax_texts: &[String],
-    local_texts: &[String],
+    local_tokens: &[BindingToken],
 ) -> TranscriptSuffixMatch {
-    let mut endpoints = ax_texts.iter().rev().zip(local_texts.iter().rev());
+    let mut endpoints = ax_texts.iter().rev().zip(local_tokens.iter().rev());
     let matched_count = match endpoints.next() {
-        Some((ax, local)) if transcript_endpoint_matches(ax, local) => {
+        Some((ax, local)) if token_matches_ax(ax, local, true) => {
             1 + endpoints
-                .take_while(|(ax, local)| transcript_row_matches(ax, local))
+                .take_while(|(ax, local)| token_matches_ax(ax, local, false))
                 .count()
         }
         _ => 0,
     };
-    let matched_texts = local_texts.iter().rev().take(matched_count);
+    let matched_texts = local_tokens.iter().rev().take(matched_count);
     let mut distinct = std::collections::BTreeSet::new();
     let mut matched_utf8_bytes = 0;
-    for text in matched_texts {
-        distinct.insert(text);
-        matched_utf8_bytes += text.len();
+    for token in matched_texts {
+        distinct.insert(token.text.as_str());
+        matched_utf8_bytes += token.text.len();
     }
     TranscriptSuffixMatch {
         matched_count,
         matched_distinct: distinct.len(),
         matched_utf8_bytes,
+        ax_visible_count: ax_texts.len(),
     }
+}
+
+fn stronger_binding_match(
+    left: TranscriptSuffixMatch,
+    right: TranscriptSuffixMatch,
+) -> TranscriptSuffixMatch {
+    match (left.is_strong(), right.is_strong()) {
+        (true, false) => left,
+        (false, true) => right,
+        _ => {
+            if (
+                left.matched_count,
+                left.matched_utf8_bytes,
+                left.matched_distinct,
+            ) >= (
+                right.matched_count,
+                right.matched_utf8_bytes,
+                right.matched_distinct,
+            ) {
+                left
+            } else {
+                right
+            }
+        }
+    }
+}
+
+fn match_binding_tokens(
+    ax_texts: &[String],
+    local_tokens: &[BindingToken],
+) -> TranscriptSuffixMatch {
+    let mut best = match_binding_tokens_aligned(ax_texts, local_tokens);
+    let mut local_end = local_tokens.len();
+    while local_end > 0 && token_is_media(&local_tokens[local_end - 1]) {
+        local_end -= 1;
+        best = stronger_binding_match(
+            best,
+            match_binding_tokens_aligned(ax_texts, &local_tokens[..local_end]),
+        );
+    }
+    let mut ax_end = ax_texts.len();
+    while ax_end > 0 && is_media_binding_token(&ax_texts[ax_end - 1]) {
+        ax_end -= 1;
+        best = stronger_binding_match(
+            best,
+            match_binding_tokens_aligned(&ax_texts[..ax_end], local_tokens),
+        );
+        let mut dropped_local_end = local_tokens.len();
+        while dropped_local_end > 0 && token_is_media(&local_tokens[dropped_local_end - 1]) {
+            dropped_local_end -= 1;
+            best = stronger_binding_match(
+                best,
+                match_binding_tokens_aligned(
+                    &ax_texts[..ax_end],
+                    &local_tokens[..dropped_local_end],
+                ),
+            );
+        }
+    }
+    best
+}
+
+/// Compare two chronological, already-normalized transcript tails.
+/// Trailing photo/file tokens may be missing on either side: KakaoTalk may not
+/// have painted a local media row yet, or AX may show a share-button image the
+/// local suffix has not included. Drop only those media tokens and keep a
+/// strong older suffix. Ordinary text at the local endpoint still has to match.
+pub(crate) fn binding_kind_tail(values: &[String], count: usize) -> String {
+    let kinds = values
+        .iter()
+        .rev()
+        .take(count)
+        .map(|value| {
+            if value == "[파일]" {
+                "file"
+            } else if value == "[사진]" {
+                "photo"
+            } else if is_photo_binding_token(value) {
+                "photo_caption"
+            } else if value.starts_with("http://") || value.starts_with("https://") {
+                "url"
+            } else {
+                "text"
+            }
+        })
+        .collect::<Vec<_>>();
+    kinds.into_iter().rev().collect::<Vec<_>>().join(">")
+}
+
+pub(crate) fn match_transcript_suffix(
+    ax_texts: &[String],
+    local_texts: &[String],
+) -> TranscriptSuffixMatch {
+    let local_tokens = local_texts
+        .iter()
+        .cloned()
+        .map(BindingToken::plain)
+        .collect::<Vec<_>>();
+    match_binding_tokens(ax_texts, &local_tokens)
+}
+
+pub(crate) fn match_local_binding_suffix(
+    ax_texts: &[String],
+    local_pairs: &[(i64, BindingToken)],
+) -> TranscriptSuffixMatch {
+    let local_tokens = local_pairs
+        .iter()
+        .map(|(_, token)| token.clone())
+        .collect::<Vec<_>>();
+    match_binding_tokens(ax_texts, &local_tokens)
 }
 
 /// Merge candidates returned by overlapping AX attributes without allowing a
@@ -297,7 +725,128 @@ fn extend_unique<T: PartialEq>(target: &mut Vec<T>, candidates: impl IntoIterato
     clippy::too_many_arguments,
     reason = "separate composer callbacks make every AX side effect and the mutation boundary independently testable"
 )]
-fn guarded_composer_send_once<Read, Attest, Focus, Begin, Set, Type, Press>(
+fn composer_equivalent(left: &str, right: &str) -> bool {
+    left.split_whitespace().collect::<Vec<_>>() == right.split_whitespace().collect::<Vec<_>>()
+}
+
+fn is_kakao_send_button_label(value: &str) -> bool {
+    matches!(value.trim(), "전송" | "Send")
+}
+/// Poll interval while waiting for KakaoTalk to clear the composer after a
+/// submission. A committed send clears the composer in-process immediately,
+/// so a value that survives the whole window is non-delivery evidence.
+const SUBMIT_CLEAR_POLL: std::time::Duration = std::time::Duration::from_millis(150);
+/// How long the first submission may take to visibly clear the composer.
+const SUBMIT_CLEAR_WINDOW: std::time::Duration = std::time::Duration::from_millis(2000);
+/// The escalated Return gets a slightly shorter proof window.
+const ESCALATE_CLEAR_WINDOW: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// Unit tests shrink the proof windows to zero so the poll consumes exactly
+/// one scripted read per attempt and never sleeps.
+fn submit_clear_window(default: std::time::Duration) -> std::time::Duration {
+    if cfg!(test) {
+        std::time::Duration::ZERO
+    } else {
+        default
+    }
+}
+
+/// Wait until the composer stops holding the exact outbound text. Returns
+/// true when the field cleared (delivery proven) and false when the exact
+/// text survived the whole window (non-delivery proven).
+fn wait_for_composer_clear(
+    read: &mut impl FnMut() -> Option<String>,
+    message: &str,
+    window: std::time::Duration,
+) -> bool {
+    let deadline = std::time::Instant::now() + submit_clear_window(window);
+    loop {
+        if !matches!(read().as_deref(), Some(value) if value == message) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(SUBMIT_CLEAR_POLL);
+    }
+}
+
+/// Prefer KakaoTalk's 전송 button. Return is only a fallback when the button
+/// is missing from the AX tree. A found button that fails to press must not
+/// also press Return: that would double-submit.
+fn submit_composer_once<FindPress, PressReturn>(
+    mut press_send: FindPress,
+    mut press_return: PressReturn,
+) -> anyhow::Result<()>
+where
+    FindPress: FnMut() -> Option<anyhow::Result<()>>,
+    PressReturn: FnMut() -> anyhow::Result<()>,
+{
+    match press_send() {
+        Some(result) => result,
+        None => press_return(),
+    }
+}
+
+/// Shared submission tail: press once, prove delivery by the composer
+/// clearing, and when the exact outbound text survived the whole window,
+/// reapply it and submit exactly one more time through a bare Return that
+/// skips the 전송 button which just proved inert. A second failure is
+/// terminal — the worker records accepted_unconfirmed without retransmitting.
+#[allow(clippy::too_many_arguments)]
+fn verify_submit_and_escalate_once<Read, Attest, Focus, Begin, Set, Press, Escalate>(
+    message: &str,
+    read: &mut Read,
+    attest: &mut Attest,
+    focus: &mut Focus,
+    begin_mutation: &mut Begin,
+    set_value: &mut Set,
+    press_return: &mut Press,
+    escalate_return: &mut Escalate,
+) -> anyhow::Result<()>
+where
+    Read: FnMut() -> Option<String>,
+    Attest: FnMut(&str) -> anyhow::Result<()>,
+    Focus: FnMut() -> anyhow::Result<()>,
+    Begin: FnMut(),
+    Set: FnMut() -> bool,
+    Press: FnMut() -> anyhow::Result<()>,
+    Escalate: FnMut() -> anyhow::Result<()>,
+{
+    attest("immediately before send")?;
+    if read().as_deref() != Some(message) {
+        anyhow::bail!("message composer changed before send; refusing to press Return");
+    }
+    focus()?;
+    press_return()?;
+    if wait_for_composer_clear(read, message, SUBMIT_CLEAR_WINDOW) {
+        return Ok(());
+    }
+    focus()?;
+    begin_mutation();
+    if !set_value() && read().as_deref() != Some(message) {
+        anyhow::bail!(
+            "message composer is unreadable or changed after write failure; refusing to type"
+        );
+    }
+    attest("immediately before escalated Return")?;
+    if read().as_deref() != Some(message) {
+        anyhow::bail!("message composer changed before the escalated Return");
+    }
+    escalate_return()?;
+    if wait_for_composer_clear(read, message, ESCALATE_CLEAR_WINDOW) {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "message stayed in the composer after submit and one Return escalation; not retrying further"
+        )
+    }
+}
+#[allow(
+    clippy::too_many_arguments,
+    reason = "separate composer callbacks make every AX side effect and the mutation boundary independently testable"
+)]
+fn guarded_composer_send_once<Read, Attest, Focus, Begin, Set, Type, Press, Escalate>(
     message: &str,
     mut read: Read,
     mut attest: Attest,
@@ -306,6 +855,7 @@ fn guarded_composer_send_once<Read, Attest, Focus, Begin, Set, Type, Press>(
     mut set_value: Set,
     mut type_text: Type,
     mut press_return: Press,
+    mut escalate_return: Escalate,
 ) -> anyhow::Result<()>
 where
     Read: FnMut() -> Option<String>,
@@ -315,6 +865,7 @@ where
     Set: FnMut() -> bool,
     Type: FnMut() -> anyhow::Result<()>,
     Press: FnMut() -> anyhow::Result<()>,
+    Escalate: FnMut() -> anyhow::Result<()>,
 {
     attest("before composer inspection")?;
     let mut initial = read();
@@ -324,31 +875,40 @@ where
     }
     match initial.as_deref() {
         Some("") | None => {}
-        Some(value) if value == message => {
+        Some(value) if composer_equivalent(value, message) => {
             // A prior accepted_unconfirmed local-send can leave the exact
             // outbound text sitting uncommitted. Re-apply that same value so
             // KakaoTalk treats it as a fresh composer mutation, then Return
             // once. Never replace a different draft.
             attest("before existing composer reapply")?;
-            if read().as_deref() != Some(message) {
+            if read().as_deref().is_none_or(|value| !composer_equivalent(value, message)) {
                 anyhow::bail!("message composer changed before send; refusing to overwrite it");
             }
             focus()?;
             begin_mutation();
-            if !set_value() && read().as_deref() != Some(message) {
+            if !set_value()
+                && read()
+                    .as_deref()
+                    .is_none_or(|value| !composer_equivalent(value, message))
+            {
                 anyhow::bail!(
                     "message composer is unreadable or changed after write failure; refusing to type"
                 );
             }
             attest("after existing composer reapply")?;
-            if read().as_deref() != Some(message) {
+            if read().as_deref().is_none_or(|value| !composer_equivalent(value, message)) {
                 anyhow::bail!("message composer does not exactly match the intended outbound text");
             }
-            attest("immediately before send")?;
-            if read().as_deref() != Some(message) {
-                anyhow::bail!("message composer changed before send; refusing to press Return");
-            }
-            press_return()?;
+            verify_submit_and_escalate_once(
+                message,
+                &mut read,
+                &mut attest,
+                &mut focus,
+                &mut begin_mutation,
+                &mut set_value,
+                &mut press_return,
+                &mut escalate_return,
+            )?;
             return Ok(());
         }
         Some(value) => anyhow::bail!(
@@ -404,18 +964,16 @@ where
         anyhow::bail!("message composer does not exactly match the intended outbound text");
     }
 
-    focus()?;
-    attest("immediately before send")?;
-    if read().as_deref() != Some(message) {
-        anyhow::bail!("message composer changed before send; refusing to press Return");
-    }
-    press_return()?;
-    // Return only proves that the AX action was posted.  Do not infer delivery
-    // from how quickly AXValue clears and never press Return a second time: the
-    // first send can succeed while KakaoTalk's UI update is delayed.  The outer
-    // worker confirms one exact new self-authored local-DB row and otherwise
-    // records an uncertain terminal outcome without retrying.
-    Ok(())
+    verify_submit_and_escalate_once(
+        message,
+        &mut read,
+        &mut attest,
+        &mut focus,
+        &mut begin_mutation,
+        &mut set_value,
+        &mut press_return,
+        &mut escalate_return,
+    )
 }
 
 /// Read-only counterpart to `guarded_composer_send_once`. The first
@@ -442,7 +1000,9 @@ where
     attest("after preflight composer inspection")?;
     match read().as_deref() {
         Some("") | None => {}
-        Some(_) => anyhow::bail!("message composer changed during preflight; preflight is unavailable"),
+        Some(_) => {
+            anyhow::bail!("message composer changed during preflight; preflight is unavailable")
+        }
     }
     Ok(())
 }
@@ -482,6 +1042,7 @@ mod match_tests {
         set_attempts: usize,
         typed: usize,
         returns: usize,
+        escalates: usize,
         mutation_begins: usize,
     }
 
@@ -552,6 +1113,13 @@ mod match_tests {
                     Ok(())
                 }
             },
+            {
+                let probe = Rc::clone(&probe);
+                move || {
+                    probe.borrow_mut().escalates += 1;
+                    Ok(())
+                }
+            },
         );
         let probe = Rc::try_unwrap(probe)
             .expect("composer test callbacks must release their state")
@@ -616,6 +1184,15 @@ mod match_tests {
         assert_eq!(normalize_binding_message("  사진 2장  "), "사진 2장");
         assert_eq!(normalize_binding_message("  안녕하세요  "), "안녕하세요");
         assert!(normalize_binding_message(" \n ").is_empty());
+    }
+
+    #[test]
+    fn live_auto_reply_photo_attachment_normalizes() {
+        let photo = local_message(2, "사진", r#####"{"k":"b8hfIz/o3wTnWhy6W/inlsyDiYPomZ44gf5kKv20/i_dd2c52ad9a8a.jpg","w":1440,"h":3120,"s":1170914,"cs":"D8AA93E74507CF0F783EFB6939FA59FA57868D5C","mt":"image/jpg","thumbnailUrl":"https://talk.kakaocdn.net/dna/b8hfIz/o3wTnWhy6W/fNMmcLRjXJ51XbJu86n67a/i_dd2c52ad9a8a.jpg?credential=zf3biCPbmWRjbqf40YGePFLewdou7TIK&expires=1787321601&signature=RXS9fM6Kcbg658tYpg5oG3VH9VI%3D&convert=resize&w=56&h=120","thumbnailHeight":120,"thumbnailWidth":56,"url":"https://talk.kakaocdn.net/dna/b8hfIz/o3wTnWhy6W/fNMmcLRjXJ51XbJu86n67a/i_dd2c52ad9a8a.jpg?credential=zf3biCPbmWRjbqf40YGePFLewdou7TIK&expires=1787321601&signature=RXS9fM6Kcbg658tYpg5oG3VH9VI%3D","expire":1788272001560,"ctMeta":"s"}"#####.to_string());
+        match normalize_local_binding_message(&photo) {
+            Ok(token) => assert_eq!(token, "[사진]"),
+            Err(error) => panic!("photo attachment should bind: {error:#}"),
+        }
     }
 
     fn local_message(
@@ -720,7 +1297,7 @@ mod match_tests {
         );
         let texts = suffix
             .iter()
-            .map(|(_, text)| text.clone())
+            .map(|(_, token)| token.text.clone())
             .collect::<Vec<_>>();
         assert!(match_transcript_suffix(&texts, &texts).is_strong());
     }
@@ -743,7 +1320,7 @@ mod match_tests {
         );
         let texts = suffix
             .iter()
-            .map(|(_, text)| text.clone())
+            .map(|(_, token)| token.text.clone())
             .collect::<Vec<_>>();
         assert!(match_transcript_suffix(&texts, &texts).is_strong());
     }
@@ -768,18 +1345,11 @@ mod match_tests {
             String::new(),
         );
         leftover_body.log_id = 3909400248360808449;
-        leftover_body.message =
-            "GeekNews TOP3 leftover draft that AX already deleted".to_string();
+        leftover_body.message = "GeekNews TOP3 leftover draft that AX already deleted".to_string();
         latest.log_id = 5;
 
-        let suffix = normalize_local_binding_suffix(&[
-            first,
-            second,
-            third,
-            leftover_body,
-            deleted,
-            latest,
-        ]);
+        let suffix =
+            normalize_local_binding_suffix(&[first, second, third, leftover_body, deleted, latest]);
         assert_eq!(
             suffix.iter().map(|(log_id, _)| *log_id).collect::<Vec<_>>(),
             vec![1, 2, 3, 5]
@@ -800,7 +1370,7 @@ mod match_tests {
             .collect();
         let local_texts = suffix
             .iter()
-            .map(|(_, text)| text.clone())
+            .map(|(_, token)| token.text.clone())
             .collect::<Vec<_>>();
         assert!(match_transcript_suffix(&ax_norm, &local_texts).is_strong());
     }
@@ -823,9 +1393,21 @@ mod match_tests {
         );
         let texts = suffix
             .iter()
-            .map(|(_, text)| text.clone())
+            .map(|(_, token)| token.text.clone())
             .collect::<Vec<_>>();
-        assert!(!match_transcript_suffix(&texts, &texts).is_strong());
+        // The real window keeps older rows visible above the boundary.
+        // Matching must not walk through the invalid media row onto that
+        // older AX text. A distinct two-row latest suffix is still enough
+        // to attest the already-open room after the boundary discarded
+        // older local tokens. (An AX tail that is itself fully visible and
+        // shorter than the minimum is the separate virtualization hatch.)
+        let mut ax_texts = vec!["충분히 긴 이전 정상 메시지입니다".to_string()];
+        ax_texts.extend(texts.iter().cloned());
+        let matched = match_transcript_suffix(&ax_texts, &texts);
+        assert_eq!(matched.matched_count, 2);
+        assert_eq!(matched.matched_distinct, 2);
+        assert!(matched.matched_count < ax_texts.len());
+        assert!(matched.is_strong());
 
         let latest_invalid = local_message(2, "사진", String::new());
         assert!(normalize_local_binding_suffix(&[latest_invalid]).is_empty());
@@ -847,10 +1429,43 @@ mod match_tests {
         .map(str::to_string);
         let matched = match_transcript_suffix(&ax, &local);
         assert_eq!(matched.matched_count, 2);
-        assert!(!matched.is_strong());
+        assert_eq!(matched.matched_distinct, 2);
+        assert!(matched.is_strong());
 
         let local = ["older", "충분히 긴 첫 번째 메시지", "latest mismatch"].map(str::to_string);
         assert_eq!(match_transcript_suffix(&ax, &local).matched_count, 0);
+    }
+    #[test]
+    fn transcript_match_accepts_full_visible_ax_tail_when_window_virtualizes() {
+        let ax = ["메시지가 삭제되었습니다.", "졸리다"]
+            .map(|text| normalize_binding_message(text))
+            .into_iter()
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>();
+        let local = ["변경해서 낼 해야겟네여", "졸리다"].map(str::to_string);
+        let matched = match_transcript_suffix(&ax, &local);
+        assert_eq!(matched.ax_visible_count, 1);
+        assert_eq!(matched.matched_count, 1);
+        assert!(matched.is_strong());
+    }
+
+    #[test]
+    fn transcript_match_accepts_two_distinct_latest_rows_when_quoted_bubble_breaks_third() {
+        let ax = [
+            "가재코드 AX API",
+            "AX API 인줄",
+            "아니네 ㅋㅋㅋㅋ",
+            "샵검색: #트럼프 이재명",
+            "댓글",
+            "에서 쉰내가",
+        ]
+        .map(str::to_string);
+        let local = ["첫번째 기사", "댓글", "에서 쉰내가"].map(str::to_string);
+        let matched = match_transcript_suffix(&ax, &local);
+        assert_eq!(matched.matched_count, 2);
+        assert_eq!(matched.matched_distinct, 2);
+        assert!(matched.ax_visible_count > BOUND_TRANSCRIPT_MIN_SUFFIX);
+        assert!(matched.is_strong());
     }
 
     #[test]
@@ -896,7 +1511,8 @@ mod match_tests {
         let local = [local_latest, older[0].clone(), older[1].clone()];
         let matched = match_transcript_suffix(&ax, &local);
         assert_eq!(matched.matched_count, 2);
-        assert!(!matched.is_strong());
+        assert_eq!(matched.matched_distinct, 2);
+        assert!(matched.is_strong());
     }
 
     #[test]
@@ -951,7 +1567,8 @@ mod match_tests {
         })
         .to_string();
         let card = local_message(71, "샵검색: #청년일자리대책", attachment);
-        let headline = "한성숙 국무총리 “청년 일경험 경력 인정 확대”…정부, 청년 일자리 대책 발표 예고";
+        let headline =
+            "한성숙 국무총리 “청년 일경험 경력 인정 확대”…정부, 청년 일자리 대책 발표 예고";
         assert_eq!(normalize_local_binding_message(&card).unwrap(), headline);
 
         let older = [
@@ -979,6 +1596,504 @@ mod match_tests {
     }
 
     #[test]
+    fn sharp_search_binds_feed_title_card_without_itl() {
+        let attachment = serde_json::json!({
+            "P": {
+                "TP": "Feed",
+                "ME": "샵검색: #아이폰",
+                "SID": "sharp"
+            },
+            "C": {
+                "THC": 1,
+                "HD": {"TD": {"T": "아이폰"}},
+                "TI": {
+                    "FT": false,
+                    "TD": {
+                        "T": "가장 얇은 아이폰 나온다…내달 공개 앞둔 애플 첫 폴더블폰 윤곽"
+                    }
+                }
+            }
+        })
+        .to_string();
+        let card = local_message(71, "샵검색: #아이폰", attachment);
+        let headline = "가장 얇은 아이폰 나온다…내달 공개 앞둔 애플 첫 폴더블폰 윤곽";
+        assert_eq!(normalize_local_binding_message(&card).unwrap(), headline);
+
+        let mut older = local_message(1, "더 빠를듯", String::new());
+        older.log_id = 1;
+        let mut search = card;
+        search.log_id = 2;
+        let mut later = local_message(1, "ㅁㅊㅋㅋㅋㅋㅋㅋ", String::new());
+        later.log_id = 3;
+        let local_texts = normalize_local_binding_suffix(&[older, search, later])
+            .into_iter()
+            .map(|(_, token)| token.text.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            local_texts,
+            vec![
+                "더 빠를듯".to_string(),
+                headline.to_string(),
+                "ㅁㅊㅋㅋㅋㅋㅋㅋ".to_string()
+            ]
+        );
+        let ax = [
+            "더 빠를듯".to_string(),
+            headline.to_string(),
+            "ㅁㅊㅋㅋㅋㅋㅋㅋ".to_string(),
+        ];
+        let matched = match_transcript_suffix(&ax, &local_texts);
+        assert_eq!(matched.matched_count, 3);
+        assert!(matched.is_strong());
+    }
+
+    #[test]
+    fn blank_ax_textarea_falls_through_to_photo_or_file_token() {
+        assert_eq!(
+            classify_ax_message_row(Some("사진 3장"), false, true).as_deref(),
+            Some("사진 3장")
+        );
+        assert_eq!(
+            classify_ax_message_row(Some("   "), false, true).as_deref(),
+            Some("[사진]")
+        );
+        assert_eq!(
+            classify_ax_message_row(Some(""), true, true).as_deref(),
+            Some("[파일]")
+        );
+        assert_eq!(
+            classify_ax_message_row(None, false, true).as_deref(),
+            Some("[사진]")
+        );
+        assert_eq!(classify_ax_message_row(None, false, false), None);
+    }
+
+    #[test]
+    fn file_rows_bind_to_file_token_not_filename() {
+        let file = local_message(
+            18,
+            "refuge-floor-om-play.mp4",
+            r#"{"k":"safe/f.mp4","name":"refuge-floor-om-play.mp4","size":1}"#.to_string(),
+        );
+        assert_eq!(normalize_local_binding_message(&file).unwrap(), "[파일]");
+        let older = local_message(
+            16,
+            "playground-cistern-om-play.mp4",
+            r#"{"k":"safe/g.mp4","name":"playground-cistern-om-play.mp4","size":1}"#.to_string(),
+        );
+        assert_eq!(normalize_local_binding_message(&older).unwrap(), "[파일]");
+    }
+
+    #[test]
+    fn url_scrap_card_binds_title_so_file_tail_can_attest() {
+        let attachment = serde_json::json!({
+            "universalScrapData": {
+                "universal": {
+                    "C": {
+                        "TI": {"txt": "사업자등록증 발급, 1시간으로 끝내기"},
+                        "TD": {"txt": "미니앱 출시를 위한 사업자등록증 발급, 한 시간으로 끝낼 수 있어요..."},
+                        "LU": {"txt": "toss.im"}
+                    }
+                }
+            }
+        })
+        .to_string();
+        let card = local_message(
+            1,
+            "https://toss.im/apps-in-toss/blog/business_registration",
+            attachment.clone(),
+        );
+        let title = "사업자등록증 발급, 1시간으로 끝내기";
+        assert_eq!(normalize_local_binding_message(&card).unwrap(), title);
+        let mut th_attachment: serde_json::Value = serde_json::from_str(&attachment).unwrap();
+        th_attachment["universalScrapData"]["universal"]["C"]["TH"] =
+            serde_json::json!({"src": "https://example.invalid/thumb.png"});
+        let th_card = local_message(
+            1,
+            "https://toss.im/apps-in-toss/blog/business_registration",
+            th_attachment.to_string(),
+        );
+        assert_eq!(normalize_local_binding_message(&th_card).unwrap(), title);
+        assert_eq!(local_binding_token(&th_card).unwrap().text, title);
+
+        let plain = local_message(1, "https://example.com/plain", String::new());
+        assert_eq!(
+            normalize_local_binding_message(&plain).unwrap(),
+            "https://example.com/plain"
+        );
+
+        let mut link = card;
+        link.log_id = 1;
+        let mut first_file = local_message(
+            18,
+            "playground-cistern-om-play.mp4",
+            r#"{"k":"safe/a.mp4","name":"playground-cistern-om-play.mp4","size":1}"#.to_string(),
+        );
+        first_file.log_id = 2;
+        let mut second_file = local_message(
+            18,
+            "refuge-floor-om-play.mp4",
+            r#"{"k":"safe/b.mp4","name":"refuge-floor-om-play.mp4","size":1}"#.to_string(),
+        );
+        second_file.log_id = 3;
+        let title_texts = normalize_local_binding_suffix(&[
+            link.clone(),
+            first_file.clone(),
+            second_file.clone(),
+        ])
+        .into_iter()
+        .map(|(_, token)| token.text.clone())
+        .collect::<Vec<_>>();
+        assert_eq!(
+            title_texts,
+            vec![
+                title.to_string(),
+                "[파일]".to_string(),
+                "[파일]".to_string()
+            ]
+        );
+        let title_ax = [
+            title.to_string(),
+            "[파일]".to_string(),
+            "[파일]".to_string(),
+        ];
+        let title_matched = match_transcript_suffix(&title_ax, &title_texts);
+        assert_eq!(title_matched.matched_count, 3);
+        assert_eq!(title_matched.matched_distinct, 2);
+        assert!(title_matched.is_strong());
+
+        let mut th_link = th_card;
+        th_link.log_id = 1;
+        let thumb_texts = normalize_local_binding_suffix(&[
+            th_link.clone(),
+            first_file.clone(),
+            second_file.clone(),
+        ])
+        .into_iter()
+        .map(|(_, token)| token.text.clone())
+        .collect::<Vec<_>>();
+        assert_eq!(
+            thumb_texts,
+            vec![
+                title.to_string(),
+                "[파일]".to_string(),
+                "[파일]".to_string()
+            ]
+        );
+        let thumb_pairs = normalize_local_binding_suffix(&[
+            th_link.clone(),
+            first_file.clone(),
+            second_file.clone(),
+        ]);
+        let thumb_ax = [
+            "[사진]".to_string(),
+            "[파일]".to_string(),
+            "[파일]".to_string(),
+        ];
+        let thumb_matched = match_local_binding_suffix(&thumb_ax, &thumb_pairs);
+        assert_eq!(thumb_matched.matched_count, 3);
+        assert_eq!(thumb_matched.matched_distinct, 2);
+        assert!(thumb_matched.matched_utf8_bytes >= 24);
+        assert!(thumb_matched.is_strong());
+
+        let mut album = local_message(27, "사진 3장", multi_photo_attachment(3));
+        album.log_id = 4;
+        let album_texts = normalize_local_binding_suffix(&[
+            th_link.clone(),
+            first_file.clone(),
+            second_file.clone(),
+            album.clone(),
+        ])
+        .into_iter()
+        .map(|(_, token)| token.text.clone())
+        .collect::<Vec<_>>();
+        assert_eq!(
+            album_texts,
+            vec![
+                title.to_string(),
+                "[파일]".to_string(),
+                "[파일]".to_string(),
+                "사진 3장".to_string(),
+            ]
+        );
+        let album_pairs = normalize_local_binding_suffix(&[
+            th_link.clone(),
+            first_file.clone(),
+            second_file.clone(),
+            album.clone(),
+        ]);
+        let album_ax = [
+            "[사진]".to_string(),
+            "[파일]".to_string(),
+            "[파일]".to_string(),
+            "사진 3장".to_string(),
+        ];
+        let album_matched = match_local_binding_suffix(&album_ax, &album_pairs);
+        assert_eq!(album_matched.matched_count, 4);
+        assert_eq!(album_matched.matched_distinct, 3);
+        assert!(album_matched.is_strong());
+        let placeholder_ax = [
+            "[사진]".to_string(),
+            "[파일]".to_string(),
+            "[파일]".to_string(),
+            "[사진]".to_string(),
+        ];
+        let placeholder_matched = match_local_binding_suffix(&placeholder_ax, &album_pairs);
+        assert_eq!(placeholder_matched.matched_count, 4);
+        assert!(placeholder_matched.is_strong());
+        let lagged_ax = [
+            "[사진]".to_string(),
+            "[파일]".to_string(),
+            "[파일]".to_string(),
+        ];
+        let lagged = match_local_binding_suffix(&lagged_ax, &album_pairs);
+        assert_eq!(lagged.matched_count, 3);
+        assert_eq!(lagged.matched_distinct, 2);
+        assert!(lagged.is_strong());
+    }
+
+    #[test]
+    fn live_youtube_url_and_album_share_row_attest_file_tail() {
+        let youtube_url = "https://youtu.be/y0zdsndybuM?si=C_BBt8wepFNrjAXb";
+        let title = "애플TV가 필요한 이유 = 아무리 비싼 TV도 결국 느려집니다";
+        let attachment = serde_json::json!({
+            "universalScrapData": {
+                "universal": {
+                    "C": {
+                        "TI": {"txt": title},
+                        "TH": {"src": "https://example.invalid/yt.png"},
+                        "LU": {"txt": "youtu.be"}
+                    }
+                }
+            }
+        })
+        .to_string();
+        let mut card = local_message(1, youtube_url, attachment);
+        card.log_id = 4;
+        assert_eq!(normalize_local_binding_message(&card).unwrap(), title);
+        let card_token = local_binding_token(&card).unwrap();
+        assert_eq!(card_token.text, title);
+        assert!(card_token
+            .candidates()
+            .any(|value| value == "https://youtu.be/y0zdsndybuM"));
+        assert_eq!(
+            url_binding_key(youtube_url).as_deref(),
+            Some("https://youtu.be/y0zdsndybuM")
+        );
+        assert!(transcript_url_tokens_match(
+            youtube_url,
+            "https://youtu.be/y0zdsndybuM"
+        ));
+
+        let mut first_file = local_message(
+            18,
+            "playground-cistern-om-play.mp4",
+            r#"{"k":"safe/a.mp4","name":"playground-cistern-om-play.mp4","size":1}"#.to_string(),
+        );
+        first_file.log_id = 1;
+        let mut second_file = local_message(
+            18,
+            "refuge-floor-om-play.mp4",
+            r#"{"k":"safe/b.mp4","name":"refuge-floor-om-play.mp4","size":1}"#.to_string(),
+        );
+        second_file.log_id = 2;
+        let mut album = local_message(27, "사진 3장", multi_photo_attachment(3));
+        album.log_id = 3;
+        let album_token = local_binding_token(&album).unwrap();
+        assert_eq!(album_token.text, "사진 3장");
+        assert!(album_token.candidates().any(|value| value == "[파일]"));
+        assert!(album_token.candidates().any(|value| value == "[사진]"));
+
+        let pairs = normalize_local_binding_suffix(&[first_file, second_file, album, card]);
+        let local_texts = pairs
+            .iter()
+            .map(|(_, token)| token.text.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            local_texts,
+            vec![
+                "[파일]".to_string(),
+                "[파일]".to_string(),
+                "사진 3장".to_string(),
+                title.to_string(),
+            ]
+        );
+        assert_eq!(
+            binding_kind_tail(&local_texts, 4),
+            "file>file>photo_caption>text"
+        );
+
+        let ax = [
+            "[파일]".to_string(),
+            "[파일]".to_string(),
+            "[파일]".to_string(),
+            youtube_url.to_string(),
+        ];
+        assert_eq!(binding_kind_tail(&ax, 4), "file>file>file>url");
+        let matched = match_local_binding_suffix(&ax, &pairs);
+        assert_eq!(matched.matched_count, 4);
+        assert_eq!(matched.matched_distinct, 3);
+        assert!(matched.matched_utf8_bytes >= 24);
+        assert!(matched.is_strong());
+    }
+
+    #[test]
+    fn bound_send_plain_tail_keeps_url_and_media_aliases() {
+        let attachment = serde_json::json!({
+            "universalScrapData": {
+                "universal": {
+                    "C": {
+                        "TI": {"txt": "Hugging Face – The AI community building the future."},
+                        "TH": {"src": "https://example.invalid/thumb.png"}
+                    }
+                }
+            }
+        })
+        .to_string();
+        let mut link = local_message(
+            1,
+            "https://huggingface.co/spaces/immich-app/immich",
+            attachment,
+        );
+        let mut first = local_message(1, "raid로 작은서버 만들어서 굿ㅓㅇ하는건가", String::new());
+        let mut second = local_message(1, "보통 나스나 미니pc에 도커 올려서 써요", String::new());
+        link.log_id = 1;
+        first.log_id = 2;
+        second.log_id = 3;
+        let pairs = normalize_local_binding_suffix(&[link, first, second]);
+        let discarded: Vec<String> = pairs
+            .iter()
+            .map(|(_, token)| token.text.clone())
+            .collect();
+        let ax = [
+            "https://huggingface.co/spaces/immich-app/immich".to_string(),
+            "raid로 작은서버 만들어서 굿ㅓㅇ하는건가".to_string(),
+            "보통 나스나 미니pc에 도커 올려서 써요".to_string(),
+        ];
+        assert_eq!(match_transcript_suffix(&ax, &discarded).matched_count, 2);
+        let tokens: Vec<BindingToken> = pairs.into_iter().map(|(_, token)| token).collect();
+        let restored = match_local_binding_suffix(
+            &ax,
+            &tokens
+                .iter()
+                .cloned()
+                .map(|token| (0_i64, token))
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(restored.matched_count, 3);
+        assert!(restored.is_strong());
+    }
+
+    #[test]
+    fn mention_display_name_attests_local_short_mention() {
+        let ax = [
+            "raid로 작은서버 만들어서 굿ㅓㅇ하는건가".to_string(),
+            "사진 2장".to_string(),
+            "코덱스 내일 오전 6시 리셋 예정? @문승현".to_string(),
+        ];
+        let local = [
+            "raid로 작은서버 만들어서 굿ㅓㅇ하는건가".to_string(),
+            "사진 2장".to_string(),
+            "코덱스 내일 오전 6시 리셋 예정? @승현".to_string(),
+        ];
+        assert!(mention_tokens_compatible(&ax[2], &local[2]));
+        let matched = match_transcript_suffix(&ax, &local);
+        assert_eq!(matched.matched_count, 3);
+        assert!(matched.is_strong());
+        assert!(!mention_tokens_compatible(
+            "코덱스 내일 오전 6시 리셋 예정? @문승현",
+            "코덱스 내일 오전 6시 리셋 예정? @주원"
+        ));
+    }
+
+    #[test]
+    fn single_photo_row_attests_ax_share_button_file_token() {
+        let mut older = local_message(1, "첫번째", String::new());
+        older.log_id = 1;
+        let mut mid = local_message(1, "두번째 문장입니다", String::new());
+        mid.log_id = 2;
+        let mut photo = local_message(
+            2,
+            "",
+            r#"{"k":"safe/photo.jpg","s":1,"w":1,"h":1,"mt":"jpg"}"#.to_string(),
+        );
+        photo.log_id = 3;
+        let pairs = normalize_local_binding_suffix(&[older, mid, photo]);
+        let token = &pairs.last().unwrap().1;
+        assert_eq!(token.text, "[사진]");
+        assert!(token.candidates().any(|value| value == "[파일]"));
+        let ax = [
+            "첫번째".to_string(),
+            "두번째 문장입니다".to_string(),
+            "[파일]".to_string(),
+        ];
+        assert_eq!(binding_kind_tail(&ax, 3), "text>text>file");
+        let matched = match_local_binding_suffix(&ax, &pairs);
+        assert_eq!(matched.matched_count, 3);
+        assert!(matched.is_strong());
+    }
+
+    #[test]
+    fn trailing_ax_photo_is_dropped_when_older_text_suffix_is_strong() {
+        let mut first = local_message(1, "첫번째 문장입니다", String::new());
+        first.log_id = 1;
+        let mut second = local_message(1, "두번째 문장입니다", String::new());
+        second.log_id = 2;
+        let mut third = local_message(1, "세번째 문장입니다", String::new());
+        third.log_id = 3;
+        let pairs = normalize_local_binding_suffix(&[first, second, third]);
+        let ax = [
+            "첫번째 문장입니다".to_string(),
+            "두번째 문장입니다".to_string(),
+            "세번째 문장입니다".to_string(),
+            "[사진]".to_string(),
+        ];
+        assert_eq!(binding_kind_tail(&ax, 4), "text>text>text>photo");
+        let matched = match_local_binding_suffix(&ax, &pairs);
+        assert_eq!(matched.matched_count, 3);
+        assert!(matched.is_strong());
+    }
+
+    #[test]
+    fn local_binding_normalizes_quoted_reply_to_source_text() {
+        let quoted = local_message(
+            26,
+            "이겅",
+            r#"{"src_linkId":0,"src_userId":157447926,"src_logId":3909820900282900481,"src_type":1,"src_message":"연우일까 ai일까"}"#.to_string(),
+        );
+        assert_eq!(
+            normalize_local_binding_message(&quoted).unwrap(),
+            "연우일까 ai일까"
+        );
+        let older = ["??".to_string(), "연우일까 ai일까".to_string()];
+        let ax = ["??".to_string(), "연우일까 ai일까".to_string()];
+        let matched = match_transcript_suffix(&ax, &older);
+        assert_eq!(matched.matched_count, 2);
+        assert!(matched.is_strong());
+        assert!(
+            normalize_local_binding_message(&local_message(26, "이겅", String::new())).is_err()
+        );
+        let commented = local_message(
+            26,
+            "이거 학습된거 같은데",
+            r#"{"src_linkId":0,"src_userId":1,"src_logId":2,"src_type":1,"src_message":"나임ㅇㅇ"}"#.to_string(),
+        );
+        assert_eq!(
+            normalize_local_binding_message(&commented).unwrap(),
+            "이거 학습된거 같은데"
+        );
+        let short_comment = local_message(
+            26,
+            "엥",
+            r#"{"src_linkId":0,"src_userId":1,"src_logId":2,"src_type":1,"src_message":"https://www.youtube.com/watch?v=4qMvcO-eMdw"}"#.to_string(),
+        );
+        assert_eq!(
+            normalize_local_binding_message(&short_comment).unwrap(),
+            "엥"
+        );
+    }
+
+    #[test]
     fn composer_guard_never_mutates_nonempty_composer() {
         let (result, probe) = run_composer_probe([Some("human draft")], true);
         assert!(result.is_err());
@@ -997,12 +2112,12 @@ mod match_tests {
                 Some("reply"),
                 Some("reply"),
                 Some("reply"),
-                Some("reply"),
+                Some(""),
             ],
             true,
         );
         assert!(result.is_ok());
-        assert_eq!(probe.focuses, 1);
+        assert_eq!(probe.focuses, 2);
         assert_eq!(probe.set_attempts, 1);
         assert_eq!(probe.mutation_begins, 1);
         assert_eq!(probe.typed, 0);
@@ -1022,10 +2137,11 @@ mod match_tests {
 
     #[test]
     fn composer_guard_treats_unreadable_value_as_empty_after_focus() {
-        let (result, probe) = run_composer_probe(
-            [None, Some(""), None, Some("reply"), Some("reply")],
-            true,
-        );
+        let (result, probe) =
+            run_composer_probe(
+                [None, Some(""), None, Some("reply"), Some("reply"), Some("")],
+                true,
+            );
         assert!(result.is_ok());
         assert_eq!(probe.focuses, 2);
         assert_eq!(probe.set_attempts, 1);
@@ -1071,19 +2187,134 @@ mod match_tests {
     }
 
     #[test]
-    fn composer_guard_presses_return_once_without_retry() {
-        let (result, probe) =
-            run_composer_probe([Some(""), Some(""), Some("reply"), Some("reply")], true);
+    fn composer_guard_presses_return_once_and_verifies_delivery() {
+        let (result, probe) = run_composer_probe(
+            [Some(""), Some(""), Some("reply"), Some("reply"), Some("")],
+            true,
+        );
         assert!(result.is_ok());
         assert_eq!(probe.set_attempts, 1);
         assert_eq!(probe.mutation_begins, 1);
         assert_eq!(probe.returns, 1);
+        assert_eq!(probe.escalates, 0);
+    }
+
+    #[test]
+    fn composer_guard_escalates_once_when_first_submit_leaves_text_staged() {
+        // The 전송 press is a silent no-op: every read keeps returning the
+        // exact outbound text until the escalated Return, which also fails.
+        let (result, probe) = run_composer_probe(
+            [
+                Some(""),
+                Some(""),
+                Some("reply"),
+                Some("reply"),
+                Some("reply"),
+                Some("reply"),
+                Some("reply"),
+            ],
+            true,
+        );
+        let error = result.expect_err("a stuck composer must fail after one escalation");
+        assert!(error.to_string().contains("stayed in the composer"));
+        assert_eq!(probe.returns, 1);
+        assert_eq!(probe.escalates, 1);
+        assert_eq!(probe.set_attempts, 2);
+        assert_eq!(probe.mutation_begins, 2);
+    }
+
+    #[test]
+    fn composer_guard_aborts_escalation_when_composer_changes() {
+        // The first submit leaves the text staged, but before the escalated
+        // reapply lands a concurrent edit replaces it — refuse to touch it.
+        let (result, probe) = run_composer_probe(
+            [
+                Some(""),
+                Some(""),
+                Some("reply"),
+                Some("reply"),
+                Some("reply"),
+                Some(""),
+                Some(""),
+            ],
+            true,
+        );
+        let error = result.expect_err("a changed composer must abort the escalation");
+        assert!(error
+            .to_string()
+            .contains("changed before the escalated Return"));
+        assert_eq!(probe.returns, 1);
+        assert_eq!(probe.escalates, 0);
+        assert_eq!(probe.set_attempts, 2);
+    }
+
+    #[test]
+    fn kakao_send_button_labels_match_korean_and_english() {
+        assert!(is_kakao_send_button_label("전송"));
+        assert!(is_kakao_send_button_label(" Send "));
+        assert!(!is_kakao_send_button_label("공유"));
+        assert!(!is_kakao_send_button_label("답장"));
+        assert!(!is_kakao_send_button_label(""));
+    }
+
+    #[test]
+    fn submit_prefers_send_button_and_does_not_press_return() {
+        use std::cell::Cell;
+        let sends = Cell::new(0);
+        let returns = Cell::new(0);
+        submit_composer_once(
+            || {
+                sends.set(sends.get() + 1);
+                Some(Ok(()))
+            },
+            || {
+                returns.set(returns.get() + 1);
+                Ok(())
+            },
+        )
+        .expect("전송 should submit");
+        assert_eq!(sends.get(), 1);
+        assert_eq!(returns.get(), 0);
+    }
+
+    #[test]
+    fn submit_falls_back_to_return_only_when_send_button_is_missing() {
+        use std::cell::Cell;
+        let returns = Cell::new(0);
+        submit_composer_once(
+            || None,
+            || {
+                returns.set(returns.get() + 1);
+                Ok(())
+            },
+        )
+        .expect("Return remains the missing-button fallback");
+        assert_eq!(returns.get(), 1);
+    }
+
+    #[test]
+    fn submit_does_not_press_return_after_a_failed_send_button() {
+        use std::cell::Cell;
+        let returns = Cell::new(0);
+        let error = submit_composer_once(
+            || Some(Err(anyhow::anyhow!("전송 press failed"))),
+            || {
+                returns.set(returns.get() + 1);
+                Ok(())
+            },
+        )
+        .expect_err("a found 전송 button must not also press Return");
+        assert!(error.to_string().contains("전송 press failed"));
+        assert_eq!(returns.get(), 0);
     }
 
     #[test]
     fn composer_guard_allows_one_verified_direct_or_keyboard_send() {
         let (direct_result, direct_probe) =
-            run_composer_probe([Some(""), Some(""), Some("reply"), Some("reply")], true);
+            run_composer_probe(
+                [Some(""), Some(""), Some("reply"), Some("reply"), Some("")],
+                true,
+            );
         assert!(direct_result.is_ok());
         assert_eq!(direct_probe.set_attempts, 1);
         assert_eq!(direct_probe.typed, 0);
@@ -1097,6 +2328,7 @@ mod match_tests {
                 Some(""),
                 Some("reply"),
                 Some("reply"),
+                Some(""),
             ],
             false,
         );
@@ -1181,7 +2413,7 @@ mod imp {
 
     const KAKAOTALK_BUNDLE_ID: &str = "com.kakao.KakaoTalkMac";
     const RETURN_KEYCODE: u16 = 36;
-    const CONTEXT_MENU_TIMEOUT: Duration = Duration::from_secs(2);
+    const CONTEXT_MENU_TIMEOUT: Duration = Duration::from_secs(6);
     const CONTEXT_MENU_TITLES_REPLY: &[&str] = &["답장"];
     const CONTEXT_MENU_TITLES_DELETE_EVERYONE: &[&str] = &["모두에게서 삭제"];
     const OPEN_CHAT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1403,9 +2635,11 @@ mod imp {
             == Some(true);
         if is_minimized {
             return Err(anyhow!(
-                "KakaoTalk's main chat-list window is minimized. Restoring it automatically risks \
-                 stealing your foreground focus, which this tool never does — please un-minimize \
-                 it yourself (click its Dock icon) and retry."
+                "KakaoTalk's main chat-list window reports AXMinimized. This is not the same as \
+                 an already-open named chat window on another Space. Restoring the list window \
+                 automatically risks stealing focus, which this tool never does. If the target \
+                 chat is already open, retry against that window; otherwise un-minimize the list \
+                 or assign KakaoTalk to All Desktops."
             ));
         }
 
@@ -1438,6 +2672,7 @@ mod imp {
         element: AXUIElement,
         role: String,
         value: Option<String>,
+        #[allow(dead_code)]
         help: Option<String>,
         description: Option<String>,
         children: Vec<AxNode>,
@@ -1598,6 +2833,42 @@ mod imp {
         post_key_to_pid(pid, RETURN_KEYCODE, false)?;
         Ok(())
     }
+
+    fn send_button_in(window: &AXUIElement) -> Option<AXUIElement> {
+        let deadline = Instant::now() + Duration::from_millis(800);
+        let buttons = live_walk(window, deadline, "AXButton", true, false)?;
+        buttons.into_iter().find(|button| {
+            ["AXTitle", "AXDescription", "AXIdentifier", "AXHelp"]
+                .into_iter()
+                .any(|name| {
+                    attr_as_string(button, name)
+                        .as_deref()
+                        .is_some_and(super::is_kakao_send_button_label)
+                })
+        })
+    }
+
+    fn press_send_button(button: &AXUIElement) -> Result<()> {
+        if button
+            .perform_action(&CFString::new(kAXPressAction))
+            .is_ok()
+        {
+            return Ok(());
+        }
+        let point = ax_frame_center(button)?;
+        left_click_point(point)
+    }
+
+    fn submit_composer(pid: i32, window: Option<&AXUIElement>) -> Result<()> {
+        super::submit_composer_once(
+            || {
+                window
+                    .and_then(send_button_in)
+                    .map(|button| press_send_button(&button))
+            },
+            || press_return(pid),
+        )
+    }
     fn focus_composer(field: &AXUIElement) -> Result<()> {
         let focused_attr: AXAttribute<CFType> = AXAttribute::new(&CFString::new("AXFocused"));
         field
@@ -1664,7 +2935,7 @@ mod imp {
     }
     const CHAT_ROW_LOOKUP_TIMEOUT: Duration = Duration::from_secs(8);
     const CHAT_ROW_LOOKUP_NODE_LIMIT: usize = 4096;
-    const CHAT_ROW_LOOKUP_MESSAGING_TIMEOUT_SECS: f32 = 0.5;
+    const CHAT_ROW_LOOKUP_MESSAGING_TIMEOUT_SECS: f32 = 0.15;
 
     fn live_walk(
         root: &AXUIElement,
@@ -1833,34 +3104,60 @@ mod imp {
     /// message composer: an `AXScrollArea` that wraps an `AXTextArea` but no
     /// `AXTable` (which would make it the message list instead).
     fn find_input_field_in(root: &AXUIElement) -> Option<AXUIElement> {
-        let snap = snapshot(root);
-        let mut scroll_areas = Vec::new();
-        snap.find_all("AXScrollArea", &mut scroll_areas);
-        let mut candidates = Vec::new();
-        for area in scroll_areas {
-            if area.find_first("AXTable").is_some() {
+        // Bounded live walks instead of a whole-window snapshot: KakaoTalk
+        // virtualizes long transcripts, so a full-window recursive snapshot
+        // stalls for tens of seconds. The composer is an AXTextArea inside a
+        // scroll area without an AXTable (the transcript scroll area owns the
+        // table), which also excludes transcript bubble text areas.
+        let areas = live_walk(
+            root,
+            Instant::now() + Duration::from_millis(900),
+            "AXScrollArea",
+            true,
+            false,
+        )?;
+        let mut composer = None;
+        for area in areas {
+            let has_table = live_walk(
+                &area,
+                Instant::now() + Duration::from_millis(300),
+                "AXTable",
+                true,
+                true,
+            )
+            .is_some_and(|tables| !tables.is_empty());
+            if has_table {
                 continue;
             }
-            let mut fields = Vec::new();
-            area.find_all("AXTextArea", &mut fields);
+            let Some(fields) = live_walk(
+                &area,
+                Instant::now() + Duration::from_millis(300),
+                "AXTextArea",
+                true,
+                false,
+            ) else {
+                continue;
+            };
             for field in fields {
-                let label = field
-                    .help
-                    .as_deref()
-                    .or(field.description.as_deref())
-                    .unwrap_or("");
+                let label = attr_as_string(&field, "AXDescription")
+                    .or_else(|| attr_as_string(&field, "AXHelp"))
+                    .unwrap_or_default();
                 if label.contains("검색") || label.contains("Search") {
                     continue;
                 }
-                candidates.push(field.element.clone());
+                if label.contains("메시지 입력") {
+                    return Some(field);
+                }
+                composer = Some(field);
             }
         }
-        candidates.pop()
+        composer
     }
 
     /// Find the composer field in the exact chat window named by
     /// `chat_display_name`. Refuse a whole-app fallback because it could
     /// select a different chat's composer.
+    #[allow(dead_code)]
     fn find_input_field(app: &AXUIElement, chat_display_name: &str) -> Result<AXUIElement> {
         let window = find_chat_window(app, chat_display_name)?.ok_or_else(|| {
             anyhow!("could not find the exact chat window for '{chat_display_name}'")
@@ -1887,65 +3184,56 @@ mod imp {
     /// of these (date separators, system notices) are skipped, same as
     /// before.
     fn read_visible_messages(window: &AXUIElement) -> Vec<AxMessage> {
-        let snap = snapshot(window);
-        let Some(table) = snap.find_first("AXTable") else {
-            return Vec::new();
-        };
-        let mut rows = Vec::new();
-        table.find_all("AXRow", &mut rows);
-
-        rows.iter()
-            .filter_map(|row| {
-                let text = message_row_text(row)?;
-
-                let time = row
-                    .find_first("AXStaticText")
-                    .and_then(|t| t.help.clone().or_else(|| t.value.clone()));
-
-                Some(AxMessage { time, text })
-            })
-            .collect()
+        // Never snapshot the whole chat window. KakaoTalk virtualizes a long
+        // transcript; AXUIElementCopyMultipleAttributeValues on the window
+        // stalls local-send/--preflight for tens of seconds.
+        match visible_message_rows(window) {
+            Ok(rows) => rows
+                .into_iter()
+                .map(|(text, _)| AxMessage { time: None, text })
+                .collect(),
+            Err(_) => Vec::new(),
+        }
     }
 
     /// Classify one message row into displayable text: the row's own
     /// `AXTextArea` value if present, else a placeholder if the row looks
     /// like an image or file share, else `None` (not a real message row).
     fn message_row_text(row: &AxNode) -> Option<String> {
-        if let Some(text_area) = row.find_first("AXTextArea") {
-            if let Some(text) = &text_area.value {
-                return Some(text.clone());
-            }
-        }
-
-        if row.find_first("AXImage").is_some() {
-            return Some("[사진]".to_string());
-        }
-
+        let text_area = row
+            .find_first("AXTextArea")
+            .and_then(|node| node.value.as_deref());
         let mut buttons = Vec::new();
         row.find_all("AXButton", &mut buttons);
-        if buttons
+        let has_share = buttons
             .iter()
-            .any(|b| b.description.as_deref() == Some("공유"))
-        {
-            return Some("[파일]".to_string());
-        }
-
-        None
+            .any(|button| button.description.as_deref() == Some("공유"));
+        super::classify_ax_message_row(text_area, has_share, row.find_first("AXImage").is_some())
     }
     fn visible_message_rows(window: &AXUIElement) -> Result<Vec<(String, AXUIElement)>> {
-        let snap = snapshot(window);
-        let table = snap
-            .find_first("AXTable")
-            .ok_or_else(|| anyhow!("could not find the message list in the chat window"))?;
-        let mut rows = Vec::new();
-        table.find_all("AXRow", &mut rows);
-        Ok(rows
+        let deadline = Instant::now() + Duration::from_millis(800);
+        let table = live_walk(window, deadline, "AXTable", true, true)
+            .ok_or_else(|| anyhow!("could not inspect the chat window AX tree"))?
             .into_iter()
-            .filter_map(|row| {
-                let text = message_row_text(row)?;
-                Some((text, row.element.clone()))
-            })
-            .collect())
+            .next()
+            .ok_or_else(|| anyhow!("could not find the message list in the chat window"))?;
+        let rows = live_walk(
+            &table,
+            Instant::now() + Duration::from_millis(800),
+            "AXRow",
+            true,
+            false,
+        )
+        .ok_or_else(|| anyhow!("could not inspect chat rows"))?;
+        let mut found = Vec::new();
+        for row in rows.into_iter().rev().take(12) {
+            let snap = snapshot(&row);
+            if let Some(text) = message_row_text(&snap) {
+                found.push((text, row));
+            }
+        }
+        found.reverse();
+        Ok(found)
     }
 
     fn find_visible_message_row(
@@ -1964,12 +3252,11 @@ mod imp {
         match matches.len() {
             0 => anyhow::bail!("no visible message matching {needle:?}"),
             1 => Ok(matches.pop().expect("one match")),
-            count => anyhow::bail!(
-                "message selector {needle:?} is ambiguous ({count} visible rows)"
-            ),
+            count => {
+                anyhow::bail!("message selector {needle:?} is ambiguous ({count} visible rows)")
+            }
         }
     }
-
 
     fn attr_as_pair(element: &AXUIElement, name: &str, value_type: u32) -> Option<(f64, f64)> {
         let attr: AXAttribute<CFType> = AXAttribute::new(&CFString::new(name));
@@ -2024,6 +3311,24 @@ mod imp {
         }
         let point = ax_frame_center(row)?;
         right_click_point(point)
+    }
+
+    fn left_click_point(point: CGPoint) -> Result<()> {
+        let source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
+            .map_err(|_| anyhow!("failed to create CGEventSource"))?;
+        let down = CGEvent::new_mouse_event(
+            source.clone(),
+            CGEventType::LeftMouseDown,
+            point,
+            CGMouseButton::Left,
+        )
+        .map_err(|_| anyhow!("failed to create left-mouse-down event"))?;
+        let up =
+            CGEvent::new_mouse_event(source, CGEventType::LeftMouseUp, point, CGMouseButton::Left)
+                .map_err(|_| anyhow!("failed to create left-mouse-up event"))?;
+        down.post(core_graphics::event::CGEventTapLocation::HID);
+        up.post(core_graphics::event::CGEventTapLocation::HID);
+        Ok(())
     }
 
     fn menu_item_title(item: &AXUIElement) -> Option<String> {
@@ -2107,38 +3412,22 @@ mod imp {
     }
 
     fn quoted_reply_armed(window: &AXUIElement, source: &str) -> bool {
-        let snap = snapshot(window);
-        if std::env::var("OPENKAKAO_CLI_DEBUG").is_ok() {
-            fn dump_node(node: &AxNode, depth: usize) {
-                let v = node.value.as_deref().unwrap_or("");
-                let h = node.help.as_deref().unwrap_or("");
-                let d = node.description.as_deref().unwrap_or("");
-                if !v.is_empty() || !h.is_empty() || !d.is_empty() {
-                    eprintln!("DEBUG_AX_NODE [{depth}] role={} val={v:?} help={h:?} desc={d:?}", node.role);
-                }
-                for c in &node.children {
-                    dump_node(c, depth + 1);
-                }
+        let short = Duration::from_millis(250);
+        if let Some(buttons) = live_walk(window, Instant::now() + short, "AXButton", true, false) {
+            if buttons.iter().any(|button| {
+                attr_as_string(button, "AXDescription").as_deref() == Some("답장 취소")
+                    || attr_as_string(button, "AXHelp").as_deref() == Some("답장 취소")
+                    || attr_as_string(button, "AXValue").as_deref() == Some("답장 취소")
+            }) {
+                return true;
             }
-            eprintln!("--- DUMP QUOTED REPLY SNAPSHOT ---");
-            dump_node(&snap, 0);
         }
-        let mut buttons = Vec::new();
-        snap.find_all("AXButton", &mut buttons);
-        let has_button = buttons.iter().any(|node| {
-            node.description.as_deref() == Some("답장 취소")
-                || node.help.as_deref() == Some("답장 취소")
-                || node.value.as_deref() == Some("답장 취소")
-        });
-        if has_button {
-            return true;
-        }
-        let mut texts = Vec::new();
-        snap.find_all("AXStaticText", &mut texts);
-        snap.find_all("AXTextArea", &mut texts);
+        let Some(texts) = live_walk(window, Instant::now() + short, "AXStaticText", true, false)
+        else {
+            return false;
+        };
         texts.iter().any(|node| {
-            node.value
-                .as_deref()
+            attr_as_string(node, "AXValue")
                 .is_some_and(|value| value.contains(source) || value.contains("답장"))
         })
     }
@@ -2153,8 +3442,16 @@ mod imp {
         let (_, row) = match find_visible_message_row(&window, source) {
             Ok(found) => found,
             Err(_) => {
-                if let Some(table) = snapshot(&window).find_first("AXTable") {
-                    let _ = table.element.perform_action(&CFString::new("AXScrollUp"));
+                if let Some(table) = live_walk(
+                    &window,
+                    Instant::now() + CONTEXT_MENU_TIMEOUT,
+                    "AXTable",
+                    true,
+                    true,
+                )
+                .and_then(|tables| tables.into_iter().next())
+                {
+                    let _ = table.perform_action(&CFString::new("AXScrollUp"));
                     sleep(Duration::from_millis(300));
                 }
                 find_visible_message_row(&window, source)?
@@ -2168,10 +3465,22 @@ mod imp {
             }
             sleep(Duration::from_millis(50));
         }
-        if !quoted_reply_armed(&window, source) {
-            anyhow::bail!("KakaoTalk did not arm a quoted reply for {source:?}");
-        }
-        send_via_ax(chat_display_name, message)
+        // KakaoTalk sometimes arms the composer without a detectable
+        // "답장 취소" button. Prefer sending into the already-open field
+        // rather than hanging on a second full-window walk.
+        let field = find_input_field_in(&window).ok_or_else(|| {
+            anyhow!("could not find the message input field after arming a quoted reply")
+        })?;
+        let mutation_started = std::cell::Cell::new(false);
+        send_with_attested_field(
+            &app,
+            pid,
+            chat_display_name,
+            message,
+            field,
+            Some(&window),
+            &mutation_started,
+        )
     }
 
     pub fn delete_via_ax(chat_display_name: &str, source: &str) -> Result<()> {
@@ -2219,6 +3528,22 @@ mod imp {
         let pid = find_kakaotalk_pid()?;
         ensure_ax_permission()?;
         let app = AXUIElement::application(pid);
+
+        if let Some(window) = find_chat_window(&app, chat_display_name)? {
+            let mut messages = read_visible_messages(&window);
+            if !messages.is_empty() {
+                if messages.len() > count {
+                    messages = messages.split_off(messages.len() - count);
+                }
+                if debug {
+                    eprintln!(
+                        "[ax_send] read_via_ax: used already-open window {:?}",
+                        start.elapsed()
+                    );
+                }
+                return Ok(messages);
+            }
+        }
 
         open_chat_row(&app, chat_display_name)?;
         press_return(pid)?;
@@ -2304,6 +3629,7 @@ mod imp {
             || mutation_started.set(true),
             || field.set_value(CFString::new(message).as_CFType()).is_ok(),
             || type_text_to_pid(pid, message),
+            || submit_composer(pid, expected_window),
             || press_return(pid),
         )
     }
@@ -2317,7 +3643,7 @@ mod imp {
         chat_display_name: &str,
         chat_id: i64,
         message: &str,
-        local_tail: &[String],
+        local_tail: &[super::BindingToken],
     ) -> std::result::Result<(), super::BoundSendFailure> {
         let mutation_started = std::cell::Cell::new(false);
         let send = || -> Result<()> {
@@ -2335,12 +3661,13 @@ mod imp {
                 .map(|item| super::normalize_binding_message(&item.text))
                 .filter(|item| !item.is_empty())
                 .collect::<Vec<_>>();
-            let local_texts = local_tail
+            let local_pairs = local_tail
                 .iter()
-                .map(|item| super::normalize_binding_message(item))
-                .filter(|item| !item.is_empty())
+                .cloned()
+                .filter(|token| !token.text.is_empty())
+                .map(|token| (0_i64, token))
                 .collect::<Vec<_>>();
-            let matched = super::match_transcript_suffix(&ax_texts, &local_texts);
+            let matched = super::match_local_binding_suffix(&ax_texts, &local_pairs);
             if !matched.is_strong() {
                 anyhow::bail!(
                     "bound send transcript attestation failed for numeric chat ID {chat_id}: matched {} rows, {} distinct values, {} UTF-8 bytes",
@@ -2368,14 +3695,14 @@ mod imp {
         send().map_err(|error| super::BoundSendFailure::new(error, mutation_started.get()))
     }
 
-    /// Prove that a bound Bujamentor send could safely begin without focusing
+    /// Prove that a bound AutoReply send could safely begin without focusing
     /// or mutating KakaoTalk. This repeats the exact-title and strong local-tail
     /// binding used by `send_bound_via_ax`, requires a readable empty composer,
     /// and rechecks the same unique AX window instance afterward.
     pub fn preflight_bound_via_ax(
         chat_display_name: &str,
         chat_id: i64,
-        local_tail: &[String],
+        local_tail: &[super::BindingToken],
     ) -> Result<()> {
         let pid = find_kakaotalk_pid()?;
         ensure_ax_permission()?;
@@ -2391,12 +3718,13 @@ mod imp {
             .map(|item| super::normalize_binding_message(&item.text))
             .filter(|item| !item.is_empty())
             .collect::<Vec<_>>();
-        let local_texts = local_tail
+        let local_pairs = local_tail
             .iter()
-            .map(|item| super::normalize_binding_message(item))
-            .filter(|item| !item.is_empty())
+            .cloned()
+            .filter(|token| !token.text.is_empty())
+            .map(|token| (0_i64, token))
             .collect::<Vec<_>>();
-        let matched = super::match_transcript_suffix(&ax_texts, &local_texts);
+        let matched = super::match_local_binding_suffix(&ax_texts, &local_pairs);
         if !matched.is_strong() {
             anyhow::bail!(
                 "bound preflight transcript attestation failed for numeric chat ID {chat_id}: matched {} rows, {} distinct values, {} UTF-8 bytes",
@@ -2431,16 +3759,12 @@ mod imp {
         // Fast path for an already-open chat. Avoiding a full snapshot of the
         // main chat-list window cuts tens of seconds on large chat histories
         // and does not change the selected/folded state of that window.
-        let field = match find_chat_window(&app, chat_display_name)? {
-            Some(window) => find_input_field_in(&window).ok_or_else(|| {
-                anyhow!(
-                    "could not find the message input field in the already-open chat {chat_display_name:?}"
-                )
-            })?,
+        let window = match find_chat_window(&app, chat_display_name)? {
+            Some(window) => window,
             None => {
-                if std::env::var("OPENKAKAO_BUJAMENTOR_WORKER").as_deref() == Ok("1") {
+                if std::env::var("OPENKAKAO_AUTO_REPLY_WORKER").ok().or_else(|| std::env::var("OPENKAKAO_BUJAMENTOR_WORKER").ok()).as_deref() == Some("1") {
                     anyhow::bail!(
-                        "Bujamentor requires exactly one already-open KakaoTalk window titled {chat_display_name:?}"
+                        "AutoReply requires exactly one already-open KakaoTalk window titled {chat_display_name:?}"
                     );
                 }
                 open_chat_row(&app, chat_display_name)?;
@@ -2448,11 +3772,11 @@ mod imp {
 
                 let deadline = Instant::now() + OPEN_CHAT_TIMEOUT;
                 loop {
-                    match find_input_field(&app, chat_display_name) {
-                        Ok(field) => break field,
-                        Err(e) => {
+                    match find_chat_window(&app, chat_display_name)? {
+                        Some(window) => break window,
+                        None => {
                             if Instant::now() >= deadline {
-                                return Err(e.context("chat window did not open in time"));
+                                anyhow::bail!("chat window did not open in time");
                             }
                             sleep(Duration::from_millis(150));
                         }
@@ -2460,6 +3784,11 @@ mod imp {
                 }
             }
         };
+        let field = find_input_field_in(&window).ok_or_else(|| {
+            anyhow!(
+                "could not find the message input field in the already-open chat {chat_display_name:?}"
+            )
+        })?;
         let mutation_started = std::cell::Cell::new(false);
         send_with_attested_field(
             &app,
@@ -2467,7 +3796,7 @@ mod imp {
             chat_display_name,
             message,
             field,
-            None,
+            Some(&window),
             &mutation_started,
         )
     }
@@ -2667,11 +3996,7 @@ mod stub {
             "local-send (AX automation) is only supported on macOS"
         ))
     }
-    pub fn reply_via_ax(
-        _chat_display_name: &str,
-        _source: &str,
-        _message: &str,
-    ) -> Result<()> {
+    pub fn reply_via_ax(_chat_display_name: &str, _source: &str, _message: &str) -> Result<()> {
         Err(anyhow!("quoted AX reply is only supported on macOS"))
     }
 
@@ -2683,7 +4008,7 @@ mod stub {
         _chat_display_name: &str,
         _chat_id: i64,
         _message: &str,
-        _local_tail: &[String],
+        _local_tail: &[super::BindingToken],
     ) -> std::result::Result<(), super::BoundSendFailure> {
         Err(super::BoundSendFailure::new(
             anyhow!("bound local-send (AX automation) is only supported on macOS"),
@@ -2694,7 +4019,7 @@ mod stub {
     pub fn preflight_bound_via_ax(
         _chat_display_name: &str,
         _chat_id: i64,
-        _local_tail: &[String],
+        _local_tail: &[super::BindingToken],
     ) -> Result<()> {
         Err(anyhow!(
             "bound local-send preflight (AX automation) is only supported on macOS"
