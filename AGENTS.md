@@ -120,3 +120,41 @@ openkakao-cli send 123 "hello" --dry-run --json
 openkakao-cli doctor --json        # Check installation, credentials, local DB access
 openkakao-cli auth-status --json   # Check auth recovery state
 ```
+
+## Cursor Cloud specific instructions
+
+The Cloud Agent VM is **Linux**, but `openkakao-cli` is a **macOS product** (drives the
+KakaoTalk desktop app via the Accessibility API and reads its SQLCipher DB). On Linux the
+AX/KakaoTalk/local-DB code paths are compiled as `cfg(not(target_os = "macos"))` stubs that
+return errors at runtime, and `doctor` reports macOS-only components (`KakaoTalk.app`,
+`Cache.db`, local SQLCipher DB) as `fail`/`warn`. That is expected here. What you *can*
+exercise on Linux: argument parsing, the safety model, all `--dry-run --json` previews
+(`send`, `local-send`, `delete`, …), `doctor`, and `auth-status`.
+
+- **Toolchain**: pinned by `rust-toolchain.toml` (1.95.0, with `clippy`/`rustfmt`); `rustup`
+  auto-installs it on the first `cargo` call. No manual toolchain steps needed.
+- **Build dependency (baked into the base image)**: `rusqlite`'s `bundled-sqlcipher` feature
+  compiles SQLite against the system OpenSSL, so building requires the OpenSSL dev headers
+  (`libssl-dev`) and `pkg-config`. Without them the build fails with
+  `openssl/crypto.h file not found`. These are part of the base environment, not the update
+  script (which only runs `cargo fetch`).
+- **Gate commands** are in `CONTRIBUTING.md` / `.github/workflows/openkakao-cli-ci.yml`:
+  `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`, the Python
+  suite (`python3 -m unittest tests.test_bujamentor_*`), and
+  `sh scripts/test-bujamentor-launchd-artifacts.sh`.
+
+Non-obvious Linux-VM caveats when running the gates here (all are environment/target
+sensitivities, not defects to "fix" during routine work):
+
+- `cargo clippy -- -D warnings` and `cargo fmt --check` are authoritative on the **macOS** CI
+  job. On Linux, clippy reports `dead_code` for macOS-only helpers that are unused on this
+  target. Validate lint/format expectations against macOS, not the Linux VM.
+- Two process-group tests — `tests::auto_reply_children_guard_kills_descendants_after_group_leader_exits`
+  and `tests::guardian_eof_stops_auto_reply_root_and_descendant_group` — can race-fail in the
+  VM. After the guard sends `SIGKILL` to the process group, the group is fully reaped ~tens of
+  ms later, but the test asserts `kill(-pgid, 0) == -1` immediately, so slightly slower reaping
+  here trips the check. The rest of `cargo test` (300+) passes.
+- The Python `test_bujamentor_service_entry` interpreter-safety checks require the Python
+  binary to be owned by the current euid (`bujamentor-auto-reply-service.py` `_owned_file`).
+  On the VM `/usr/bin/python3` is root-owned while the agent runs as non-root `ubuntu`, so
+  those ownership-gated tests fail. The launchd artifact harness passes.
