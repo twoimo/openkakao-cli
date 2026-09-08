@@ -1,122 +1,98 @@
 # AI Agent Integration Guide
 
-openkakao-cli is designed for AI agent integration. All commands support `--json` for structured output.
+openkakao-cli supports human and agent workflows. Prefer `--json` when the
+selected command provides it.
 
-## Safety Model
+## Autonomy and stop line
 
-LOCO write operations (send, delete, edit, react) are **disabled by default** to prevent account bans.
-Documented product send is AX `local-send` (`allow_ax_send` + `allowed_send_chats`). `local-delete` is AX `모두에게서 삭제`, not LOCO. LOCO `send`/`delete`/`edit`/`react`/`mark-read` stay research-quarantined behind `allow_loco_write`. Supported realtime watch is `ax-watch`, not LOCO `watch`. Context/style search is 최연우-persona adjunct. GeekNews uses the official Atom feed, three KST slots, TOP5 numbered after a blank line with blank lines between items, and persists seen/slots only after a confirmed send. Session-monitor is the only unattended host; never hide the user's existing Terminal.
+Proceed without approval for local inspection, scoped edits, targeted tests,
+and dry-runs.
 
-### Safe commands (always available, no server contact)
+Stop before the first action that would:
 
-```bash
-# Read chats from local KakaoTalk database (SQLCipher, no network)
-openkakao-cli local-chats --json
-openkakao-cli local-read <chat_id> -n 30 --json
-openkakao-cli local-search "keyword" --json
-openkakao-cli local-schema
+- write to KakaoTalk (send, edit, delete, react, or mark read);
+- deploy or restart a live service unless the user requested that operation;
+- write to another external service or incur cost; or
+- weaken an allowlist, identity check, delivery fence, or immutable-runtime
+  guarantee.
 
-# Preview actions without executing
-openkakao-cli send 123 "message" --dry-run --json
-openkakao-cli delete 123 456 --dry-run --json
-```
+An explicit user request is authorization. Re-resolve the target and run its
+safety gate before execution.
 
-### Safe commands (REST API, lower risk)
+## Load context progressively
 
-```bash
-openkakao-cli chats --json
-openkakao-cli read <chat_id> --rest --json
-openkakao-cli friends --json
-openkakao-cli me --json
-openkakao-cli doctor --json
-```
+Start with task files and nearby code. Do not preload all documentation. Read
+only relevant sections.
 
-### Risky commands (require opt-in)
+| Scope | Load when needed |
+| --- | --- |
+| Public CLI behavior | Relevant `README.md` and `README.en.md` sections |
+| Contribution/release | `CONTRIBUTING.md` and relevant `CHANGELOG.md` section |
+| AutoReply supervision, launchd, packaging, recovery | Relevant `docs/auto-reply-launchd-supervision.md` section |
+| AutoReply conversation policy, retrieval, GeekNews | Relevant README section and exact prompt/config source |
+| LOCO authentication research | Relevant `docs/research/credential-storage.md` section |
+| Historical protocol limitations | Relevant `docs/IMPROVEMENT_PLAN.md` section |
 
-These require `allow_loco_write = true` in `~/.config/openkakao/config.toml`:
+A nearer `AGENTS.md` overrides this file. Broaden context only when evidence
+shows the change crosses a boundary.
 
-```bash
-openkakao-cli send <chat_id> "message" -y --json
-openkakao-cli send --me "test" -y --json    # Send to memo chat
-openkakao-cli delete <chat_id> <log_id> -y --json
-openkakao-cli edit <chat_id> <log_id> "new" -y --json
-openkakao-cli react <chat_id> <log_id> --json
-openkakao-cli local-delete "부자멘토멘티" "보이는 메시지 일부" -y --json
-```
+## Safety invariants
 
-### Foreground automatic replies
+- LOCO writes remain research-quarantined behind `allow_loco_write`; they are
+  never an AutoReply fallback.
+- Product send is AX `local-send`, guarded by `allow_ax_send` and
+  `allowed_send_chats`. `local-delete` is AX **모두에게서 삭제**.
+- Supported realtime observation is `ax-watch`, not LOCO `watch`.
+- Automatic replies keep their database-authoritative identity, queue, and
+  delivery fences. Never retry `delivery_unknown`.
+- Session-monitor is the only unattended host. It is Kakao-blind, never owns
+  AX send, and never hides the user's existing Terminal.
+- Tests use fake DB, process, and AX adapters; never test with a real send.
 
-Automatic replies use the separate AX/database-authoritative safety gates, not
-`allow_loco_write`. Always run a read-only preflight first:
+Local database reads and dry-runs are safe. REST reads contact Kakao; use them
+only for needed live state. Preserve all opt-in flags for authorized writes.
+Dry-run when it materially validates target or payload.
 
-```bash
-openkakao-cli auto-reply --chat '부자멘토멘티' --check --json
-openkakao-cli auto-reply --chat '부자멘토멘티' --model gemini-3.6-flash
-# Interactive terminals omit --model and pick the LLM with arrow keys.
-openkakao-cli auto-reply --chat 'name:부자멘토멘티' --chat id:123456789
-# For an unnamed local group-room row, attest the already-open exact AX window:
-openkakao-cli auto-reply --chat 'bind:417780809780519:부자멘토멘티' --check --json
-```
-# Unattended host (Kakao-blind monitor only; never owns AX send)
-openkakao-cli auto-reply-host --status --json
-openkakao-cli auto-reply-host --bake --json
-openkakao-cli auto-reply-host --tick --manifest <runtime>/session-monitor-manifest.json --state-root "$HOME/Library/Application Support/openkakao/auto-reply"
+Before starting or materially reconfiguring foreground AutoReply, run
+`auto-reply --check --json` with the exact chat selector. It owns only its
+workers and must not adopt or kill another supervisor. `auto-reply-host` is
+limited to status, immutable bake, disable, and Kakao-blind monitor ticks.
 
-`--chat` may be repeated or contain comma-separated exact `id:`/`name:`
-selectors. The command is foreground-only and `Ctrl-C` stops its owned
-workers. It never adopts or kills an existing supervisor, and tests must use
-fake database/process/AX adapters rather than a live send.
+## Skill triggers
 
-## Unattended Mode
+This repository has no local `SKILL.md`. Invoke an installed skill only when
+its artifact and action match the task. A schema skill is for schema changes,
+an AX skill for AX code/UI validation, and a launchd skill for
+supervision/packaging/recovery—not merely related prose or ordinary CLI work.
 
-For fully non-interactive operation:
+New skills must state a trigger, non-trigger, required inputs, allowed side
+effects, and completion condition.
 
-```bash
-openkakao-cli --unattended --allow-non-interactive-send send <chat_id> "msg" -y --json
-```
+## Proportionate verification
 
-Or configure in `~/.config/openkakao/config.toml`:
+1. Run the narrowest deterministic check covering the edit.
+2. Add adjacent tests for shared types, persistence, process boundaries, or
+   safety gates.
+3. Run the full suite only for broad/refactoring/release risk or evidence that
+   the change is wider.
 
-```toml
-[mode]
-unattended = true
+Prefer a named Rust test/integration target and affected Python source-tree
+tests first. Never import, compile, or test an immutable live runtime.
 
-[send]
-allow_non_interactive = true
+## Completion criteria
 
-[safety]
-allow_loco_write = true
-min_unattended_send_interval_secs = 10
-```
+- **Diagnosis:** evidence supports the cause; uncertainty is named.
+- **Local change:** behavior exists, relevant tests pass, unrelated changes stay
+  untouched.
+- **Safety change:** affected gates and failure paths pass, with broader tests
+  for shared boundaries.
+- **Live operation:** readiness and target are rechecked; execute once, then
+  confirm or report uncertainty without blind retry.
+- **Docs:** paths, commands, and links are checked; runtime tests are needed
+  only for changed executable examples.
 
-## Recommended Agent Workflow
+Stop when the criteria pass. Do not drift into deployment, external writes,
+unrelated cleanup, or speculative refactors.
 
-1. **Read** with `local-chats` / `local-read` (zero risk)
-2. **Preview** with `--dry-run` before any write
-3. **Execute** only after user confirmation
-4. **Prefer** `--me` flag for testing sends
-
-## JSON Output
-
-All commands with `--json` return structured JSON to stdout. Diagnostic messages go to stderr.
-
-```bash
-# List chats
-openkakao-cli local-chats --json
-# Returns: [{"chat_id": 123, "chat_type": 0, "chat_name": "...", ...}]
-
-# Read messages
-openkakao-cli local-read 123 --json
-# Returns: [{"log_id": 456, "chat_id": 123, "sender_name": "...", "message": "...", ...}]
-
-# Dry-run
-openkakao-cli send 123 "hello" --dry-run --json
-# Returns: {"dry_run": true, "action": "send", "chat_id": 123, "message": "..."}
-```
-
-## Diagnostics
-
-```bash
-openkakao-cli doctor --json        # Check installation, credentials, local DB access
-openkakao-cli auth-status --json   # Check auth recovery state
-```
+Keep message bodies, image contents, credentials, and hidden prompts out of
+diagnostics unless the user explicitly requests that exact data.
