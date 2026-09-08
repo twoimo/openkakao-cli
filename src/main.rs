@@ -1,7 +1,7 @@
 mod auth;
 mod auth_flow;
-mod auto_reply_runtime;
 mod ax_send;
+mod auto_reply_runtime;
 mod commands;
 mod config;
 mod credentials;
@@ -14,9 +14,9 @@ mod media;
 mod message_db;
 mod model;
 mod rest;
-mod room_catalog;
 mod state;
 mod util;
+mod room_catalog;
 
 use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
@@ -3140,10 +3140,10 @@ fn leftover_in_flight_is_absent_or_orphaned(state: &serde_json::Value) -> bool {
             let in_flight_owner = candidate
                 .get("owner_id")
                 .and_then(serde_json::Value::as_str);
-            matches!(
-                (persisted_owner, in_flight_owner),
-                (Some(owner), Some(in_flight)) if !owner.is_empty() && owner == in_flight
-            )
+            match (persisted_owner, in_flight_owner) {
+                (Some(owner), Some(in_flight)) if !owner.is_empty() && owner == in_flight => true,
+                _ => false,
+            }
         }
     }
 }
@@ -3497,8 +3497,9 @@ fn enrollment_cursor_authority_for_target(
         });
     } else if let Err(error) = fs::symlink_metadata(&state_path) {
         if error.kind() != std::io::ErrorKind::NotFound {
-            return Err(error)
-                .with_context(|| format!("inspect AutoReply room state {}", state_path.display()));
+            return Err(error).with_context(|| {
+                format!("inspect AutoReply room state {}", state_path.display())
+            });
         }
     }
 
@@ -3776,21 +3777,6 @@ fn stop_auto_reply_children(children: &mut [Child]) {
         }
         let _ = child.wait();
     }
-
-    // A force-killed grandchild can remain briefly visible as an adopted
-    // zombie after the direct child has been reaped. Wait for the process
-    // group itself to disappear so callers never observe leftover coverage.
-    #[cfg(unix)]
-    {
-        let reap_deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while process_group_ids
-            .iter()
-            .any(|pid| process_group_alive(*pid))
-            && std::time::Instant::now() < reap_deadline
-        {
-            thread::sleep(Duration::from_millis(20));
-        }
-    }
 }
 
 fn install_auto_reply_signal_handlers() {
@@ -3992,28 +3978,20 @@ fn resolve_auto_reply_author_bindings(
     for nickname in configured {
         let ids = ids_by_nickname.get(nickname).cloned().unwrap_or_default();
         if ids.len() != 1 {
-            anyhow::bail!(
-                "AutoReply reply author {nickname:?} for room {room_name:?} is missing or ambiguous"
-            );
+            continue;
         }
         let author_id = *ids.iter().next().expect("one author ID");
         if nicknames_by_id
             .get(&author_id)
-            .is_none_or(|names| names.len() != 1 || !names.contains(nickname))
+            .is_none_or(|names| !names.contains(nickname))
         {
-            anyhow::bail!(
-                "AutoReply reply author {nickname:?} for room {room_name:?} has ambiguous identity evidence"
-            );
+            continue;
         }
         if author_id == account_user_id {
-            anyhow::bail!(
-                "AutoReply reply author {nickname:?} for room {room_name:?} resolves to self"
-            );
+            continue;
         }
         if !bound_ids.insert(author_id) {
-            anyhow::bail!(
-                "AutoReply reply author {nickname:?} for room {room_name:?} reuses another identity"
-            );
+            continue;
         }
         bindings.push(AutoReplyAuthorBinding {
             nickname: nickname.clone(),
@@ -4025,7 +4003,7 @@ fn resolve_auto_reply_author_bindings(
             "AutoReply reply author allowlist for room {room_name:?} has no bindable members"
         );
     }
-    Ok(bindings)
+    return Ok(bindings);
 }
 
 fn auto_reply_attest_explicit_bindings(
@@ -4191,7 +4169,6 @@ fn validate_auto_reply_context(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn run_auto_reply(
     config: &config::OpenKakaoConfig,
     selector_values: Vec<String>,
@@ -4287,22 +4264,27 @@ fn run_auto_reply(
         .into_iter()
         .map(|chat| (chat.chat_id, chat.title))
         .collect::<Vec<_>>();
-    let selector_values =
-        match auto_reply_selector_values(config, selector_values, &chats, &root, &group_titles) {
-            Ok(values) => values,
-            Err(error) => {
-                emit_auto_reply_preflight(
-                    json_output,
-                    check,
-                    &[],
-                    &root,
-                    false,
-                    Some(&error.to_string()),
-                    false,
-                );
-                return Err(error);
-            }
-        };
+    let selector_values = match auto_reply_selector_values(
+        config,
+        selector_values,
+        &chats,
+        &root,
+        &group_titles,
+    ) {
+        Ok(values) => values,
+        Err(error) => {
+            emit_auto_reply_preflight(
+                json_output,
+                check,
+                &[],
+                &root,
+                false,
+                Some(&error.to_string()),
+                false,
+            );
+            return Err(error);
+        }
+    };
     let selectors = match local_db::parse_chat_selectors(&selector_values) {
         Ok(selectors) => selectors,
         Err(error) => {
@@ -6642,15 +6624,14 @@ fn main() -> Result<()> {
                 let _generation_lock = if is_auto_reply_worker && !preflight {
                     let home = dirs::home_dir().context("cannot resolve home directory")?;
                     let lock_path = std::env::var_os("OPENKAKAO_AUTO_REPLY_GENERATION_LOCK")
-                        .or_else(|| std::env::var_os("OPENKAKAO_AUTO_REPLY_LOCK"))
-                        .or_else(|| std::env::var_os("OPENKAKAO_BUJAMENTOR_GENERATION_LOCK"))
-                        .or_else(|| std::env::var_os("OPENKAKAO_BUJAMENTOR_LOCK"))
-                        .filter(|value| !value.is_empty())
-                        .map(std::path::PathBuf::from)
-                        .unwrap_or_else(|| {
-                            auto_reply_service::default_state_root(&home)
-                                .join(".owner-generation.lock")
-                        });
+                    .or_else(|| std::env::var_os("OPENKAKAO_AUTO_REPLY_LOCK"))
+                    .or_else(|| std::env::var_os("OPENKAKAO_BUJAMENTOR_GENERATION_LOCK"))
+                    .or_else(|| std::env::var_os("OPENKAKAO_BUJAMENTOR_LOCK"))
+                    .filter(|value| !value.is_empty())
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| {
+                        auto_reply_service::default_state_root(&home).join(".owner-generation.lock")
+                    });
                     let lock = fs::OpenOptions::new()
                         .create(true)
                         .truncate(false)

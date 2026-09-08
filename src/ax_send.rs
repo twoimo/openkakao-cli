@@ -20,8 +20,6 @@
 //! stub with the same public API stands in on other platforms so the crate
 //! still builds and lints in cross-platform CI.
 
-#![cfg_attr(not(target_os = "macos"), allow(dead_code))]
-
 // Only `imp::open_chat_row` (macOS-only) actually calls these outside of
 // tests, so on other platforms — where `mod imp` doesn't compile and
 // `mod stub` never needs to match a chat row at all — they're otherwise
@@ -105,10 +103,6 @@ pub(crate) fn normalize_binding_message(value: &str) -> String {
     trimmed.to_string()
 }
 
-// The crate exposes both a library and a binary that compile this module
-// independently. These helpers are used by the binary path and unit tests but
-// can be unreferenced in the standalone library target.
-#[allow(dead_code)]
 fn deleted_control_log_id(message: &crate::local_db::LocalMessage) -> Option<i64> {
     let parsed: serde_json::Value = serde_json::from_str(&message.message).ok()?;
     if parsed.get("hidden").and_then(serde_json::Value::as_bool) != Some(true) {
@@ -117,12 +111,10 @@ fn deleted_control_log_id(message: &crate::local_db::LocalMessage) -> Option<i64
     parsed.get("logId").and_then(serde_json::Value::as_i64)
 }
 
-#[allow(dead_code)]
 fn is_local_deleted_control_message(message: &crate::local_db::LocalMessage) -> bool {
     message.message.trim() == AX_DELETED_MESSAGE_TOKEN || deleted_control_log_id(message).is_some()
 }
 
-#[allow(dead_code)]
 fn hidden_local_log_ids(
     messages: &[crate::local_db::LocalMessage],
 ) -> std::collections::BTreeSet<i64> {
@@ -379,7 +371,6 @@ fn local_binding_token(message: &crate::local_db::LocalMessage) -> anyhow::Resul
     Ok(token)
 }
 
-#[allow(dead_code)]
 pub(crate) fn normalize_local_binding_suffix(
     messages: &[crate::local_db::LocalMessage],
 ) -> Vec<(i64, BindingToken)> {
@@ -523,7 +514,7 @@ fn mention_tokens_compatible(ax: &str, local: &str) -> bool {
         ax_i += 1;
         local_i += 1;
     }
-    ax_i == ax_chars.len() && local_i == local_chars.len()
+    return ax_i == ax_chars.len() && local_i == local_chars.len();
 }
 
 fn transcript_endpoint_matches(ax: &str, local: &str) -> bool {
@@ -667,7 +658,6 @@ fn match_binding_tokens(
 /// have painted a local media row yet, or AX may show a share-button image the
 /// local suffix has not included. Drop only those media tokens and keep a
 /// strong older suffix. Ordinary text at the local endpoint still has to match.
-#[allow(dead_code)]
 pub(crate) fn binding_kind_tail(values: &[String], count: usize) -> String {
     let kinds = values
         .iter()
@@ -690,7 +680,6 @@ pub(crate) fn binding_kind_tail(values: &[String], count: usize) -> String {
     kinds.into_iter().rev().collect::<Vec<_>>().join(">")
 }
 
-#[allow(dead_code)]
 pub(crate) fn match_transcript_suffix(
     ax_texts: &[String],
     local_texts: &[String],
@@ -1449,7 +1438,7 @@ mod match_tests {
     #[test]
     fn transcript_match_accepts_full_visible_ax_tail_when_window_virtualizes() {
         let ax = ["메시지가 삭제되었습니다.", "졸리다"]
-            .map(normalize_binding_message)
+            .map(|text| normalize_binding_message(text))
             .into_iter()
             .filter(|text| !text.is_empty())
             .collect::<Vec<_>>();
@@ -1972,7 +1961,10 @@ mod match_tests {
         first.log_id = 2;
         second.log_id = 3;
         let pairs = normalize_local_binding_suffix(&[link, first, second]);
-        let discarded: Vec<String> = pairs.iter().map(|(_, token)| token.text.clone()).collect();
+        let discarded: Vec<String> = pairs
+            .iter()
+            .map(|(_, token)| token.text.clone())
+            .collect();
         let ax = [
             "https://huggingface.co/spaces/immich-app/immich".to_string(),
             "raid로 작은서버 만들어서 굿ㅓㅇ하는건가".to_string(),
@@ -2145,10 +2137,11 @@ mod match_tests {
 
     #[test]
     fn composer_guard_treats_unreadable_value_as_empty_after_focus() {
-        let (result, probe) = run_composer_probe(
-            [None, Some(""), None, Some("reply"), Some("reply"), Some("")],
-            true,
-        );
+        let (result, probe) =
+            run_composer_probe(
+                [None, Some(""), None, Some("reply"), Some("reply"), Some("")],
+                true,
+            );
         assert!(result.is_ok());
         assert_eq!(probe.focuses, 2);
         assert_eq!(probe.set_attempts, 1);
@@ -2317,10 +2310,11 @@ mod match_tests {
 
     #[test]
     fn composer_guard_allows_one_verified_direct_or_keyboard_send() {
-        let (direct_result, direct_probe) = run_composer_probe(
-            [Some(""), Some(""), Some("reply"), Some("reply"), Some("")],
-            true,
-        );
+        let (direct_result, direct_probe) =
+            run_composer_probe(
+                [Some(""), Some(""), Some("reply"), Some("reply"), Some("")],
+                true,
+            );
         assert!(direct_result.is_ok());
         assert_eq!(direct_probe.set_attempts, 1);
         assert_eq!(direct_probe.typed, 0);
@@ -3669,8 +3663,8 @@ mod imp {
                 .collect::<Vec<_>>();
             let local_pairs = local_tail
                 .iter()
-                .filter(|token| !token.text.is_empty())
                 .cloned()
+                .filter(|token| !token.text.is_empty())
                 .map(|token| (0_i64, token))
                 .collect::<Vec<_>>();
             let matched = super::match_local_binding_suffix(&ax_texts, &local_pairs);
@@ -3726,8 +3720,8 @@ mod imp {
             .collect::<Vec<_>>();
         let local_pairs = local_tail
             .iter()
-            .filter(|token| !token.text.is_empty())
             .cloned()
+            .filter(|token| !token.text.is_empty())
             .map(|token| (0_i64, token))
             .collect::<Vec<_>>();
         let matched = super::match_local_binding_suffix(&ax_texts, &local_pairs);
@@ -3768,12 +3762,7 @@ mod imp {
         let window = match find_chat_window(&app, chat_display_name)? {
             Some(window) => window,
             None => {
-                if std::env::var("OPENKAKAO_AUTO_REPLY_WORKER")
-                    .ok()
-                    .or_else(|| std::env::var("OPENKAKAO_BUJAMENTOR_WORKER").ok())
-                    .as_deref()
-                    == Some("1")
-                {
+                if std::env::var("OPENKAKAO_AUTO_REPLY_WORKER").ok().or_else(|| std::env::var("OPENKAKAO_BUJAMENTOR_WORKER").ok()).as_deref() == Some("1") {
                     anyhow::bail!(
                         "AutoReply requires exactly one already-open KakaoTalk window titled {chat_display_name:?}"
                     );
@@ -4077,9 +4066,9 @@ mod stub {
 
 #[cfg(not(target_os = "macos"))]
 pub use stub::{
-    delete_via_ax, preflight_bound_via_ax, read_open_exact_via_ax, read_via_ax, reply_via_ax,
-    scrape_chat_list, scrape_chat_list_for_service, scrape_chat_list_for_service_isolated,
-    send_bound_via_ax, send_via_ax, ChatListRow,
+    preflight_bound_via_ax, read_open_exact_via_ax, read_via_ax, scrape_chat_list,
+    scrape_chat_list_for_service, scrape_chat_list_for_service_isolated, send_bound_via_ax,
+    send_via_ax, ChatListRow,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

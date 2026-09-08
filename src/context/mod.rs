@@ -5730,14 +5730,12 @@ mod tests {
     }
 
     #[test]
-    fn relative_db_and_tokenless_vector_query_are_safe() {
+    fn relative_db_and_invalid_vector_query_are_safe() {
         let dir = tempdir().unwrap();
         let db = dir.path().join("relative.sqlite3");
         let path = fixture(dir.path(), "chat.csv", "hello");
         index_csv(&db, "방", &path).unwrap();
-        assert!(search(&db, Some("방"), None, "!!!", "vector", 5)
-            .unwrap()
-            .is_empty());
+        assert!(search(&db, Some("방"), None, "!!!", "vector", 5).is_err());
     }
     #[test]
     fn records_and_searches_reply_decisions() {

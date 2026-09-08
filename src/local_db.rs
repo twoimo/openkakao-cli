@@ -154,7 +154,7 @@ fn parse_display_member_ids(blob: &[u8]) -> Vec<i64> {
             }
         }
     }
-    if blob.len().is_multiple_of(8) && blob.len() <= 8 * 64 {
+    if blob.len() % 8 == 0 && blob.len() <= 8 * 64 {
         let mut ids = Vec::new();
         for chunk in blob.chunks_exact(8) {
             let id = i64::from_le_bytes(chunk.try_into().expect("8-byte chunk"));
@@ -191,7 +191,9 @@ fn preferred_group_title(candidates: &[String]) -> Option<String> {
             uniq.push(title);
         }
     }
-    let mut best = uniq.first().cloned()?;
+    let Some(mut best) = uniq.first().cloned() else {
+        return None;
+    };
     for candidate in &uniq {
         let best_compact: String = best.chars().filter(|ch| !ch.is_whitespace()).collect();
         let cand_compact: String = candidate.chars().filter(|ch| !ch.is_whitespace()).collect();
@@ -352,25 +354,9 @@ pub fn resolve_chat_selectors(
     for selector in selectors {
         let chat = match selector {
             ChatSelector::Id(id) => {
-                let chat = by_id
+                by_id
                     .get(id)
-                    .with_context(|| format!("chat ID {id} was not found"))?;
-                if is_group_directory_chat(chat.chat_type, chat.active_members_count)
-                    && chat.chat_name.is_empty()
-                {
-                    anyhow::bail!(
-                        "group chat ID {id} has no local AX name; use bind:<id>:<exact-name>"
-                    );
-                }
-                if let Some(ids) = by_name.get(&chat.chat_name) {
-                    if ids.len() != 1 {
-                        anyhow::bail!(
-                            "chat ID {id} has ambiguous AX name {:?} (candidate IDs: {ids:?})",
-                            chat.chat_name
-                        );
-                    }
-                }
-                chat
+                    .with_context(|| format!("chat ID {id} was not found"))?
             }
             ChatSelector::Name(name) => {
                 let ids = by_name
@@ -470,7 +456,6 @@ const LOCAL_POLL_MAX_INT64: i64 = i64::MAX;
 const LOCAL_POLL_ID_DOMAIN: &str = "global_sparse";
 const LOCAL_CONVERSATION_MESSAGE_TYPE_MIN: i32 = 1;
 
-#[allow(dead_code)]
 pub(crate) fn is_local_conversation_message_type(message_type: i32) -> bool {
     message_type >= LOCAL_CONVERSATION_MESSAGE_TYPE_MIN
 }
@@ -2143,7 +2128,13 @@ mod tests {
     #[test]
     fn group_title_prefers_extended_kakao_or_extra_name() {
         assert_eq!(
-            resolve_group_title("NIMDA 인수인계", "NIMDA 인수인계 임원방", "", "", &[]),
+            resolve_group_title(
+                "NIMDA 인수인계",
+                "NIMDA 인수인계 임원방",
+                "",
+                "",
+                &[]
+            ),
             Some("NIMDA 인수인계 임원방".to_string()),
         );
         assert_eq!(

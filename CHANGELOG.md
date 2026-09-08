@@ -7,17 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [1.8.2] - 2026-09-08
-
 ### Changed
-- Agent guidance now uses progressive context loading, precise skill triggers,
-  proportionate verification, explicit autonomy boundaries, and task-specific
-  completion criteria while preserving KakaoTalk safety gates.
-- AutoReply now rejects unnamed group `id:` selectors, duplicate room names,
-  and ambiguous reply-author identities instead of silently weakening identity
-  binding.
-- AutoReply shutdown now waits for the whole worker process group to disappear
-  after forced termination, closing a short guardian teardown race.
 - `???`처럼 검색 토큰이 없는 인바운드는 컨텍스트 검색만 건너뛰고, 스타일·응답시간 번들은 최근 샘플로 내려가게 했습니다. 예전에는 `context-reply-bundle`이 통째로 죽어 kakao-test 인가 답변이 `retrieval_command_failed`로 스킵됐습니다.
 - `context-reply-bundle` 조회 제한을 5초에서 30초로 늘렸습니다. 짧은 제한 때문에 토큰 있는 인바운드도 `retrieval_command_failed`로 스킵되던 경우를 줄입니다.
 - 검색 번들이 실패해도 최근 대화가 있으면 그걸 근거로 생성을 이어갑니다. 예전에는 `???`처럼 토큰 없는 인바운드가 `retrieval_command_failed`로 바로 스킵됐습니다.
