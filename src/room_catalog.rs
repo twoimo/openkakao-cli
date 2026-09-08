@@ -74,6 +74,7 @@ pub fn catalog_geeknews_chat_ids(state_root: &Path) -> Result<Vec<i64>> {
         .collect())
 }
 
+#[allow(dead_code)]
 pub fn merge_configured_and_catalog_selectors(
     configured: &[String],
     catalog_chat_ids: &[i64],
@@ -128,11 +129,15 @@ pub fn merge_configured_and_catalog_selectors_named(
     Ok(selectors)
 }
 
+#[allow(dead_code)]
 fn binding_selector(chat: &crate::local_db::LocalChat) -> String {
     binding_selector_named(chat, None)
 }
 
-fn binding_selector_named(chat: &crate::local_db::LocalChat, group_title: Option<&String>) -> String {
+fn binding_selector_named(
+    chat: &crate::local_db::LocalChat,
+    group_title: Option<&String>,
+) -> String {
     let name = if !chat.chat_name.trim().is_empty() {
         chat.chat_name.trim()
     } else if let Some(title) = group_title.filter(|title| !title.trim().is_empty()) {

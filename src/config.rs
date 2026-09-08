@@ -689,10 +689,7 @@ allow_link_fetch = true
         );
         assert!(config.safety.allow_auto_reply);
         assert!(unattended_auto_reply_enabled(&config));
-        assert_eq!(
-            config.auto_reply.chats,
-            ["bind:417780809780519:room"]
-        );
+        assert_eq!(config.auto_reply.chats, ["bind:417780809780519:room"]);
         assert_eq!(config.auto_reply.self_nickname.as_deref(), Some("self"));
         assert_eq!(config.auto_reply.reply_authors, ["author"]);
         assert!(config.auto_reply.allow_link_fetch);
