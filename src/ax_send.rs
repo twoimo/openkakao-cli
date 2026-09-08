@@ -20,6 +20,8 @@
 //! stub with the same public API stands in on other platforms so the crate
 //! still builds and lints in cross-platform CI.
 
+#![cfg_attr(not(target_os = "macos"), allow(dead_code))]
+
 // Only `imp::open_chat_row` (macOS-only) actually calls these outside of
 // tests, so on other platforms — where `mod imp` doesn't compile and
 // `mod stub` never needs to match a chat row at all — they're otherwise

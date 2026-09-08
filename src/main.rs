@@ -3776,6 +3776,21 @@ fn stop_auto_reply_children(children: &mut [Child]) {
         }
         let _ = child.wait();
     }
+
+    // A force-killed grandchild can remain briefly visible as an adopted
+    // zombie after the direct child has been reaped. Wait for the process
+    // group itself to disappear so callers never observe leftover coverage.
+    #[cfg(unix)]
+    {
+        let reap_deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while process_group_ids
+            .iter()
+            .any(|pid| process_group_alive(*pid))
+            && std::time::Instant::now() < reap_deadline
+        {
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
 }
 
 fn install_auto_reply_signal_handlers() {
